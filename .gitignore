@@ -1,0 +1,19 @@
+# Composer
+/vendor/
+composer.lock
+
+# Runtime state written by the app (per-user; never commit)
+sqli.json
+debug.log
+php_errors.log
+
+# Local config that may contain real credentials
+*.local.json
+sqli.config.json
+/dd/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

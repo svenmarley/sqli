@@ -1,0 +1,16 @@
+{
+  "_comment": "Example sqli config file. Pass with -c / --config (e.g. `php sqli.php -c devel.json`) or via $SQLI_CONFIG. Keys match the long option names; every option except config/user-config/help/version is allowed. A --user-config file (or $SQLI_USER_CONFIG) layers on top of this and overrides it; explicit command-line flags override both. Unknown keys (like this _comment) are ignored.",
+
+  "host": "localhost",
+  "port": 3306,
+  "user": "devuser",
+  "password": "",
+  "database": "myapp_dev",
+  "socket": null,
+
+  "theme": "default",
+  "dictionary": "dd/myapp.csv",
+  "read-only": false,
+  "screensaver-timeout": 36000,
+  "debug": false
+}
