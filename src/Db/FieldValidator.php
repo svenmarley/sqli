@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Sqli2\Db;
+namespace Sqli\Db;
 
 /**
  * Validates a proposed cell value against a column's SQL type before an edit is

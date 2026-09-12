@@ -1,16 +1,26 @@
-# Composer
-/vendor/
-composer.lock
+# Runtime state and logs written by the app (per-user; never commit)
+/debug.log
+/php_errors.log
 
-# Runtime state written by the app (per-user; never commit)
+# .sqli/ config dir. Convention: a file with `.example.` in its name is part of
+# the release and is tracked; everything else here is local-only — your real
+# config, credentials, state and formatting, plus any themes you drop into
+# .sqli/themes/ yourself. The one exception is the single scheme that ships
+# with sqli, .sqli/themes/nord.yaml (Nord, unmodified from
+# tinted-theming/schemes) — named plainly, because a theme's name is its
+# filename stem and a picker offering `nord.example` would be this convention
+# leaking into the UI.
+.sqli/*
+!.sqli/*.example.*
+!.sqli/themes/
+.sqli/themes/*
+!.sqli/themes/nord.yaml
+
+# Legacy sqli file names (pre-2.30.4; auto-migrated into .sqli/ on run)
 sqli.json
-debug.log
-php_errors.log
-
-# Local config that may contain real credentials
-*.local.json
-sqli.config.json
-/dd/
+credentials.json
+.sqli.json
+.sqli_formatting.json
 
 # Editor / OS
 .idea/

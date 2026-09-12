@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Sqli2\Terminal;
+namespace Sqli\Terminal;
 
 /**
  * A decoded mouse event with 0-based (x, y) cell coordinates.
@@ -10,8 +10,8 @@ namespace Sqli2\Terminal;
  * Only the events the spec cares about are modeled: left-button press,
  * left-button drag (motion with the button held — used for dragging the
  * scrollbar thumb, §6), and scroll up/down. Bare movement and other buttons
- * are ignored by the decoder so they never reset the screensaver idle timer
- * (Section 14).
+ * are ignored by the decoder, so a mouse crossing the window is not mistaken
+ * for someone using it.
  */
 final class MouseEvent
 {

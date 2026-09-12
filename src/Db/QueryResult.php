@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Sqli2\Db;
+namespace Sqli\Db;
 
 /**
  * Immutable outcome of a single query execution.

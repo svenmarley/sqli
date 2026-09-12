@@ -2,178 +2,405 @@
 
 declare(strict_types=1);
 
-namespace Sqli2\Config;
+namespace Sqli\Config;
 
 use includes\my;
 
 /**
- * Reads and writes `sqli.json` in the current working directory (spec 16).
+ * Reads and writes sqli's persisted UI state (spec 16) inside a `.sqli/`
+ * directory — the closest project one walking up from the cwd, else the global
+ * `$SQLI_HOME/.sqli` (the resolution lives in {@see Config::stateDir()}) —
+ * across two files:
  *
- * Holds persisted UI state: active theme, query history, and per-database
- * dictionary path / column widths / hidden columns. Mutators persist
- * immediately so a crash never loses the last change.
+ *   `sqli_state.json`       — churny state: active theme, query history,
+ *                             exec history, and each database's dictionary path.
+ *   `sqli_formatting.json`  — per-column display settings (widths, order,
+ *                             formats, hidden), grouped database → table so the
+ *                             file is easy to hand-edit.
+ *
+ * Both file their per-database nodes under a **connection scope** — the
+ * `host:port/db` string from {@see \Sqli\Db\Database::stateKey()}, not a bare
+ * database name. A name alone is not unique: `prod` on staging and `prod` in
+ * production would otherwise share one entry and overwrite each other's
+ * layout and dictionary association.
+ *
+ * When no `.sqli/` exists anywhere yet the dir is null: values are held in
+ * memory, {@see needsDir()} turns true on the first attempted save, and the app
+ * prompts the user for where to create one (or to skip persisting). Mutators
+ * persist immediately so a crash never loses the last change; write failures
+ * are reported via {@see takeWriteError()}, never silent.
  */
 final class Settings
 {
-    private const FILE = 'sqli.json';
+    private const STATE_FILE = 'sqli_state.json';
+    private const FORMATTING_FILE = 'sqli_formatting.json';
+    private const LEGACY_FILE = 'sqli.json';
     private const HISTORY_MAX = 25;
 
-    private string $path;
-    /** @var array<string,mixed> */
-    private array $data;
+    /** The `.sqli/` dir state lives in; null = nowhere yet (in-memory only). */
+    private ?string $dir;
 
-    public function __construct(?string $workingDir = null)
+    /** True after a save was attempted with no dir — the app should prompt. */
+    private bool $pendingSave = false;
+
+    /** True when the user chose "don't persist this session". */
+    private bool $muted = false;
+
+    /** Last file-write failure (path + reason), cleared when read. */
+    private ?string $writeError = null;
+
+    /** @var array<string,mixed> theme / history / execHistory / databases[db].dictionary */
+    private array $state = [];
+
+    /** @var array<string,mixed> databases[db].tables[table] => {widths,order,formats,hidden} */
+    private array $formatting = [];
+
+    public function __construct(?string $sqliDir)
     {
-        $dir = $workingDir ?? getcwd() ?: '.';
-        $this->path = rtrim($dir, '/\\') . DIRECTORY_SEPARATOR . self::FILE;
-        $this->data = $this->load();
+        $this->dir = $sqliDir !== null ? rtrim($sqliDir, '/\\') : null;
+        if ($this->dir === null) {
+            return;
+        }
+
+        $state = self::readJson($this->statePath());
+        $formatting = self::readJson($this->formattingPath());
+
+        // First run after the split: migrate the ancient combined `sqli.json`
+        // sitting beside the `.sqli/` dir (the newer dot-file layout is migrated
+        // into `.sqli/` by Config during discovery).
+        if ($state === null && $formatting === null) {
+            $legacy = self::readJson(dirname($this->dir) . DIRECTORY_SEPARATOR . self::LEGACY_FILE);
+            if ($legacy !== null) {
+                [$state, $formatting] = self::splitLegacy($legacy);
+                $this->state = $state;
+                $this->formatting = $formatting;
+                $this->saveState();
+                $this->saveFormatting();
+                return;
+            }
+        }
+
+        $this->state = $state ?? [];
+        $this->formatting = $formatting ?? [];
+    }
+
+    /** Absolute path to the state file (for tooling such as --lint). */
+    public function statePath(): string
+    {
+        return ($this->dir ?? '.') . DIRECTORY_SEPARATOR . self::STATE_FILE;
+    }
+
+    /** Absolute path to the formatting file (for tooling such as --lint). */
+    public function formattingPath(): string
+    {
+        return ($this->dir ?? '.') . DIRECTORY_SEPARATOR . self::FORMATTING_FILE;
+    }
+
+    /** True when a save was attempted but there is no `.sqli/` dir yet. */
+    public function needsDir(): bool
+    {
+        return $this->dir === null && $this->pendingSave && !$this->muted;
+    }
+
+    /** Stop asking: hold state in memory only for the rest of the session. */
+    public function mute(): void
+    {
+        $this->muted = true;
+    }
+
+    /**
+     * Point state at (a possibly new) `.sqli/` dir and flush the in-memory
+     * values there — used after the user picks where to create the config, and
+     * by "Create Local sqli Config" when the new dir is closer than the old one.
+     */
+    public function relocate(string $sqliDir): void
+    {
+        $this->dir = rtrim($sqliDir, '/\\');
+        $this->muted = false;
+        $this->pendingSave = false;
+        $this->saveState();
+        $this->saveFormatting();
+    }
+
+    /** Last write failure (path + OS reason), cleared by reading. */
+    public function takeWriteError(): ?string
+    {
+        $e = $this->writeError;
+        $this->writeError = null;
+        return $e;
+    }
+
+    /**
+     * Files `--lint` should validate in the given `.sqli/` dir, as
+     * label => {path, kind}. Read-only: does not construct/migrate anything.
+     *
+     * @return array<string,array{path:string,kind:string}>
+     */
+    public static function lintTargets(?string $sqliDir): array
+    {
+        if ($sqliDir === null) {
+            return [];
+        }
+        $dir = rtrim($sqliDir, '/\\');
+        return [
+            'state file'      => ['path' => $dir . DIRECTORY_SEPARATOR . self::STATE_FILE, 'kind' => 'state'],
+            'formatting file' => ['path' => $dir . DIRECTORY_SEPARATOR . self::FORMATTING_FILE, 'kind' => 'formatting'],
+        ];
     }
 
     public function getTheme(): string
     {
-        return (string) ($this->data['theme'] ?? 'default');
+        return (string) ($this->state['theme'] ?? 'default');
     }
 
     public function setTheme(string $name): void
     {
-        $this->data['theme'] = $name;
-        $this->save();
+        $this->state['theme'] = $name;
+        $this->saveState();
     }
 
     /** @return list<string> */
     public function getHistory(): array
     {
-        $h = $this->data['history'] ?? [];
+        $h = $this->state['history'] ?? [];
         return is_array($h) ? array_values(array_map('strval', $h)) : [];
     }
 
     /** @param list<string> $history */
     public function setHistory(array $history): void
     {
-        if (count($history) > self::HISTORY_MAX) {
-            $history = array_slice($history, -self::HISTORY_MAX);
-        }
-        $this->data['history'] = array_values($history);
-        $this->save();
+        $this->state['history'] = self::capped($history);
+        $this->saveState();
     }
 
     /**
      * Executed-form history: the normalized SQL actually sent to the server,
-     * browsed with Shift+Up/Down (§4). Kept parallel to but separate from the
+     * browsed with Alt+Up/Down (§4). Kept parallel to but separate from the
      * typed-form {@see getHistory()}.
      *
      * @return list<string>
      */
     public function getExecHistory(): array
     {
-        $h = $this->data['execHistory'] ?? [];
+        $h = $this->state['execHistory'] ?? [];
         return is_array($h) ? array_values(array_map('strval', $h)) : [];
     }
 
     /** @param list<string> $history */
     public function setExecHistory(array $history): void
     {
-        if (count($history) > self::HISTORY_MAX) {
-            $history = array_slice($history, -self::HISTORY_MAX);
-        }
-        $this->data['execHistory'] = array_values($history);
-        $this->save();
+        $this->state['execHistory'] = self::capped($history);
+        $this->saveState();
     }
 
-    public function getDictionary(string $db): ?string
+    public function getDictionary(string $scope): ?string
     {
-        $p = $this->data['databases'][$db]['dictionary'] ?? null;
+        $p = $this->state['databases'][$scope]['dictionary'] ?? null;
         return is_string($p) && $p !== '' ? $p : null;
     }
 
-    public function setDictionary(string $db, string $path): void
+    public function setDictionary(string $scope, string $path): void
     {
-        $this->data['databases'][$db]['dictionary'] = $path;
-        $this->save();
+        $this->state['databases'][$scope]['dictionary'] = $path;
+        $this->saveState();
     }
 
     /** @return array<string,int> field => width */
-    public function getColWidths(string $db, string $table): array
+    public function getColWidths(string $scope, string $table): array
     {
-        $w = $this->data['databases'][$db]['colWidths'][$table] ?? [];
+        $w = $this->formatting['databases'][$scope]['tables'][$table]['widths'] ?? [];
         return is_array($w) ? array_map('intval', $w) : [];
     }
 
     /** @param array<string,int> $widths */
-    public function setColWidths(string $db, string $table, array $widths): void
+    public function setColWidths(string $scope, string $table, array $widths): void
     {
-        if ($widths === []) {
-            unset($this->data['databases'][$db]['colWidths'][$table]);
-        } else {
-            $this->data['databases'][$db]['colWidths'][$table] = $widths;
-        }
-        $this->save();
+        $this->setFmt($scope, $table, 'widths', $widths === [] ? null : $widths);
     }
 
     /** @return list<string> column names in saved display order ([] = natural) */
-    public function getColOrder(string $db, string $table): array
+    public function getColOrder(string $scope, string $table): array
     {
-        $o = $this->data['databases'][$db]['colOrder'][$table] ?? [];
+        $o = $this->formatting['databases'][$scope]['tables'][$table]['order'] ?? [];
         return is_array($o) ? array_values(array_map('strval', $o)) : [];
     }
 
     /** @param list<string> $order */
-    public function setColOrder(string $db, string $table, array $order): void
+    public function setColOrder(string $scope, string $table, array $order): void
     {
-        if ($order === []) {
-            unset($this->data['databases'][$db]['colOrder'][$table]);
-        } else {
-            $this->data['databases'][$db]['colOrder'][$table] = array_values($order);
-        }
-        $this->save();
+        $this->setFmt($scope, $table, 'order', $order === [] ? null : array_values($order));
+    }
+
+    /** @return array<string,string> column name => display format id (§6) */
+    public function getColFormats(string $scope, string $table): array
+    {
+        $f = $this->formatting['databases'][$scope]['tables'][$table]['formats'] ?? [];
+        return is_array($f) ? array_map('strval', $f) : [];
+    }
+
+    /** @param array<string,string> $formats */
+    public function setColFormats(string $scope, string $table, array $formats): void
+    {
+        $this->setFmt($scope, $table, 'formats', $formats === [] ? null : $formats);
     }
 
     /** @return list<string> hidden field names */
-    public function getHiddenCols(string $db, string $table): array
+    public function getHiddenCols(string $scope, string $table): array
     {
-        $h = $this->data['databases'][$db]['hiddenCols'][$table] ?? [];
+        $h = $this->formatting['databases'][$scope]['tables'][$table]['hidden'] ?? [];
         return is_array($h) ? array_values(array_map('strval', $h)) : [];
     }
 
     /** @param list<string> $fields */
-    public function setHiddenCols(string $db, string $table, array $fields): void
+    public function setHiddenCols(string $scope, string $table, array $fields): void
     {
-        if ($fields === []) {
-            unset($this->data['databases'][$db]['hiddenCols'][$table]);
-        } else {
-            $this->data['databases'][$db]['hiddenCols'][$table] = array_values($fields);
-        }
-        $this->save();
+        $this->setFmt($scope, $table, 'hidden', $fields === [] ? null : array_values($fields));
     }
 
-    /** @return array<string,mixed> */
-    private function load(): array
+    /**
+     * Set (or clear, when $value is null) one formatting attribute for a table,
+     * pruning now-empty table/database nodes so the file stays tidy for editing.
+     */
+    private function setFmt(string $scope, string $table, string $attr, mixed $value): void
     {
-        if (!is_file($this->path)) {
-            return [];
+        if ($value === null) {
+            unset($this->formatting['databases'][$scope]['tables'][$table][$attr]);
+            if (($this->formatting['databases'][$scope]['tables'][$table] ?? null) === []) {
+                unset($this->formatting['databases'][$scope]['tables'][$table]);
+            }
+            if (($this->formatting['databases'][$scope]['tables'] ?? null) === []) {
+                unset($this->formatting['databases'][$scope]);
+            }
+        } else {
+            $this->formatting['databases'][$scope]['tables'][$table][$attr] = $value;
         }
-        $raw = @file_get_contents($this->path);
-        if ($raw === false || $raw === '') {
-            return [];
+        $this->saveFormatting();
+    }
+
+    /** @param list<string> $items */
+    private static function capped(array $items): array
+    {
+        if (count($items) > self::HISTORY_MAX) {
+            $items = array_slice($items, -self::HISTORY_MAX);
+        }
+        return array_values($items);
+    }
+
+    /**
+     * Split the legacy combined `sqli.json` into the new state + formatting
+     * shapes. Legacy stored `databases[db][colWidths|colOrder|colFormats|
+     * hiddenCols][table]`; the new formatting file groups by table.
+     *
+     * @param array<string,mixed> $legacy
+     * @return array{0:array<string,mixed>,1:array<string,mixed>}
+     */
+    private static function splitLegacy(array $legacy): array
+    {
+        $state = [];
+        foreach (['theme', 'history', 'execHistory'] as $k) {
+            if (isset($legacy[$k])) {
+                $state[$k] = $legacy[$k];
+            }
+        }
+
+        $attrMap = [
+            'colWidths'  => 'widths',
+            'colOrder'   => 'order',
+            'colFormats' => 'formats',
+            'hiddenCols' => 'hidden',
+        ];
+        $formatting = [];
+        $dbs = is_array($legacy['databases'] ?? null) ? $legacy['databases'] : [];
+        foreach ($dbs as $db => $dbData) {
+            if (!is_array($dbData)) {
+                continue;
+            }
+            if (isset($dbData['dictionary'])) {
+                $state['databases'][$db]['dictionary'] = $dbData['dictionary'];
+            }
+            foreach ($attrMap as $legacyKey => $newKey) {
+                $byTable = $dbData[$legacyKey] ?? null;
+                if (!is_array($byTable)) {
+                    continue;
+                }
+                foreach ($byTable as $table => $value) {
+                    if ($value !== [] && $value !== null) {
+                        $formatting['databases'][$db]['tables'][$table][$newKey] = $value;
+                    }
+                }
+            }
+        }
+
+        return [$state, $formatting];
+    }
+
+    /** @return array<string,mixed>|null null = file absent or unparseable */
+    private static function readJson(string $path): ?array
+    {
+        if (!is_file($path)) {
+            return null;
+        }
+        $raw = @file_get_contents($path);
+        if ($raw === false || trim($raw) === '') {
+            return null;
         }
         $decoded = json_decode($raw, true);
         if (!is_array($decoded)) {
-            my::lineout('FILE:FILE', 'settings parse failed', $this->path);
-            return [];
+            my::lineout('FILE:FILE', 'settings parse failed', $path);
+            return null;
         }
         return $decoded;
     }
 
-    private function save(): void
+    private function saveState(): void
     {
+        $this->write($this->statePath(), $this->state);
+    }
+
+    private function saveFormatting(): void
+    {
+        // A header comment makes the hand-edited formatting file self-explanatory.
+        $data = $this->formatting;
+        $data = ['_comment' => 'sqli per-column display settings — safe to hand-edit. '
+            . 'databases > <host:port/db> > tables > <table> > { hidden:[cols], order:[cols], '
+            . 'widths:{col:width}, formats:{col:formatId} }. Delete any key to reset it.']
+            + $data;
+        $this->write($this->formattingPath(), $data);
+    }
+
+    /** @param array<string,mixed> $data */
+    private function write(string $path, array $data): void
+    {
+        if ($this->muted) {
+            return; // user chose not to persist this session
+        }
+        if ($this->dir === null) {
+            $this->pendingSave = true; // nowhere to write yet — app will prompt
+            return;
+        }
+        if (!is_dir($this->dir) && !@mkdir($this->dir, 0700, true) && !is_dir($this->dir)) {
+            $this->writeError = "Could not create {$this->dir}: " . self::lastOsError();
+            my::lineout('FILE:FILE', 'settings mkdir failed', $this->dir);
+            return;
+        }
         $json = json_encode(
-            $this->data,
+            $data,
             JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
         );
         if ($json === false) {
-            my::lineout('FILE:FILE', 'settings encode failed', $this->path);
+            my::lineout('FILE:FILE', 'settings encode failed', $path);
             return;
         }
-        @file_put_contents($this->path, $json . PHP_EOL);
+        if (@file_put_contents($path, $json . PHP_EOL) === false) {
+            $this->writeError = "Could not write $path: " . self::lastOsError();
+            my::lineout('FILE:FILE', 'settings write failed', $path);
+        }
+    }
+
+    /** The most recent PHP/OS error message, for user-facing write failures. */
+    private static function lastOsError(): string
+    {
+        $e = error_get_last();
+        return $e !== null ? $e['message'] : 'permission denied or path not writable';
     }
 }

@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Sqli2\Terminal;
+namespace Sqli\Terminal;
 
 use FFI;
 
@@ -108,6 +108,30 @@ final class WindowsConsole
             $newOut = $this->origOutMode | self::ENABLE_VIRTUAL_TERMINAL_PROCESSING;
             $this->ffi->SetConsoleMode($this->hOut, $newOut);
         }
+    }
+
+    /**
+     * Turn **only** input echo off, leaving line editing and Ctrl+C processing
+     * alone, and return the restorer. Used by {@see PasswordPrompt} before the
+     * TUI starts — unlike {@see enableRawMode()} this wants the console's normal
+     * line reader, just without the characters appearing on screen.
+     *
+     * Null when the mode could not be read: PHP for Windows under a
+     * non-console host (mintty/Git Bash) has no real console handle.
+     *
+     * @return callable():void|null
+     */
+    public function disableEcho(): ?callable
+    {
+        $mode = $this->ffi->new('unsigned long');
+        if (!$this->ffi->GetConsoleMode($this->hIn, FFI::addr($mode))) {
+            return null;
+        }
+        $orig = $mode->cdata;
+        $this->ffi->SetConsoleMode($this->hIn, $orig & ~self::ENABLE_ECHO_INPUT);
+        return function () use ($orig): void {
+            $this->ffi->SetConsoleMode($this->hIn, $orig);
+        };
     }
 
     /** Restore the console modes captured by enableRawMode(). */

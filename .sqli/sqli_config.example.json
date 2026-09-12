@@ -1,0 +1,52 @@
+{
+  "_comment": "Example sqli config. Copy to $SQLI_HOME/.sqli/sqli_config.json (global; $SQLI_HOME defaults to your home dir) and/or <project>/.sqli/sqli_config.json. Every .sqli/ dir from the cwd up to the filesystem root is a layer; closest to the cwd wins per key. Layers, low->high: built-in defaults < global < project layers (farthest..closest) < --config/$SQLI_CONFIG < --user-config/$SQLI_USER_CONFIG < credentials < CLI flags. A file's base is its flat option keys and/or a `defaults{}` block; `envs{}` holds named environments picked with -e NAME / -e=NAME / --env NAME / $SQLI_ENV, or by an `env` key in `defaults{}` when the command line and the environment name none. Envs may `extends` another env. Passwords belong in `.sqli/sqli_credentials.json` (see sqli_credentials.example.json), not here. Paths may use ${SQLI_HOME} and a leading ~. `dictionary` points at wherever your team keeps the Data Dictionary — a shared drive, the project repo, anywhere; it is a company document, not an sqli file, so sqli never creates a folder for it or presumes a location. Macros — the `?name` snippets the CLI expands, with or without arguments, and the `?{name}` values it asks for when a statement runs (spec §23) — live beside this file in `sqli_macros.ini`, layered by the same closest-wins rule; that one is INI rather than JSON, because a macro is one line of SQL and JSON spends most of a line escaping it. It reads the envs named here too: a `[env:NAME]` section in that file loads only under -e NAME, so one macro name can hold a different id per server, and with no -e no such section loads at all. See sqli_macros.example.ini. Validate any of these files with `php sqli.php --lint`. Unknown keys (like this _comment, and reserved top-level sections other than defaults/envs) are ignored.",
+
+  "_env_note": "`env` in `defaults{}` is the env sqli uses when nothing on the command line names one — so `sqli` typed bare inside a project dir opens that project's server instead of localhost-with-no-database. It belongs in `defaults{}` (or at the file's flat root — it is read from the file's base like any other option, with defaults{} winning); it may NOT go inside an envs{} block, where an environment naming an environment means nothing and `extends` is the key you want. It must name an env some layer's envs{} defines, and it follows the same closest-wins cascade as everything else here: a project .sqli/ overrides the global one, and an empty value (\"\") means 'no default in this directory', which is how a project cancels a global default rather than inheriting it. Precedence: -e NAME beats $SQLI_ENV, which beats this. `--no-env` ignores $SQLI_ENV and this one for a single run (an explicit -e still wins over it), which is the way back to a bare session. sqli prints one line at startup naming the env when it came from here, since that is the only selected env that leaves no trace on the command line — and a default naming an env nothing defines is caught by `php sqli.php --lint` before it stops sqli from starting.",
+
+  "defaults": {
+    "env": "local",
+    "theme": "default",
+    "truecolor": "auto",
+    "dictionary": "//fileserver/Engineering/Schema/app_DD.csv"
+  },
+
+  "_theme_note": "`theme` is a Base16 scheme name. Themes are user assets: drop any Base16 scheme file (base00..base0F) into .sqli/themes/ (project or global) — hundreds are at github.com/tinted-theming/schemes, and the one that ships in .sqli/themes/ (nord.yaml) is Nord taken unmodified from there — the file's base name is the theme name, so it appears as `nord`. Only `<default>` (Base16 Default Dark) is built into the code — it is always offered in the theme pickers, can be edited and saved under a new name but never overwritten, and setting theme to \"<default>\" forces it, overriding any theme saved from the app. The bare name `default` means \"unspecified\", so a default.yaml on the search path reskins the fallback. `truecolor` is auto|on|off — auto detects 24-bit support and falls back to 256-color otherwise. `php sqli.php --lint` lists available themes.",
+
+  "envs": {
+    "base": {
+      "user": "admin",
+      "port": 3306
+    },
+
+    "local": {
+      "extends": "base",
+      "host": "localhost",
+      "database": "devel"
+    },
+
+    "devel": {
+      "extends": "base",
+      "host": "database-devel.cluster-example.us-east-1.rds.amazonaws.com",
+      "database": "devel"
+    },
+
+    "prod": {
+      "extends": "base",
+      "host": "database-1.cluster-example.us-east-1.rds.amazonaws.com",
+      "database": "prod",
+      "comment": "PROD - careful",
+      "read-only": true,
+      "ssl-mode": "verify-ca",
+      "ssl-ca": "${SQLI_HOME}/.sqli/certs/rds-ca.pem",
+      "compress": true,
+      "read-timeout": 900,
+      "init-command": "SET SESSION max_execution_time = 30000"
+    }
+  },
+
+  "_comment_note": "`comment` is a short note sqli pins to the header row, in brackets and in its own colour, right after the CLI/DATA tag: ` sqli v2.36.1  CLI [PROD - careful] `. It answers the question the rest of the header cannot — which of the four windows you have open is this one — so it is worth setting on any env you would rather not type into by accident. Set it per env (as `prod` does above), or in `defaults` for a note that applies everywhere, or with `--comment \"...\"` for one run. It can also be set or cleared live from System menu -> Header Comment, but that lasts the session only; this file is where a permanent one lives. It is folded to one line and cut at 40 characters, and the header truncates it further when the row is narrow, so keep it short.",
+
+  "_connection_note": "The rest of the connection settings, all of them fixed when the connection opens — there is no way to change any of them from inside the running app, because the driver offers none. `connect-timeout` (seconds, default 10, 0 = leave it to the OS) bounds the connect only, never a query. `read-timeout` (seconds, default 1800, 0 = leave PHP's own setting alone) is how long the client waits for the server to say ANYTHING; it measures silence between packets, not the length of a query, so a million-row result never trips it while a long aggregate that returns nothing until it finishes will — and note that it drops the connection, not the query, which keeps running on the server. `init-command` runs on every connect and every automatic reconnect and must be a single SET (`SET SESSION max_execution_time = 30000` is the useful one — it makes the server kill a runaway SELECT, which a read timeout cannot); anything else is refused, and so is a SET disguised behind a comment. `compress` compresses the protocol, worth it for large result sets over a WAN. `found-rows` makes an UPDATE report rows matched instead of rows changed. `multi-statements` (default off) controls whether the server will accept several statements in one packet; sqli splits input client-side and sends one statement at a time regardless, so leaving it off costs nothing and closes a class of bypass. `ignore-space` allows a space between a function name and its ( — it also makes function names reserved words, so a column called `count` will start needing backticks. `driver` is auto|mysqli|pdo (default auto) and picks the extension the connection is opened with: mysqli is the only one that can run a statement without blocking the process, and therefore the only one on which Esc can cancel a running query, so `auto` takes it wherever the build has it and falls back to pdo where it does not; `pdo` forces the old path; `mysqli` demands it and fails at startup on a build without it, rather than quietly connecting with no way to cancel. `local-infile` (default false) allows LOAD DATA LOCAL INFILE, and is the one option in this file that is about security rather than behaviour: in that protocol the SERVER names a file and the CLIENT sends it, so any server you connect to with this on can ask for anything the sqli process can read, in answer to an ordinary SELECT. Measured on the wire, not assumed - off, the client refuses with 2068 and zero bytes leave the machine; on, the file is handed over. Leave it off unless you are loading a file right now, prefer server-side LOAD DATA (without LOCAL) where you can, and note that sqli refuses to start with local-infile and read-only together, since those two disagree about how far the session is trusted. It is deliberately not shown in the header; `php sqli.php --lint` prints the resolved set, including which driver `auto` chose and whether local-infile is on.",
+
+  "_ssl_note": "`ssl-mode` is disabled|preferred|required|verify-ca|verify-identity, same vocabulary as the mysql client. Default is `preferred`: TLS when the server offers it, plaintext when it doesn't. Use `required` when the server sets require_secure_transport=ON and you have no CA file to check it against; use `verify-ca` (or `verify-identity`, which also matches the hostname) with `ssl-ca` pointing at the CA .pem when you do — those two modes refuse to start without it. `ssl-cert` + `ssl-key` are only needed for accounts created with REQUIRE X509; plain REQUIRE SSL needs neither, and one without the other is an error. After connecting, sqli reads the session's Ssl_cipher and shows it on the status line — under required/verify-* an unencrypted session is refused rather than reported. Alternatives: `ssl-capath` (a directory of CA certs) instead of `ssl-ca`; `ssl-cipher` to restrict the TLS 1.2-and-below cipher list; `server-public-key` (the one option here that is not TLS) for caching_sha2_password auth over an unencrypted link. PDO exposes no knob for tls-version, TLS 1.3 ciphersuites, CRL checking or FIPS — enforce those server-side."
+}

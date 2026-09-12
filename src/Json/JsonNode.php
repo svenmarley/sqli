@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Sqli2\Json;
+namespace Sqli\Json;
 
 /**
  * One node in a parsed JSON document tree (§10). A node is either a container

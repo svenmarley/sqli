@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Sqli2\Json;
+namespace Sqli\Json;
 
 /**
  * A parsed, editable JSON document tree (spec §10). Pure — no I/O, no terminal.

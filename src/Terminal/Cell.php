@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Sqli2\Terminal;
+namespace Sqli\Terminal;
 
 /**
  * A single terminal cell: one visible character plus its style.

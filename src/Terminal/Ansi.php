@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Sqli2\Terminal;
+namespace Sqli\Terminal;
 
 /**
  * Raw ANSI / VT escape sequences. Pure constants and tiny helpers — no state.
@@ -27,9 +27,18 @@ final class Ansi
     public const AUTOWRAP_OFF   = "\e[?7l";
     public const AUTOWRAP_ON    = "\e[?7h";
 
-    // Mouse tracking: button events + SGR extended coordinates (1006).
-    public const MOUSE_ON  = "\e[?1000h\e[?1006h";
-    public const MOUSE_OFF = "\e[?1006l\e[?1000l";
+    // Mouse tracking: 1000 = button press/release, 1002 = ALSO report motion while a
+    // button is held (drag), 1006 = SGR extended coordinates. Without 1002 the
+    // terminal sends no drag bytes, so every drag feature — selection-extend, and the
+    // framed editors' title-bar move / grip resize — silently does nothing.
+    public const MOUSE_ON  = "\e[?1000h\e[?1002h\e[?1006h";
+    public const MOUSE_OFF = "\e[?1006l\e[?1002l\e[?1000l";
+
+    // Bracketed paste (DEC 2004): the terminal wraps pasted text in
+    // ESC[200~ … ESC[201~ so the app can insert it literally instead of
+    // decoding embedded newlines as Enter presses (§4, CLI paste).
+    public const BRACKETED_PASTE_ON  = "\e[?2004h";
+    public const BRACKETED_PASTE_OFF = "\e[?2004l";
 
     // Cursor position report request (device status report).
     public const REPORT_CURSOR = "\e[6n";

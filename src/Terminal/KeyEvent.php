@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Sqli2\Terminal;
+namespace Sqli\Terminal;
 
 /**
  * A decoded keyboard event.

@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Sqli2\Terminal;
+namespace Sqli\Terminal;
 
 /**
  * Decodes raw STDIN bytes into KeyEvent / MouseEvent objects.
@@ -46,7 +46,7 @@ final class InputReader
     }
 
     /**
-     * @return array<int, KeyEvent|MouseEvent>
+     * @return array<int, KeyEvent|MouseEvent|PasteEvent>
      */
     public function poll(): array
     {
@@ -157,6 +157,17 @@ final class InputReader
                 };
             }
 
+            // ESC CR / ESC LF  =>  Alt+Enter (§4: force a continuation line).
+            // This must come before the Ctrl+Alt+letter rule below, which would
+            // otherwise claim 0x0d as Ctrl+Alt+M and swallow the key. Alt+Enter
+            // is the only modifier+Enter that survives the trip: Shift+Enter and
+            // Ctrl+Enter both arrive as a bare 0x0d, indistinguishable from
+            // Enter, and disambiguating them needs xterm `modifyOtherKeys`, which
+            // was tried and deliberately reverted.
+            if ($b1 === "\r" || $b1 === "\n") {
+                return [KeyEvent::special(Key::Enter, alt: true), 2];
+            }
+
             // ESC <ctrl-byte>  =>  Ctrl+Alt+letter (e.g. ESC 0x03 = Ctrl+Alt+C).
             $b1ord = ord($b1);
             if ($b1ord >= 0x01 && $b1ord <= 0x1a) {
@@ -216,6 +227,18 @@ final class InputReader
     private function decodeCsi(): ?array
     {
         $len = strlen($this->buf);
+
+        // Bracketed paste: ESC [ 200 ~ <text> ESC [ 201 ~. Deliver the whole
+        // block as one PasteEvent so embedded newlines/escapes are inserted
+        // literally instead of being decoded as Enter/arrow keypresses (§4).
+        if (str_starts_with($this->buf, "\e[200~")) {
+            $end = strpos($this->buf, "\e[201~");
+            if ($end === false) {
+                return null; // end marker not here yet — wait for more bytes
+            }
+            $text = substr($this->buf, 6, $end - 6);
+            return [new PasteEvent($text), $end + 6];
+        }
 
         // SGR mouse: ESC [ < params (M|m)
         if ($len >= 3 && $this->buf[2] === '<') {

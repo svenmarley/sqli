@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Sqli2\Db;
+namespace Sqli\Db;
 
 /**
  * Pure comparison of a Data Dictionary table against the live MySQL schema

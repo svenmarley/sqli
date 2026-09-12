@@ -2,17 +2,20 @@
 
 declare(strict_types=1);
 
-namespace Sqli2\Db;
+namespace Sqli\Db;
+
+use Sqli\Support\Path;
 
 /**
  * A loaded Data Dictionary: a CSV documentation layer over the live MySQL schema
  * (spec §11).
  *
- * CSV shape: `Table, Field, Type, Comment, Nullable, Key, Default[, FKey]`.
+ * CSV shape: `Table, Field, Type, Comment, Nullable, Key, Default[, FKey][, Format]`.
  * A row with a blank Field is the table-level description; every other row is one
  * field. Column positions are detected from the header (by name, case-insensitive)
  * with sensible positional fallbacks, so minor header wording differences are
- * tolerated.
+ * tolerated. The optional `Format` column marks a field's display format (e.g.
+ * `epoch`) so it renders formatted without a manual toggle (§6 backlog S / §11).
  *
  * The raw rows are kept verbatim so edits (e.g. a comment change) and {@see save()}
  * round-trip the file without disturbing anything else.
@@ -53,6 +56,12 @@ final class DataDictionary
     /** Load a dictionary from a CSV path; null if missing/unreadable/empty. */
     public static function load(string $path): ?self
     {
+        // A saved path may be spelled for another runtime (a WSL `/mnt/d/…` opened
+        // under native Windows, or vice-versa). Resolve to the form that exists
+        // here before touching it; native Linux/Windows paths pass through. The
+        // resolved path is what we keep, so saves and the Archives dir land beside
+        // the file we actually read.
+        $path = Path::resolve($path);
         if ($path === '' || !is_file($path) || !is_readable($path)) {
             return null;
         }
@@ -110,6 +119,49 @@ final class DataDictionary
         return $this->path;
     }
 
+    /**
+     * Snapshot the current on-disk CSV into a sibling `Archives/` directory before
+     * it is edited (§11). The copy is named `<basename>-NNN.csv` with a zero-padded
+     * 3-digit counter one past the highest existing snapshot (first is `-000`).
+     *
+     * A **no-op returning null** when there is no `Archives/` subdir next to the
+     * file (the feature is opt-in by that directory's existence), the file is
+     * missing, or the copy fails. Returns the archive path on success. Callers
+     * gate this to once per file per session.
+     */
+    public function archive(): ?string
+    {
+        if ($this->path === '' || !is_file($this->path)) {
+            return null;
+        }
+        $dir = dirname($this->path) . DIRECTORY_SEPARATOR . 'Archives';
+        if (!is_dir($dir)) {
+            return null; // opt-in: only archive when the Archives dir exists
+        }
+        $base = pathinfo($this->path, PATHINFO_FILENAME); // name without .csv
+        $dest = $dir . DIRECTORY_SEPARATOR . $base . '-'
+            . sprintf('%03d', $this->nextArchiveIndex($dir, $base)) . '.csv';
+        return @copy($this->path, $dest) ? $dest : null;
+    }
+
+    /**
+     * The next archive counter for `<base>-NNN.csv` in $dir: one past the highest
+     * existing number (0 when none exist). Anchored to the exact base so a base
+     * that itself ends in digits can't be mismatched; `\d{3,}` tolerates a roll
+     * past 999.
+     */
+    private function nextArchiveIndex(string $dir, string $base): int
+    {
+        $max = -1;
+        $re = '/^' . preg_quote($base, '/') . '-(\d{3,})\.csv$/i';
+        foreach ((array) @scandir($dir) as $name) {
+            if (preg_match($re, (string) $name, $m) === 1) {
+                $max = max($max, (int) $m[1]);
+            }
+        }
+        return $max + 1;
+    }
+
     /** @return list<string> table names in CSV order */
     public function tableNames(): array
     {
@@ -163,6 +215,21 @@ final class DataDictionary
             ];
         }
         return $out;
+    }
+
+    /**
+     * A field's declared display-format id from the optional `Format` column
+     * (lowercased/trimmed, e.g. `epoch`), or '' when unset or the field/column is
+     * absent. Read-only documentation the app maps onto a
+     * {@see \Sqli\Format\ColumnFormats} format (§6/§11).
+     */
+    public function format(string $table, string $field): string
+    {
+        $idx = $this->byTable[$table]['fields'][$field] ?? null;
+        if ($idx === null) {
+            return '';
+        }
+        return strtolower(trim($this->rows[$idx][$this->ci['format']] ?? ''));
     }
 
     /** A single field's comment, or null when the field isn't in the dictionary. */
@@ -300,6 +367,296 @@ final class DataDictionary
         return $merged ? self::SAVE_MERGED : self::SAVE_OK;
     }
 
+    /**
+     * Sync a table's structural metadata from the live schema (Ctrl+U, §11).
+     *
+     * Overwrites each documented field's type/nullable/key/default from the
+     * matching `SHOW COLUMNS` row, **preserving comments and format**, appends any
+     * live column the DD doesn't document yet (with an empty comment), and
+     * **removes any DD field that no longer exists in the live table** (a field the
+     * DB has dropped). The archive snapshot taken before the edit preserves the
+     * removed rows if they are ever needed. Same read-modify-write concurrency
+     * contract as {@see save()}: refuses when the file is locked, and re-reads a
+     * changed file first so a co-worker's comment edits survive the rewrite.
+     *
+     * @param list<array<string,mixed>> $liveColumns raw SHOW COLUMNS rows
+     * @return array{status:string,updated:int,added:list<string>,removed:list<string>}
+     */
+    public function sync(string $table, array $liveColumns): array
+    {
+        if ($this->path === '') {
+            return ['status' => self::SAVE_FAILED, 'updated' => 0, 'added' => [], 'removed' => []];
+        }
+        if ($this->isLocked()) {
+            return ['status' => self::SAVE_LOCKED, 'updated' => 0, 'added' => [], 'removed' => []];
+        }
+
+        $merged = false;
+        if ($this->isStale()) {
+            $parsed = self::parseFile($this->path);
+            if ($parsed !== null) {
+                $this->header = $parsed[0];
+                $this->rows = $parsed[1];
+                $this->pending = [];
+                $this->reindex();
+                $merged = true;
+            }
+        }
+
+        $applied = $this->applySchemaSync($table, $liveColumns);
+
+        if (!$this->writeAtomically()) {
+            return ['status' => self::SAVE_FAILED, 'updated' => 0, 'added' => [], 'removed' => []];
+        }
+        $this->captureStat();
+        $this->pending = [];
+        return [
+            'status'  => $merged ? self::SAVE_MERGED : self::SAVE_OK,
+            'updated' => $applied['updated'],
+            'added'   => $applied['added'],
+            'removed' => $applied['removed'],
+        ];
+    }
+
+    /**
+     * Create DD entries for live tables the dictionary doesn't document yet (§11),
+     * writing one row per live column with an empty comment for the user to fill in.
+     * All requested tables are created in a single atomic write — one lock check,
+     * one merge, one rewrite — rather than a save per table.
+     *
+     * Same shared-drive contract as {@see save()}/{@see sync()}: refuses when the
+     * file is held open elsewhere, and re-reads + merges an externally changed file
+     * first so a co-worker's edits survive. A table that turned out to be documented
+     * after that merge is skipped rather than duplicated.
+     *
+     * @param array<string,list<array<string,mixed>>> $spec table name => raw SHOW COLUMNS rows
+     * @return array{status:string,created:list<string>,fields:int,skipped:list<string>}
+     */
+    public function createTables(array $spec): array
+    {
+        if ($this->path === '') {
+            return ['status' => self::SAVE_FAILED, 'created' => [], 'fields' => 0, 'skipped' => []];
+        }
+        if ($this->isLocked()) {
+            return ['status' => self::SAVE_LOCKED, 'created' => [], 'fields' => 0, 'skipped' => []];
+        }
+
+        $merged = false;
+        if ($this->isStale()) {
+            $parsed = self::parseFile($this->path);
+            if ($parsed !== null) {
+                $this->header = $parsed[0];
+                $this->rows = $parsed[1];
+                $this->pending = [];
+                $this->reindex();
+                $merged = true;
+            }
+        }
+
+        $created = [];
+        $skipped = [];
+        $fields = 0;
+        foreach ($spec as $table => $liveColumns) {
+            $name = trim((string) $table);
+            if ($name === '') {
+                continue;
+            }
+            $added = $this->applyCreateTable($name, $liveColumns);
+            if ($added > 0) {
+                $created[] = $name;
+                $fields += $added;
+            } else {
+                $skipped[] = $name;
+            }
+        }
+
+        if ($created === []) {
+            // Nothing to write — don't touch the file (and don't report a failure;
+            // the caller turns an empty 'created' into its own status).
+            return ['status' => self::SAVE_OK, 'created' => [], 'fields' => 0, 'skipped' => $skipped];
+        }
+        if (!$this->writeAtomically()) {
+            return ['status' => self::SAVE_FAILED, 'created' => [], 'fields' => 0, 'skipped' => $skipped];
+        }
+        $this->captureStat();
+        $this->pending = [];
+        return [
+            'status'  => $merged ? self::SAVE_MERGED : self::SAVE_OK,
+            'created' => $created,
+            'fields'  => $fields,
+            'skipped' => $skipped,
+        ];
+    }
+
+    /**
+     * Insert a block of rows documenting one previously-unknown table. Returns the
+     * number of field rows added, or 0 if the table is already documented (so a
+     * concurrent add merged in from disk can't produce a duplicate block) or has
+     * no usable live columns.
+     *
+     * @param list<array<string,mixed>> $liveColumns
+     */
+    private function applyCreateTable(string $table, array $liveColumns): int
+    {
+        if (isset($this->byTable[$table])) {
+            return 0;
+        }
+        $width = max(count($this->header), max($this->ci) + 1);
+        $newRows = [];
+        foreach ($liveColumns as $col) {
+            $name = trim((string) ($col['Field'] ?? ''));
+            if ($name === '') {
+                continue;
+            }
+            $row = array_fill(0, $width, '');
+            $row[$this->ci['table']] = $table;
+            $row[$this->ci['field']] = $name;
+            $this->writeSchemaCells($row, $col);
+            $newRows[] = $row;
+        }
+        if ($newRows === []) {
+            return 0;
+        }
+        array_splice($this->rows, $this->newTableInsertPos(), 0, $newRows);
+        $this->reindex();
+        return count($newRows);
+    }
+
+    /**
+     * Row index at which a brand-new table's block goes: the end of the dictionary
+     * proper. That is *not* simply the end of the file — the user may append a
+     * "--- Database Server Info ---" metadata section below the dictionary, which
+     * {@see reindex()} stops at. Rows spliced after that marker would be written to
+     * the CSV but never indexed, so the new table would silently not exist.
+     */
+    private function newTableInsertPos(): int
+    {
+        foreach ($this->rows as $idx => $row) {
+            if (self::isServerInfoMarker(trim($row[$this->ci['table']] ?? ''))) {
+                return $idx;
+            }
+        }
+        return count($this->rows);
+    }
+
+    /**
+     * Rewrite $table's structural cells from the live columns and append any
+     * undocumented live fields. Reindexes when rows are inserted so the in-memory
+     * view (and the next diff) reflect the new fields.
+     *
+     * @param list<array<string,mixed>> $liveColumns
+     * @return array{updated:int,added:list<string>}
+     */
+    private function applySchemaSync(string $table, array $liveColumns): array
+    {
+        if (!isset($this->byTable[$table])) {
+            return ['updated' => 0, 'added' => []]; // viewer only offers DD tables
+        }
+        // Existing fields by lower-cased name → row index (MySQL names are ci).
+        $existing = [];
+        foreach ($this->byTable[$table]['fields'] as $name => $idx) {
+            $existing[strtolower((string) $name)] = $idx;
+        }
+        $width = max(count($this->header), max($this->ci) + 1);
+
+        $updated = 0;
+        $added = [];
+        $newRows = [];
+        foreach ($liveColumns as $col) {
+            $name = trim((string) ($col['Field'] ?? ''));
+            if ($name === '') {
+                continue;
+            }
+            $key = strtolower($name);
+            if (isset($existing[$key])) {
+                $this->writeSchemaCells($this->rows[$existing[$key]], $col);
+                $updated++;
+            } else {
+                $row = array_fill(0, $width, '');
+                $row[$this->ci['table']] = $table;
+                $row[$this->ci['field']] = $name;
+                $this->writeSchemaCells($row, $col);
+                $newRows[] = $row;
+                $added[] = $name;
+            }
+        }
+        if ($newRows !== []) {
+            array_splice($this->rows, $this->fieldInsertPos($table), 0, $newRows);
+            $this->reindex();
+        }
+
+        // Prune DD fields that no longer exist in the live table (§11). The DD is
+        // the documentation of what the DB actually is, so a field the DB dropped
+        // is removed here rather than left flagged forever. The archive snapshot
+        // taken before the edit preserves the removed rows' comments if needed.
+        $liveNames = [];
+        foreach ($liveColumns as $col) {
+            $n = strtolower(trim((string) ($col['Field'] ?? '')));
+            if ($n !== '') {
+                $liveNames[$n] = true;
+            }
+        }
+        $removeIdx = [];
+        $removed = [];
+        foreach ($this->byTable[$table]['fields'] as $name => $idx) {
+            if (!isset($liveNames[strtolower((string) $name)])) {
+                $removeIdx[] = $idx;
+                $removed[] = (string) $name;
+            }
+        }
+        if ($removeIdx !== []) {
+            rsort($removeIdx); // delete high indices first so lower ones stay valid
+            foreach ($removeIdx as $i) {
+                array_splice($this->rows, $i, 1);
+            }
+            $this->reindex();
+        }
+
+        return ['updated' => $updated, 'added' => $added, 'removed' => $removed];
+    }
+
+    /**
+     * Copy the structural columns (type/nullable/key/default) from a SHOW COLUMNS
+     * row into a DD row in place, leaving Comment/Format untouched. Pads the row
+     * if a detected column index sits past its current width.
+     *
+     * @param list<string> $row
+     * @param array<string,mixed> $col
+     */
+    private function writeSchemaCells(array &$row, array $col): void
+    {
+        $set = static function (array &$r, int $i, string $v): void {
+            while (count($r) <= $i) {
+                $r[] = '';
+            }
+            $r[$i] = $v;
+        };
+        $default = $col['Default'] ?? null;
+        $set($row, $this->ci['type'], (string) ($col['Type'] ?? ''));
+        $set($row, $this->ci['nullable'], (string) ($col['Null'] ?? ''));
+        $set($row, $this->ci['key'], (string) ($col['Key'] ?? ''));
+        $set($row, $this->ci['default'], $default === null ? '' : (string) $default);
+    }
+
+    /**
+     * Row index at which to insert new field rows for $table: after its last
+     * documented field (or description row) but before the read-only foreign-keys
+     * summary, so that marker stays the final row of the block (§11).
+     */
+    private function fieldInsertPos(string $table): int
+    {
+        $block = $this->byTable[$table];
+        $last = $block['desc'];
+        foreach ($block['fields'] as $idx) {
+            $last = max($last, $idx);
+        }
+        $fk = $block['fkeys'];
+        if ($fk >= 0 && $fk > $last) {
+            return $fk; // splice before the FK summary → it remains last
+        }
+        return $last >= 0 ? $last + 1 : count($this->rows);
+    }
+
     /** Re-apply pending cell edits onto the (freshly reindexed) rows. */
     private function applyPending(): void
     {
@@ -374,6 +731,9 @@ final class DataDictionary
             'key'      => $find(['key'], 5),
             'default'  => $find(['default'], 6),
             'fkey'     => $find(['fkey', 'foreign'], 7),
+            // Optional. Absent → index 8 (past the standard columns) reads '',
+            // so a DD without a Format column simply marks no formats.
+            'format'   => $find(['format'], 8),
         ];
 
         $this->tableOrder = [];

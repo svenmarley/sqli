@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Sqli2\Sql;
+namespace Sqli\Sql;
 
 /**
  * Outcome of a normalization pass (spec §5).

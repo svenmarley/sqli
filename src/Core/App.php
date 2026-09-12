@@ -2,32 +2,39 @@
 
 declare(strict_types=1);
 
-namespace Sqli2\Core;
+namespace Sqli\Core;
 
 use includes\my;
-use Sqli2\Config\Config;
-use Sqli2\Config\Settings;
-use Sqli2\Db\Database;
-use Sqli2\Db\DataDictionary;
-use Sqli2\Db\FieldValidator;
-use Sqli2\Db\QueryResult;
-use Sqli2\Db\Schema;
-use Sqli2\Db\SchemaDiff;
-use Sqli2\Input\InputBuffer;
-use Sqli2\Input\LineEditor;
-use Sqli2\Json\JsonNode;
-use Sqli2\Json\JsonTree;
-use Sqli2\Render\Renderer;
-use Sqli2\Render\Theme;
-use Sqli2\Sql\Completion;
-use Sqli2\Sql\CompletionResult;
-use Sqli2\Sql\Normalizer;
-use Sqli2\Terminal\Ansi;
-use Sqli2\Terminal\Key;
-use Sqli2\Terminal\KeyEvent;
-use Sqli2\Terminal\MouseEvent;
-use Sqli2\Terminal\Screen;
-use Sqli2\Terminal\Terminal;
+use Sqli\Config\Config;
+use Sqli\Config\Settings;
+use Sqli\Config\Macros;
+use Sqli\Db\Database;
+use Sqli\Db\DataDictionary;
+use Sqli\Db\FieldValidator;
+use Sqli\Db\QueryResult;
+use Sqli\Db\Schema;
+use Sqli\Db\SchemaDiff;
+use Sqli\Export\CsvExport;
+use Sqli\Format\ColumnFormats;
+use Sqli\Input\LineEditor;
+use Sqli\Json\JsonNode;
+use Sqli\Json\JsonTree;
+use Sqli\Render\Renderer;
+use Sqli\Render\Scheme;
+use Sqli\Render\SchemeLoader;
+use Sqli\Render\Theme;
+use Sqli\Terminal\Style;
+use Sqli\Sql\Completion;
+use Sqli\Sql\CompletionResult;
+use Sqli\Sql\Normalizer;
+use Sqli\Sql\Splitter;
+use Sqli\Terminal\Ansi;
+use Sqli\Terminal\Key;
+use Sqli\Terminal\KeyEvent;
+use Sqli\Terminal\MouseEvent;
+use Sqli\Terminal\PasteEvent;
+use Sqli\Terminal\Screen;
+use Sqli\Terminal\Terminal;
 
 /**
  * Application kernel: owns the event loop and wires the subsystems together.
@@ -43,6 +50,29 @@ final class App
         'INSERT', 'UPDATE', 'DELETE', 'REPLACE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'RENAME',
         'GRANT', 'REVOKE', 'LOAD', 'CALL',
     ];
+    /**
+     * Everything typed on the CLI that means "quit" (§18), lower-cased and with
+     * any trailing `;` already stripped by the caller.
+     *
+     * Only `exit`/`quit` are advertised. The rest are deliberately unadvertised
+     * muscle-memory aliases — vi (`:q`), sqlite/psql-style dot commands, and the
+     * conversational `bye` — kept out of the help, the status hints and the spec
+     * on purpose. None of them is valid SQL, so none can shadow a real statement.
+     *
+     * @var list<string>
+     */
+    private const QUIT_WORDS = ['exit', 'quit', ':q', '.exit', '.quit', 'bye'];
+
+    /**
+     * Data View Configuration actions that act on one column ({@see State::$popupCol})
+     * rather than on the whole table — the half of the menu that used to be F2.
+     * Everything else in that menu falls through to {@see applyLayoutActionStr()}.
+     */
+    private const COLUMN_ACTIONS = [
+        'sort_asc', 'sort_desc', 'move', 'width', 'fit', 'fit_all',
+        'format_epoch', 'copy_col', 'hide',
+    ];
+
     private const SIZE_POLL_INTERVAL = 0.3; // seconds between terminal-size checks
     // After a resize we keep forcing full redraws for a short settle window: the
     // terminal finishes resizing its viewport a few ms after FFI reports the new
@@ -52,21 +82,71 @@ final class App
     private const FRAME_SLEEP_US = 8000;    // ~8ms idle pause; only diffs are flushed
     private const DD_LOCK_POLL = 2.0;       // seconds between DD file-lock checks while the viewer is open
     private const AUTO_LIMIT = 1000;        // rows a SELECT/WITH is auto-capped at when it has no LIMIT (§5)
+    /** MySQL's code for a statement stopped by KILL QUERY — i.e. a successful cancel (§21). */
+    private const INTERRUPTED = 1317;
+    /**
+     * Seconds between a lost connection and the statement going back out by
+     * itself (§2).
+     *
+     * Was a full second, which bought the time to *read* the error. There is no
+     * error to read any more — a loss sqli can handle is handled in silence —
+     * so what is left to buy is one frame of the `!db` marker and a moment's
+     * pause before coming straight back at a server that just dropped us.
+     * Waited out in the frame loop, never slept through: the clock, the spinner
+     * and Esc all stay live across it.
+     */
+    private const RESEND_DELAY = 0.3;
+
+    /**
+     * Seconds the header's `!db` marker stays up after the link is good again
+     * (§2). The whole of a handled loss can pass in under half a second; this is
+     * what makes it something the user saw rather than something that merely
+     * happened.
+     */
+    private const LINK_LINGER = 3.0;
 
     private Terminal $terminal;
     private Screen $screen;
     private Renderer $renderer;
+    /** The theme currently driving the Renderer (swapped live by the editor, §13). */
+    private Theme $theme;
+    /** Theme to restore if the editor is closed without saving, or null. */
+    private ?Theme $themeBackup = null;
     private State $state;
-    private InputBuffer $input;
+    /**
+     * The CLI's multi-line SQL input. A single {@see LineEditor} holds the whole
+     * buffer as `\n`-joined text (each continuation line is a "\n" grapheme), so
+     * the CLI shares the one editing core with every modal field — flat-offset
+     * selection, word moves, mouse mapping (§4). The executed/stored SQL keeps
+     * those newlines ({@see cliText()}), because a line comment ends on one.
+     */
+    private LineEditor $input;
     private Normalizer $normalizer;
     private Completion $completion;
     private Schema $schema;
+    /**
+     * Macros (§23): the `?name` snippets — with or without arguments —
+     * read from the `.sqli/` layers and expanded into a submission before it is
+     * split. Edited outside sqli, so the viewer's `r` re-reads it; the app never
+     * writes this file.
+     */
+    private Macros $macros;
 
     private int $historyIdx = 0;
     private string $historySaved = '';
     private int $execHistoryIdx = 0;
     private string $execHistorySaved = '';
     private float $lastSizeCheck = 0.0;
+    /** Frames drawn since the last heartbeat line, and when that line was written. */
+    private int $heartbeatFrames = 0;
+    private float $lastHeartbeat = 0.0;
+    /**
+     * Worst time any single frame spent in each phase of the loop since the last
+     * heartbeat. Four microtime() calls a frame buys the difference between "the
+     * app is stuck" and "the app is stuck in draw", which is the whole question.
+     * @var array<string,float>
+     */
+    private array $phaseMax = ['input' => 0.0, 'query' => 0.0, 'resize' => 0.0, 'draw' => 0.0];
     private float $resizeRedrawUntil = 0.0;
     /** Next time (microtime) to re-probe whether the DD file is locked elsewhere. */
     private float $ddLockNextCheck = 0.0;
@@ -79,9 +159,30 @@ final class App
 
     /** Cursor-to-origin offset [dx,dy] while dragging the cell inspector, or null (§9). */
     private ?array $popupDrag = null;
+    /** Title-bar drag of the framed cell editor: [dx,dy] into the box, or null (§9). */
+    private ?array $editorDrag = null;
+    /** True while the framed cell editor's corner grip is being dragged (§9). */
+    private bool $editorResizing = false;
+
+    /** True while a left-drag begun in the CLI region is extending a text selection (§4). */
+    private bool $cliSelecting = false;
+
+    /** True while a left-drag begun in a modal edit field is extending its selection (§4). */
+    private bool $modalSelecting = false;
 
     /** The loaded Data Dictionary for the current database, or null (§11). */
     private ?DataDictionary $dictionary = null;
+
+    /**
+     * True once a lazy DD load has been attempted for the current database, so a
+     * failed load (e.g. a stale/unresolvable saved path) is not retried — and its
+     * "Loading Data Dictionary …" notice re-flashed — on every subsequent query.
+     * Reset whenever the DD is dropped (a USE to another db).
+     */
+    private bool $ddLoadAttempted = false;
+
+    /** DD file paths already archived this session (archive-before-first-edit, §11). @var list<string> */
+    private array $ddArchivedPaths = [];
 
     /** The parsed JSON document being viewed/edited, or null (§10). */
     private ?JsonTree $jsonTree = null;
@@ -89,13 +190,23 @@ final class App
      * Flattened JSON rows (with live JsonNode refs) for the open document, so a
      * key/toggle/edit acts on the exact node the user selected. The renderer gets
      * a node-stripped projection via State (see publishJson()).
-     * @var list<array{node:\Sqli2\Json\JsonNode,depth:int,label:string,value:string,type:string,container:bool,expanded:bool,childCount:int,editable:bool}>
+     * @var list<array{node:\Sqli\Json\JsonNode,depth:int,label:string,value:string,type:string,container:bool,expanded:bool,childCount:int,editable:bool}>
      */
     private array $jsonRows = [];
 
     /** Where a not-yet-named new object member will be inserted (§10 add flow). */
     private ?JsonNode $jsonAddContainer = null;
     private int $jsonAddPos = 0;
+    /**
+     * Documents descended into with `j` from inside the viewer (§10), outermost
+     * first. Each frame remembers the tree left behind, the **string leaf** the
+     * nested document came out of, that leaf's original text, and where the
+     * cursor was — everything {@see jsonAscend()} needs to put an edited
+     * document back where it was found and land the user where they left.
+     *
+     * @var list<array{tree:JsonTree,node:JsonNode,original:string,sel:int,offset:int}>
+     */
+    private array $jsonStack = [];
 
     /**
      * The single in-flight cell edit whose UPDATE currently sits on the CLI, or
@@ -107,6 +218,35 @@ final class App
     private ?array $autoUpdate = null;
 
     /**
+     * The in-flight row deletion whose DELETE currently sits on the CLI, or null
+     * (§22). Deliberately the same shape as {@see $autoUpdate}: the grid builds a
+     * statement, drops it on the CLI, and Enter runs it or Esc cancels it — a
+     * generated DELETE is reviewed as text before it goes, exactly like a
+     * generated UPDATE. Keys: sql (the exact DELETE on the CLI), rawIdxs (the
+     * rows it addresses) and count (rows the confirm reported).
+     * @var array{sql:string,rawIdxs:list<int>,count:int}|null
+     */
+    private ?array $autoDelete = null;
+
+    /**
+     * The delete held while its confirm popup is open (§22), moved to
+     * {@see $autoDelete} on Y and dropped on N. Separate from
+     * {@see $pendingDangerous} because that one belongs to the CLI's own
+     * dangerous-query guard and re-runs a *typed* statement through
+     * {@see execute()}; this one never goes near execute().
+     * @var array{sql:string,rawIdxs:list<int>,count:int}|null
+     */
+    private ?array $pendingDelete = null;
+
+    /**
+     * The "N rows deleted" sentence, held across the SELECT that a delete
+     * re-runs (§22). {@see applyResult()} writes the reload's own status line,
+     * which would otherwise be the last word on screen after a delete - and
+     * "42 rows" is not what the user just asked about.
+     */
+    private string $deleteNote = '';
+
+    /**
      * Schema-diff results cached per table (lower-cased name) so the DD viewer
      * doesn't re-run SHOW COLUMNS every frame. Cleared on USE and on DD reload.
      * @var array<string,array{fieldStatus:array<string,string>,missing:list<string>,changed:list<string>,extra:list<string>,hasDiff:bool}|null>
@@ -116,9 +256,133 @@ final class App
     /** Original typed DELETE/UPDATE held while the dangerous-query confirm is open (§5). */
     private ?array $pendingDangerous = null;
 
+    /**
+     * Statements of the current submit still waiting to run, in order (§5).
+     * Multi-statement input is split client-side by {@see Splitter} and run one
+     * at a time so every statement faces read-only mode and the dangerous-query
+     * confirm on its own terms — the whole point of the splitter.
+     * @var list<string>
+     */
+    private array $batchQueue = [];
+    /** Statements the current submit started with; >1 means multi-statement. */
+    private int $batchTotal = 0;
+    /** Statements of the current submit that have finished. */
+    private int $batchDone = 0;
+    /** Output mode (`\G`) the whole batch runs under. */
+    private bool $batchVertical = false;
+    /**
+     * Why the statement just run did not complete: '' ran, 'confirm' opened the
+     * dangerous-query popup (the batch is suspended until it is answered),
+     * 'async' was sent and is still running (the batch is suspended until it
+     * comes back), or 'blocked' was refused outright (the rest of the batch is
+     * dropped).
+     *
+     * 'async' and 'confirm' are the same kind of stop — the queue survives and
+     * something later resumes it — which is why the cancellable path needed no
+     * new state machine: {@see pumpQuery()} resumes the batch exactly where
+     * {@see handleConfirmKey()} already did.
+     */
+    private string $batchStop = '';
+
+    /**
+     * The submission as it was **typed**, when macros (§23) made what runs
+     * differ from it; null when they did not.
+     *
+     * Typed history keeps this rather than the expanded text, on the same
+     * principle as the normalizer's `$original`: Up-arrow gives back the line
+     * the user wrote — arguments and all — so re-running it re-reads the
+     * macro instead of repeating whatever it happened to hold an hour ago. The executed-SQL
+     * history (Alt+Up) still records what actually went to the server.
+     */
+    private ?string $submitTyped = null;
+
+    /**
+     * The submission suspended on a `?{name}` question, or null (§23).
+     *
+     * Holds the expanded SQL and everything {@see runSubmission()} will need
+     * when the last answer comes in — the typed text for history, the output
+     * mode, the target tab — because between the question and the answer the
+     * user may do nothing else, but the frame loop keeps running and the
+     * arguments to a half-finished call have to live somewhere.
+     *
+     * @var array{sql:string,typed:string,vertical:bool,tab:?int,names:list<string>,answers:array<string,string>}|null
+     */
+    private ?array $pendingPrompt = null;
+
+    /**
+     * "N macros expanded", waiting to be said once — consumed by the first
+     * statement of the submission. Per submission, not per statement: one
+     * `?cleanup` that expands into four statements is one expansion.
+     */
+    private string $macroNote = '';
+
+    /**
+     * The statement waiting to go out again by itself after the connection died
+     * under it, and when (§2). Null when nothing is scheduled.
+     *
+     * It carries the *originally typed* text so the re-send normalizes exactly
+     * as the first attempt did, and the confirmation the user already gave, so
+     * a write they approved once is not put back in front of them.
+     *
+     * @var array{sql:string,vertical:bool,confirmed:bool,at:float}|null
+     */
+    private ?array $pendingResend = null;
+
+    /**
+     * One automatic attempt per statement. Cleared by a result that comes back
+     * without an error and by every new submission; set when a re-send goes
+     * out. Without it, a server that is genuinely down turns one dead statement
+     * into a re-send loop a second wide.
+     */
+    private bool $resendUsed = false;
+
+    /**
+     * Set while the statement now going out is one that came back by itself, so
+     * its answer can carry the marker that says where it came from. Consumed by
+     * {@see execute()}, which hands it to {@see $queryContext}.
+     */
+    private bool $resentStatement = false;
+
+    /**
+     * The whole of what a silently re-sent statement says about itself (§2).
+     *
+     * A footnote behind the row count, not a headline in front of it: a rewrite
+     * note leads the status line because it changed *what ran*, and this changed
+     * nothing about what ran. It replaced `reconnected · statement re-sent`
+     * leading the line, which was a second sentence about an event the user was
+     * deliberately not being troubled with.
+     */
+    public const RESENT_NOTE = 'reconnected';
+
+    /**
+     * What {@see applyResult()} needs about the statement now in flight: the
+     * normalized SQL, its command keyword, the originally typed text, the
+     * normalization notes, and the output mode. Parked here because on the async
+     * path the two halves of {@see execute()} are separated by frames.
+     *
+     * @var array{sql:string,first:string,original:string,notes:list<string>,vertical:bool,capped:bool,confirmed:bool}
+     */
+    private array $queryContext = [
+        'sql' => '', 'first' => '', 'original' => '', 'notes' => [], 'vertical' => false,
+    ];
+
     /** Column order / selection captured on entering "move column" mode, for Esc revert. */
     private ?array $moveSavedOrder = null;
     private int $moveSavedCol = 0;
+
+    /**
+     * Parked data views, keyed by tab index (§20). The *active* view is not in
+     * here — it lives in State, which is what lets every one of App's existing
+     * `$this->state->selectedRow`-style references keep working untouched. A tab
+     * switch is a capture of the current view into this array and a restore of
+     * the target's; a tab with no entry yet shows {@see State::blankView()}.
+     *
+     * Deliberately not persisted: views are scratch space, so a restart starts
+     * with five empty grids.
+     *
+     * @var array<int,array<string,mixed>>
+     */
+    private array $tabViews = [];
 
     public function __construct(
         private readonly Database $database,
@@ -127,18 +391,121 @@ final class App
         private readonly string $version,
     ) {
         $this->terminal = new Terminal();
-        $this->input = new InputBuffer();
+        $this->input = new LineEditor();
         $this->state = new State();
+        $this->state->tabLabels = array_fill(0, State::TAB_COUNT, '');
         $this->normalizer = new Normalizer();
         $this->completion = new Completion();
         $this->schema = new Schema($database);
-        $this->renderer = new Renderer(new Theme($settings->getTheme()));
+        $this->macros = Macros::fromConfig($config);
+        // Decide truecolor vs. 256-color fallback before styles are emitted.
+        Style::setTruecolor($this->resolveTruecolor());
+        $this->theme = $this->buildTheme();
+        $this->renderer = new Renderer($this->theme);
+    }
+
+    /**
+     * Resolve the `truecolor` option (auto|on|off) to a boolean. `auto` sniffs
+     * the environment ({@see Style::detectTruecolor()}); an explicit on/off
+     * overrides detection — useful when a terminal is misidentified.
+     */
+    private function resolveTruecolor(): bool
+    {
+        return match (strtolower($this->config->getString('truecolor', 'auto'))) {
+            'on', 'true', '1', 'yes' => true,
+            'off', 'false', '0', 'no' => false,
+            default => Style::detectTruecolor([
+                'COLORTERM'    => getenv('COLORTERM') ?: null,
+                'WT_SESSION'   => getenv('WT_SESSION') ?: null,
+                'ConEmuANSI'   => getenv('ConEmuANSI') ?: null,
+                'TERM_PROGRAM' => getenv('TERM_PROGRAM') ?: null,
+                'TERM'         => getenv('TERM') ?: null,
+            ]),
+        };
+    }
+
+    /**
+     * Resolve the active theme into a {@see Theme} backed by a Base16 scheme.
+     *
+     * Name precedence: an explicit config/CLI `--theme` (anything other than the
+     * built-in `default`) wins over the persisted UI state, so a flag or config
+     * file overrides whatever was last selected interactively. The name `default`
+     * (or an unresolvable one) falls back to the built-in Default Dark palette so
+     * the UI is always themed, never colorless.
+     *
+     * Schemes are searched in the project `.sqli/themes/` dirs (closest first),
+     * then the global one. Themes are user assets — sqli ships none.
+     */
+    private function buildTheme(): Theme
+    {
+        $configTheme = $this->config->getString('theme', 'default');
+        $name = $configTheme !== 'default' ? $configTheme : $this->settings->getTheme();
+        if ($name === '' || $name === Scheme::BUILT_IN) {
+            // `<default>` asked for the in-code palette by name — no file lookup,
+            // which is also the way to override a saved theme back to built-in.
+            return new Theme(Scheme::BUILT_IN);
+        }
+
+        // Try to load a scheme file even for 'default' — a user may drop a
+        // default.yaml to reskin it; only fall back to the built-in Default Dark
+        // palette when no file resolves.
+        $reason = null;
+        $scheme = $this->themeLoader()->load($name, $reason);
+        if ($scheme === null) {
+            if ($name !== 'default') {
+                my::lineout('FILE:FILE', 'theme load failed, using default', $name, (string) $reason);
+            }
+            return new Theme(Scheme::BUILT_IN);
+        }
+        return new Theme($name, $scheme);
+    }
+
+    /**
+     * Scheme search path: each project `.sqli/themes/` (closest first), then
+     * the global `$SQLI_HOME/.sqli/themes/`.
+     */
+    private function themeLoader(): SchemeLoader
+    {
+        return new SchemeLoader($this->config->themeDirs());
+    }
+
+    /**
+     * Every theme that can be picked: the built-in `<default>` first, then the
+     * discoverable scheme files. The built-in is always offered so the list is
+     * never empty and there is always a way back to a known-good palette.
+     *
+     * @return list<string>
+     */
+    private function themeNames(): array
+    {
+        return [Scheme::BUILT_IN, ...$this->themeLoader()->available()];
+    }
+
+    /**
+     * Resolve a picker name to a Scheme. `<default>` comes from code; anything
+     * else goes through the file search path.
+     */
+    private function loadScheme(string $name, ?string &$reason = null): ?Scheme
+    {
+        if ($name === Scheme::BUILT_IN) {
+            return Scheme::default();
+        }
+        return $this->themeLoader()->load($name, $reason);
     }
 
     public function run(): int
     {
         $this->state->version = $this->version;
         $this->state->readOnly = $this->config->isFlag('read-only');
+        // `--comment PROD`, or a `comment` key on the env in the config file, so
+        // a server that deserves a warning carries one without anyone having to
+        // remember to type it (§7).
+        $this->state->comment = self::cleanComment($this->config->getString('comment'));
+        // Both fixed for the life of the connection: the driver is chosen before
+        // this and never changes. canCancel gates what the UI offers (§21);
+        // driverName is shown in the header.
+        $this->state->canCancel  = $this->database->supportsCancel();
+        $this->state->driverName = $this->database->driverName();
         $this->state->history = $this->settings->getHistory();
         $this->historyIdx = count($this->state->history);
         $this->state->execHistory = $this->settings->getExecHistory();
@@ -148,9 +515,10 @@ final class App
         // Restore the terminal even on a fatal error or fatal signal path.
         register_shutdown_function(fn () => $this->terminal->close());
 
-        // Measure the initial viewport. Prefer the platform API (Windows FFI
-        // srWindow) when available — it is the true visible window for both grow
-        // and shrink. Otherwise fall back to the DSR cursor-position report.
+        // Measure the initial viewport. Prefer the platform API — Windows FFI
+        // srWindow, or POSIX ioctl(TIOCGWINSZ) — when available: it is the true
+        // visible window for both grow and shrink, and asking costs nothing on
+        // the wire. Otherwise fall back to the DSR cursor-position report.
         $platformSize = $this->terminal->hasPlatformSize();
         [$w, $h] = $platformSize
             ? $this->terminal->size()
@@ -158,14 +526,43 @@ final class App
         my::lineout('FILE:FILE', 'init size', $w . 'x' . $h, 'platformSize', $platformSize);
         $this->screen = new Screen($w, $h);
 
-        $this->connect();
+        // Normally the connection is already open: sqli.php connects on the plain
+        // terminal so a failure can be read and retried before the TUI exists.
+        // Adopting it here keeps the startup path honest — no second connection,
+        // and no modal for work that is already done.
+        //
+        // The dialog remains for any caller that hands over an unconnected
+        // Database. A connect to an unreachable server blocks for the full TCP
+        // timeout; painting the popup first means the user sees which database
+        // we're waiting on — instead of a blank TUI — and can Ctrl+C.
+        if ($this->database->isConnected()) {
+            $this->adoptConnection();
+        } else {
+            $this->withBusy(
+                'Connecting to ' . $this->database->target() . ' …',
+                fn () => $this->connect(),
+                modal: true,
+            );
+        }
+
+        // Report config migrations / registry updates: each says exactly which
+        // file in which dir was touched. All go to the log; the latest one also
+        // lands on the status line so it's seen without digging.
+        $notices = $this->config->notices();
+        foreach ($notices as $n) {
+            my::lineout('FILE:FILE', 'config', $n);
+        }
+        if ($notices !== []) {
+            $this->state->statusLine = (string) end($notices);
+            $this->state->statusIsError = false;
+        }
 
         // Only load a Data Dictionary at startup when one is explicitly passed via
         // --dictionary. A saved per-db association is loaded lazily, the first time
         // the user actually opens a DD feature (§11) — not eagerly on launch.
         $cliDict = $this->config->getString('dictionary');
         if ($cliDict !== '') {
-            $this->loadDictionary($this->database->currentDatabase(), $cliDict);
+            $this->loadDictionary($this->database->stateKey(), $cliDict);
         }
 
         $this->loop();
@@ -178,21 +575,62 @@ final class App
     {
         $this->draw();
         while ($this->state->running) {
+            $phase = microtime(true);
             $events = $this->terminal->input()->poll();
             foreach ($events as $event) {
                 if ($event instanceof KeyEvent) {
                     $this->handleKey($event);
                 } elseif ($event instanceof MouseEvent) {
                     $this->handleMouse($event);
+                } elseif ($event instanceof PasteEvent) {
+                    $this->handlePaste($event);
                 }
                 if (!$this->state->running) {
                     break;
                 }
             }
+            $this->mark('input', $phase);
+
+            // Collect a finished query before anything else looks at the frame:
+            // the result reshapes the grid, and drawing it in the same pass it
+            // landed is what makes a cancelled query feel like it stopped rather
+            // than like it stopped a frame later (§21).
+            $phase = microtime(true);
+            $this->pumpQuery();
+            // The header's connection notice is derived, not maintained: one
+            // assignment a frame, from the only object that knows. A flag set at
+            // each of the places a connection can die and cleared at each of the
+            // places one can be opened is the kind of bookkeeping that ends with
+            // a red banner over a working connection.
+            $this->state->linkState = match (true) {
+                !$this->database->isLost() => State::LINK_OK,
+                // Still derived, still one assignment: a statement waiting to go
+                // out again is a fact this object holds, not a flag anyone sets
+                // twice. It reads as RESENDING rather than LOST because there is
+                // nothing for the user to do about it.
+                $this->pendingResend !== null => State::LINK_RESENDING,
+                default => State::LINK_LOST,
+            };
+            // The marker outlives the fault. Pushed forward on every bad frame
+            // rather than set on a transition: the reconnect inside execute()
+            // takes `linkState` from LOST to OK without this loop running once
+            // in between, so a transition here would never fire — and a deadline
+            // that always expires cannot be left standing over a live link (§2).
+            if ($this->state->linkState !== State::LINK_OK) {
+                $this->state->linkLingerUntil = microtime(true) + self::LINK_LINGER;
+            }
+            // Same rule, same reason: whether the session is encrypted is asked
+            // of the connection every frame rather than remembered, because the
+            // plaintext retry and the reconnect can both change the answer (§2).
+            $this->state->secure = $this->database->isEncrypted();
+            $this->maybeResend();
+            $this->mark('query', $phase);
 
             // poll() drains console resize records; if one arrived, repaint right
             // away (force past the size-poll throttle) so resize feels instant.
+            $phase = microtime(true);
             $this->maybeResize($this->terminal->takeResizeSignal());
+            $this->mark('resize', $phase);
             // While the DD viewer is open, watch (throttled) for the file being
             // locked/freed by another program so the banner + edit gate stay live.
             if ($this->state->ddViewer) {
@@ -208,7 +646,21 @@ final class App
                     $this->resizeRedrawUntil = 0.0;
                 }
             }
+            // Persistence plumbing (§16): the first save attempted with no
+            // `.sqli/` anywhere opens the "save settings where?" prompt, and any
+            // state-file write failure is surfaced with its path + reason.
+            if ($this->settings->needsDir() && $this->state->chooser === null) {
+                $this->openStateDirPrompt();
+            }
+            $writeError = $this->settings->takeWriteError();
+            if ($writeError !== null) {
+                $this->state->statusLine = $writeError;
+                $this->state->statusIsError = true;
+            }
+            $phase = microtime(true);
             $this->draw();
+            $this->mark('draw', $phase);
+            $this->heartbeat();
             usleep(self::FRAME_SLEEP_US);
         }
     }
@@ -235,42 +687,59 @@ final class App
     private function flushFrame(): void
     {
         $this->renderer->render($this->screen, $this->state, $this->input);
-        $this->terminal->write($this->screen->flush());
+        // Screen::flush() promotes back to front as it renders: once it returns,
+        // the screen believes those cells are on the glass. If the write then drops
+        // bytes, that belief is wrong and the difference is permanent — the cells
+        // are clean, so no later frame will repaint them. This is what left a
+        // half-drawn screen that only a manual resize could clear, because a resize
+        // invalidates by hand. Do it here instead, where the drop is known.
+        if (!$this->terminal->write($this->screen->flush())) {
+            $this->screen->invalidate();
+        }
     }
 
     /**
-     * Run a known-slow synchronous operation behind a centered "please wait"
-     * popup. The main loop is blocked while $fn runs, so we paint one frame with
-     * the popup and flush it to the terminal *before* calling $fn, then clear it.
-     * The next normal frame from run() erases the popup. Returns $fn's result.
+     * Run a known-slow synchronous operation behind a "please wait" message. The
+     * main loop is blocked while $fn runs, so we paint one frame with the message
+     * and flush it to the terminal *before* calling $fn, then clear it. The next
+     * normal frame from run() erases it. Returns $fn's result.
+     *
+     * By default the message is an unobtrusive one-liner above the status/help
+     * line — routine queries shouldn't fire a modal in the middle of the screen
+     * every time. Pass $modal = true for the centered, bordered dialog, reserved
+     * for the initial DB connect (which can block for the full TCP timeout).
      *
      * For a multi-step op that can report progress, see {@see warmDdDiffs()},
      * which drives {@see $busyMessage} + {@see flushFrame()} itself between steps.
      *
-     * @template T
+     * @macro T
      * @param callable():T $fn
      * @return T
      */
-    private function withBusy(string $message, callable $fn): mixed
+    private function withBusy(string $message, callable $fn, bool $modal = false): mixed
     {
         $this->state->busyMessage = $message;
+        $this->state->busyModal = $modal;
         $this->flushFrame();
         try {
             return $fn();
         } finally {
             $this->state->busyMessage = '';
+            $this->state->busyModal = false;
         }
     }
 
     private function maybeResize(bool $force = false): void
     {
-        // On Windows (FFI) the platform srWindow is the visible window for both
-        // grow and shrink, so prefer it. A resize console event ($force) applies
-        // immediately; otherwise we poll at most every SIZE_POLL_INTERVAL as a
-        // safety net. The DSR cursor-clamp is only a fallback for POSIX/VT
-        // terminals with no platform API: it under-reports height right after the
-        // window grows (the alt-screen buffer lags), which left the CLI/status
-        // stranded at the old bottom row with a blank band below.
+        // Prefer the platform API — Windows FFI srWindow, or POSIX
+        // ioctl(TIOCGWINSZ) — which is the visible window for both grow and
+        // shrink and costs no terminal traffic. A resize event ($force: a console
+        // record on Windows, SIGWINCH on POSIX) applies immediately; otherwise we
+        // poll at most every SIZE_POLL_INTERVAL as a safety net. The DSR
+        // cursor-clamp is only a fallback for terminals with neither: it
+        // under-reports height right after the window grows (the alt-screen
+        // buffer lags), which left the CLI/status stranded at the old bottom row
+        // with a blank band below.
         if ($this->terminal->hasPlatformSize()) {
             $now = microtime(true);
             if (!$force && $now - $this->lastSizeCheck < self::SIZE_POLL_INTERVAL) {
@@ -282,25 +751,89 @@ final class App
             return;
         }
 
-        // No platform API (pipe/Git-Bash path): drive resize with an async DSR
-        // cursor-clamp report. Keep EXACTLY ONE report in flight — each reply
-        // immediately triggers the next request — so the reply itself keeps waking
-        // the blocking read. (A fixed-interval poll deadlocks here: after the lone
-        // reply wakes the loop, the throttle suppresses the next request, and the
-        // blocking read then has nothing left to wake it until a keystroke.)
-        $report = $this->terminal->input()->takeSizeReport();
+        // No platform API (a pipe, Git-Bash/MSYS, or a POSIX build without FFI):
+        // drive resize with an async DSR cursor-clamp report.
+        $report = $this->terminal->takeSizeReport();
         if ($report !== null) {
             $this->dsrInFlight = false;
             $this->applySize($report[0], $report[1]);
         }
         $now = microtime(true);
-        // Send the next request when none is pending, or recover if a reply was
-        // lost (no answer within a short grace period).
-        if (!$this->dsrInFlight || $now - $this->lastDsrRequest > 0.5) {
+        // How often to ask depends on whether the loop can tick without an answer.
+        //
+        // Where stdin CANNOT be made non-blocking (the Windows console/pipe), the
+        // DSR reply is the only thing that wakes an idle read, so exactly one
+        // report must stay in flight: each reply immediately triggers the next
+        // request. Throttling there deadlocks — the throttle suppresses the
+        // request, and the read then has nothing left to wake it until a keystroke.
+        //
+        // Where stdin IS non-blocking (every POSIX tty), the loop ticks on its own
+        // and the request can be throttled like the platform path. That is the
+        // difference between a terminal round-trip every frame — 100+ a second,
+        // for as long as sqli is open — and one every SIZE_POLL_INTERVAL.
+        $due = $this->terminal->stdinIsNonBlocking()
+            ? $now - $this->lastDsrRequest >= self::SIZE_POLL_INTERVAL
+            : !$this->dsrInFlight;
+        // Recover if a reply was lost (no answer within a short grace period).
+        if ($due || $force || $now - $this->lastDsrRequest > 0.5) {
             $this->terminal->requestSizeReport();
             $this->dsrInFlight = true;
             $this->lastDsrRequest = $now;
         }
+    }
+
+    /** Record a phase duration if it is the worst seen since the last heartbeat. */
+    private function mark(string $phase, float $startedAt): void
+    {
+        $took = microtime(true) - $startedAt;
+        if ($took > $this->phaseMax[$phase]) {
+            $this->phaseMax[$phase] = $took;
+        }
+    }
+
+    /**
+     * Once a second, while debug logging is on, write one line saying how fast the
+     * loop is turning, what size it believes the screen is, and what the platform
+     * says it actually is.
+     *
+     * It exists because the failure it was written for could not be described from
+     * the outside: "resizing is broken" covers a loop that has stopped, a loop that
+     * is running against a stale size, and a terminal that is being talked over.
+     * The three look identical on screen and are three different bugs. A gap in
+     * these timestamps is the first; `screen` disagreeing with `platform` is the
+     * second; a climbing `dsrSent` is the third. Several sqli can share one log —
+     * every line carries its pid.
+     */
+    private function heartbeat(): void
+    {
+        $this->heartbeatFrames++;
+        if (!my::$enabled) {
+            return;
+        }
+        $now = microtime(true);
+        $elapsed = $now - $this->lastHeartbeat;
+        if ($elapsed < 1.0) {
+            return;
+        }
+        // The first call has no interval behind it, so it reports the state
+        // without inventing a rate for it.
+        $fps = $this->lastHeartbeat > 0.0
+            ? sprintf('%.1f', $this->heartbeatFrames / $elapsed)
+            : 'n/a';
+        $slowest = '';
+        foreach ($this->phaseMax as $phase => $took) {
+            $slowest .= sprintf('%s%s=%.0fms', $slowest === '' ? '' : ' ', $phase, $took * 1000);
+        }
+        my::lineout(
+            'FILE:FILE',
+            'heartbeat fps', $fps,
+            'screen', $this->screen->width() . 'x' . $this->screen->height(),
+            'slowest frame', $slowest,
+            'term', $this->terminal->diagnostics(),
+        );
+        $this->lastHeartbeat = $now;
+        $this->heartbeatFrames = 0;
+        $this->phaseMax = ['input' => 0.0, 'query' => 0.0, 'resize' => 0.0, 'draw' => 0.0];
     }
 
     /** Resize the screen buffer to a new viewport and force a clean repaint. */
@@ -323,20 +856,56 @@ final class App
         $this->resizeRedrawUntil = microtime(true) + self::RESIZE_SETTLE;
     }
 
+    /**
+     * Take the app's state from a connection that is already open — the normal
+     * path, since sqli.php connects before the TUI starts.
+     */
+    private function adoptConnection(): void
+    {
+        $this->state->connectionLabel = $this->database->getConnectionLabel();
+        $this->state->currentDatabase = $this->database->currentDatabase();
+        $this->state->secure = $this->database->isEncrypted();
+        // The status line says nothing about the connection, on purpose: who,
+        // where, which driver and whether it is encrypted all live on the header
+        // row now (§3). Saying it twice cost the status line its first screenful
+        // — the line that then has to carry row counts, notes and edit prompts —
+        // to repeat something already on screen and still true.
+        $this->state->statusLine = '';
+        $this->state->statusIsError = false;
+    }
+
     private function connect(): void
     {
         try {
             $this->database->connect();
-            $this->state->connectionLabel = $this->database->getConnectionLabel();
-            $this->state->currentDatabase = $this->database->currentDatabase();
-            $this->state->statusLine = 'Connected · ' . $this->state->connectionLabel;
+            $this->adoptConnection();
         } catch (\Throwable $e) {
             $this->state->connectionLabel = '';
             $this->state->currentDatabase = '';
-            $this->state->statusLine = 'Connection failed: ' . $e->getMessage();
+            $this->state->statusLine = 'Connection failed: ' . $e->getMessage() . $this->connectHint($e->getMessage());
             $this->state->statusIsError = true;
             my::lineout('FILE:FILE', 'connect failed', $e->getMessage());
         }
+    }
+
+    /**
+     * Turn a connection error the user can't act on into one they can. MySQL's
+     * 3159 names the server setting (`--require_secure_transport=ON`) but not
+     * the client knob that answers it, and someone hitting it has no reason to
+     * guess that sqli has an `ssl-mode` at all.
+     *
+     * Public + static so the mapping can be pinned without a server.
+     */
+    public static function connectHint(string $message): string
+    {
+        $m = strtolower($message);
+        if (str_contains($m, 'insecure transport') || str_contains($m, '3159')) {
+            return ' · This server requires TLS — set ssl-mode (preferred|required|verify-ca) for this connection.';
+        }
+        if (str_contains($m, 'ssl connection error')) {
+            return ' · TLS handshake failed — check ssl-ca, or try ssl-mode=required to skip certificate verification.';
+        }
+        return '';
     }
 
     // --- Data Dictionary (§11) ---------------------------------------------
@@ -344,24 +913,29 @@ final class App
     /**
      * (Re)load the Data Dictionary for a database. An explicit path (from
      * --dictionary) takes precedence and is persisted as the association for
-     * that db; otherwise the path saved in sqli.json for the db is used. Clears
-     * the dictionary when nothing applies.
+     * that database; otherwise the path saved in `sqli_state.json` is used.
+     * Clears the dictionary when nothing applies.
+     *
+     * $scope is a {@see Database::stateKey()} — `host:port/db`, not a bare
+     * database name, so two hosts serving a same-named database keep their own
+     * dictionary association.
      */
-    private function loadDictionary(string $db, ?string $explicit = null): void
+    private function loadDictionary(string $scope, ?string $explicit = null): void
     {
         $path = null;
         if ($explicit !== null && $explicit !== '') {
             $path = $explicit;
-            if ($db !== '') {
-                $this->settings->setDictionary($db, $explicit);
+            if ($scope !== '') {
+                $this->settings->setDictionary($scope, $explicit);
             }
-        } elseif ($db !== '') {
-            $path = $this->settings->getDictionary($db);
+        } elseif ($scope !== '') {
+            $path = $this->settings->getDictionary($scope);
         }
 
         $this->dictionary = ($path !== null && $path !== '')
-            ? $this->withBusy('Loading Data Dictionary …', static fn () => DataDictionary::load($path))
+            ? $this->withBusy('Loading and comparing Data Dictionary …', static fn () => DataDictionary::load($path))
             : null;
+        $this->ddLoadAttempted = true; // an explicit load counts; don't re-attempt lazily
 
         if ($path !== null && $path !== '' && $this->dictionary === null) {
             my::lineout('FILE:FILE', 'DD load failed', $path);
@@ -375,14 +949,15 @@ final class App
      */
     private function ensureDictionaryLoaded(): void
     {
-        if ($this->dictionary !== null) {
+        if ($this->dictionary !== null || $this->ddLoadAttempted) {
             return;
         }
-        $db = $this->database->currentDatabase();
-        $saved = $db !== '' ? $this->settings->getDictionary($db) : null;
+        $scope = $this->database->stateKey();
+        $saved = $scope !== '' ? $this->settings->getDictionary($scope) : null;
         if ($saved !== null && $saved !== '') {
+            $this->ddLoadAttempted = true; // don't retry a failing load every query
             $this->dictionary = $this->withBusy(
-                'Loading Data Dictionary …',
+                'Loading and comparing Data Dictionary …',
                 static fn () => DataDictionary::load($saved),
             );
         }
@@ -397,8 +972,8 @@ final class App
         if ($this->dictionary !== null) {
             return true;
         }
-        $db = $this->database->currentDatabase();
-        $saved = $db !== '' ? $this->settings->getDictionary($db) : null;
+        $scope = $this->database->stateKey();
+        $saved = $scope !== '' ? $this->settings->getDictionary($scope) : null;
         return $saved !== null && $saved !== '';
     }
 
@@ -406,6 +981,24 @@ final class App
 
     private function handleKey(KeyEvent $e): void
     {
+        // While a statement is running the keyboard does one thing: Esc asks the
+        // server to stop it (§21). Everything else is swallowed here, above every
+        // modal check below — including the Ctrl+Alt+Z quit, deliberately.
+        //
+        // This is the narrow reading of "the loop is alive again", and it is
+        // narrow on purpose. Letting the rest of the app run during a query
+        // means a result landing into a view the user has since left, an edit
+        // committed against a grid that is about to be replaced, and a second
+        // submission with nowhere to go — a much larger surface than the feature
+        // being bought. Nothing here forecloses widening it later: every key
+        // that would need a home is currently refused in one place.
+        if ($this->state->queryRunning) {
+            if ($e->key === Key::Escape) {
+                $this->cancelQuery();
+            }
+            return;
+        }
+
         // Exit is by typing `exit`/`quit` on the CLI (handled in onEnter), not a
         // key chord. Ctrl+C is now "copy selected cell" in DATA focus (handled in
         // handleDataKey, §19); it no longer quits.
@@ -429,7 +1022,7 @@ final class App
         // the triggering `?` from the buffer (§11). The key itself is consumed.
         if ($this->state->ddHint) {
             $this->state->ddHint = false;
-            $editor = $this->input->editor();
+            $editor = $this->input;
             if (mb_substr($editor->text(), max(0, $editor->cursor() - 1), 1) === '?') {
                 $editor->backspace();
             }
@@ -453,6 +1046,35 @@ final class App
         // key handler, so the grid keeps its controls and the popup tracks the
         // selection. Its own keys (`v` toggle, `e` edit) live in handleDataKey.
 
+        // The theme editor owns input while open (§13). It sits above the other
+        // popups: it is opened from the system menu and its own sub-modals (hex
+        // entry, save-as, scheme picker) are handled inside its key handler.
+        if ($this->state->themeEditor) {
+            $this->handleThemeEditorKey($e);
+            return;
+        }
+        // Standalone theme switch, also from the system menu (§13).
+        if ($this->state->themeSelect) {
+            $this->handleThemeSelectKey($e);
+            return;
+        }
+        // Generic chooser popup (create-config dir picker / state-dir prompt).
+        if ($this->state->chooser !== null) {
+            $this->handleChooserKey($e);
+            return;
+        }
+        // The header-comment prompt, opened from the system menu (§7).
+        if ($this->state->commentEdit) {
+            $this->handleCommentEditKey($e);
+            return;
+        }
+
+        // A `?{name}` question, with a submission waiting behind it (§23).
+        if ($this->state->promptAsk) {
+            $this->handlePromptKey($e);
+            return;
+        }
+
         // The Assign-DD picker is a small modal opened from the system menu (§11).
         if ($this->state->ddPicker) {
             $this->handleDdPickerKey($e);
@@ -466,11 +1088,13 @@ final class App
             return;
         }
 
-        // Modal overlays consume input until dismissed (innermost first).
-        if ($this->state->columnPopup) {
-            $this->handleColumnPopupKey($e);
+        // The macros viewer, likewise, until Esc (§23).
+        if ($this->state->macrosView) {
+            $this->handleMacrosViewKey($e);
             return;
         }
+
+        // Modal overlays consume input until dismissed (innermost first).
         if ($this->state->layoutPopup) {
             $this->handleLayoutPopupKey($e);
             return;
@@ -517,30 +1141,52 @@ final class App
         // Ctrl+D toggles focus. An in-flight cell edit already lives on the CLI as
         // an UPDATE (§9), so there is nothing to prompt about when switching.
         if ($e->isChar() && $e->ctrl && strtolower($e->char) === 'd') {
+            $this->input->clearSelection(); // a CLI selection doesn't carry into DATA focus (§4)
             $this->state->focus = $this->state->focus === State::FOCUS_CLI
                 ? State::FOCUS_DATA
                 : State::FOCUS_CLI;
             return;
         }
 
-        // Ctrl+L opens the Layout popup (also reachable via the right-margin
-        // label, a click, or the system menu, §6).
+        // Ctrl+L opens Data View Configuration (also reachable via the
+        // right-margin label, a column-header click, or the system menu, §6).
         if ($e->isChar() && $e->ctrl && strtolower($e->char) === 'l') {
             if ($this->state->hasResult()) {
-                $this->openLayoutPopup();
+                $this->openLayoutPopup($this->state->selectedCol);
             }
+            return;
+        }
+
+        // Alt+1…Alt+9 switch data views, in either focus (§20). Decoded upstream
+        // as ESC + the digit, so it arrives here as a Char with alt set and needs
+        // nothing from the terminal layer.
+        //
+        // Placed below every modal guard above deliberately: while a popup, a
+        // cell edit or the DD viewer owns input, those handlers have already
+        // returned, so a tab switch cannot fire out from under unfinished work.
+        if ($e->isChar() && $e->alt && !$e->ctrl && strlen($e->char) === 1
+            && $e->char >= '1' && $e->char <= (string) State::TAB_COUNT) {
+            $this->switchTab((int) $e->char - 1);
+            return;
+        }
+
+        // Ctrl+PageUp / Ctrl+PageDown step through the data views and **wrap**
+        // (§20): the same nine places Alt+1…9 reaches, for when you want the next
+        // one rather than a particular one. Sits beside Alt+N for the same reason
+        // it does — every modal handler above has already returned, so this cannot
+        // fire out from under an open popup or an unfinished edit.
+        //
+        // It must be tested before the focus handlers below, because plain
+        // PageUp/PageDown is a page of scrolling in the grid, the detail view,
+        // the JSON tree and every list popup, and none of those look at Ctrl.
+        if (($e->key === Key::PageUp || $e->key === Key::PageDown) && $e->ctrl && !$e->alt) {
+            $this->cycleTab($e->key === Key::PageDown ? 1 : -1);
             return;
         }
 
         // F1 opens the context-sensitive help overlay (§15).
         if ($e->key === Key::F1) {
             $this->state->help = true;
-            return;
-        }
-
-        // F2 opens the column popup for the selected column (any focus, §6).
-        if ($e->key === Key::F2) {
-            $this->openColumnPopup($this->state->selectedCol);
             return;
         }
 
@@ -562,11 +1208,26 @@ final class App
 
     private function handleCliKey(KeyEvent $e): void
     {
-        $editor = $this->input->editor();
+        $editor = $this->input;
         switch ($e->key) {
             case Key::Char:
+                // Ctrl+A selects the whole CLI; Ctrl+C copies the selection (§4).
+                if ($e->ctrl && !$e->alt && strtolower($e->char) === 'a') {
+                    $this->input->selectAll();
+                    return;
+                }
+                if ($e->ctrl && !$e->alt && strtolower($e->char) === 'c') {
+                    $this->copyCliSelection();
+                    return;
+                }
                 if ($e->ctrl || $e->alt) {
-                    return; // unhandled control combo
+                    return; // other control combos unhandled here
+                }
+                // Typing over a selection replaces it (standard editor behavior).
+                if ($this->input->hasSelection()) {
+                    $this->input->deleteSelection();
+                } else {
+                    $this->input->clearSelection();
                 }
                 $editor->insert($e->char);
                 $this->resetHistoryNav();
@@ -576,58 +1237,87 @@ final class App
                 }
                 break;
             case Key::Backspace:
-                // Ctrl+Backspace deletes the previous word (§4). Otherwise, at
-                // column 0 merge into the line above; else delete a char.
-                if ($e->ctrl) {
-                    $editor->deleteWordLeft();
-                } elseif (!$this->input->backspaceMerge()) {
-                    $editor->backspace();
+                // A selection is deleted whole; otherwise Ctrl+Backspace deletes
+                // the previous word, col-0 merges up, else a plain backspace (§4).
+                if ($this->input->deleteSelection()) {
+                    break;
                 }
+                // A flat backspace at column 0 deletes the preceding "\n", which
+                // merges the line into the one above — no special-case needed.
+                $e->ctrl ? $editor->deleteWordLeft() : $editor->backspace();
                 break;
             case Key::Delete:
-                // Ctrl+Del deletes the current word (§4).
+                // A selection is deleted whole; else Ctrl+Del deletes the current
+                // word and plain Del removes the char at the caret (§4).
+                if ($this->input->deleteSelection()) {
+                    break;
+                }
                 $e->ctrl ? $editor->deleteWordRight() : $editor->delete();
                 break;
             case Key::Left:
+                $this->cliSelectGuard($e);
                 $e->ctrl ? $editor->wordLeft() : $editor->left();
                 break;
             case Key::Right:
+                $this->cliSelectGuard($e);
                 $e->ctrl ? $editor->wordRight() : $editor->right();
                 break;
             case Key::Home:
-                $editor->home();
+                // Home → start of the current line; Ctrl+Home → start of buffer.
+                $this->cliSelectGuard($e);
+                $e->ctrl ? $editor->home() : $editor->lineHome();
                 break;
             case Key::End:
-                $editor->end();
+                // End → end of the current line; Ctrl+End → end of buffer.
+                $this->cliSelectGuard($e);
+                $e->ctrl ? $editor->end() : $editor->lineEnd();
                 break;
             case Key::Up:
-                // Shift+Up browses the executed-SQL history (§4). Plain Up moves
-                // the active pushed line; from the top line it enters typed
-                // history browse mode.
+                // Shift+Up extends the selection up a line (at the top line it
+                // selects to the line start). Alt+Up browses executed-SQL history
+                // (§4). Plain Up moves the active line, then enters typed history.
                 if ($e->shift) {
+                    if (!$this->cliMoveUp(true)) {
+                        $this->input->startSelection();
+                        $editor->lineHome();
+                    }
+                } elseif ($e->alt) {
+                    $this->input->clearSelection();
                     $this->execHistoryPrev();
-                } elseif (!$this->input->moveUp()) {
+                } elseif (!$this->cliMoveUp(false)) {
                     $this->historyPrev();
                 }
                 break;
             case Key::Down:
-                // Shift+Down walks forward through executed-SQL history (§4).
+                // Shift+Down extends the selection down a line (at the bottom line
+                // it selects to the line end). Alt+Down walks executed-SQL history
+                // forward (§4).
                 if ($e->shift) {
+                    if (!$this->cliMoveDown(true)) {
+                        $this->input->startSelection();
+                        $editor->lineEnd();
+                    }
+                } elseif ($e->alt) {
+                    $this->input->clearSelection();
                     $this->execHistoryNext();
                 } elseif ($this->inHistory()) {
                     $this->historyNext();
                 } else {
-                    $this->input->moveDown();
+                    $this->cliMoveDown(false);
                 }
                 break;
             case Key::Escape:
-                // If the CLI holds an in-flight cell edit's UPDATE, Esc cancels the
-                // edit: revert the grid value and return to the data view (§9).
-                // Otherwise it just clears all pushed lines and the buffer (§4).
-                if ($this->autoUpdate !== null) {
+                // Esc first drops an active selection; then, if the CLI holds an
+                // in-flight cell edit's UPDATE, cancels the edit (revert grid +
+                // return to the data view, §9); otherwise clears the buffer (§4).
+                if ($this->input->hasSelection()) {
+                    $this->input->clearSelection();
+                } elseif ($this->autoUpdate !== null) {
                     $this->cancelInFlight();
+                } elseif ($this->autoDelete !== null) {
+                    $this->cancelInFlightDelete();
                 } else {
-                    $this->input->clearAll();
+                    $this->input->clear();
                     $this->resetHistoryNav();
                 }
                 break;
@@ -635,11 +1325,265 @@ final class App
                 $this->openCompletion();
                 break;
             case Key::Enter:
-                $this->onEnter();
+                $this->onEnter($e);
                 break;
             default:
                 break;
         }
+    }
+
+    /**
+     * Selection bookkeeping shared by the CLI caret-move keys (§4): a shifted
+     * move anchors the selection (if not already) before the caret moves; an
+     * unshifted move drops any selection.
+     */
+    private function cliSelectGuard(KeyEvent $e): void
+    {
+        $e->shift ? $this->input->startSelection() : $this->input->clearSelection();
+    }
+
+    /**
+     * The CLI buffer as executable SQL: display lines right-trimmed and rejoined
+     * with the newlines the user typed (§4/§5).
+     *
+     * The newlines are not cosmetic, which is why this no longer joins with a
+     * space. `--` and `#` comments run to the **end of the line**, so flattening
+     *
+     *     SELECT id      -- the key
+     *     FROM users
+     *
+     * into one line fed the server `SELECT id -- the key FROM users`, and the
+     * comment swallowed the rest of the submission. What ran was not what was
+     * typed, and it ran without complaint whenever the truncated statement was
+     * still valid SQL — `SELECT id` here, which returns a column from nothing at
+     * all rather than an error anyone would notice.
+     *
+     * Only trailing whitespace is stripped, per line: leading indentation is the
+     * user's formatting and survives into history unchanged. {@see Splitter} and
+     * {@see Normalizer} read newlines as ordinary whitespace and needed no
+     * teaching; {@see dangerCheck()} did, but for the comments rather than the
+     * newlines — see there.
+     */
+    private function cliText(): string
+    {
+        return trim(implode("\n", array_map('rtrim', $this->input->lines())));
+    }
+
+    /**
+     * Move the caret up one display line within the CLI buffer. Returns false when
+     * already on the top line, so the caller can fall through to history nav (§4).
+     * With $select the selection is extended; otherwise it is dropped. The caret
+     * keeps its column (the unified multi-line behavior shared with the modal
+     * fields), rather than snapping to the line end as the old InputBuffer did.
+     */
+    private function cliMoveUp(bool $select): bool
+    {
+        if ($this->input->cursorRowCol()[0] === 0) {
+            return false;
+        }
+        $select ? $this->input->startSelection() : $this->input->clearSelection();
+        $this->input->upLine();
+        return true;
+    }
+
+    /** Move the caret down one display line; false when already on the bottom line. */
+    private function cliMoveDown(bool $select): bool
+    {
+        if ($this->input->cursorRowCol()[0] >= count($this->input->lines()) - 1) {
+            return false;
+        }
+        $select ? $this->input->startSelection() : $this->input->clearSelection();
+        $this->input->downLine();
+        return true;
+    }
+
+    /**
+     * Continue input on a fresh line below (Enter with no terminator, §4). Keeps
+     * the whole active line intact and opens an empty line beneath it with the
+     * caret on it — the old InputBuffer::pushLine() behavior, expressed on the flat
+     * editor as "go to line end, then insert a hard break".
+     */
+    private function cliPushLine(): void
+    {
+        $this->input->clearSelection();
+        $this->input->lineEnd();
+        $this->input->insertNewline();
+    }
+
+    /** Copy the CLI selection to the clipboard, if any (Ctrl+C in CLI focus, §4/§19). */
+    private function copyCliSelection(): void
+    {
+        $sel = $this->input->selectedText();
+        if ($sel === '') {
+            return;
+        }
+        $this->copyToClipboard($sel, 'selection (' . mb_strlen($sel) . ' chars)');
+    }
+
+    /**
+     * Shared base-editing key handling for every {@see LineEditor}-backed field —
+     * the CLI-grade behavior (caret moves incl. word jumps, Shift-selection,
+     * Home/End, Backspace/Delete incl. word, Ctrl+A, printable insert with
+     * replace-selection) made identical everywhere it's used: the Assign-DD path,
+     * cell edit, DD comment, JSON node (§4). Clipboard (Ctrl+C/X, {@see
+     * editorClipboardKey()}) and paste (a PasteEvent) are handled separately.
+     *
+     * Returns true when the key was consumed. A field calls this last, after
+     * peeling off its own specials (Enter, Esc, Tab, Ctrl+S, `?`), so anything it
+     * doesn't own gets the standard treatment; keys left unhandled here (e.g.
+     * Up/Down in a single-line field) return false for the caller to use.
+     */
+    private function applyEditingKey(LineEditor $ed, KeyEvent $e, bool $multiline): bool
+    {
+        $sel = static function (LineEditor $ed, bool $shift): void {
+            $shift ? $ed->startSelection() : $ed->clearSelection();
+        };
+        switch ($e->key) {
+            case Key::Char:
+                if ($e->ctrl && !$e->alt && strtolower($e->char) === 'a') {
+                    $ed->selectAll();
+                    return true;
+                }
+                if ($e->ctrl || $e->alt || $e->char === '') {
+                    return false; // control combos aren't plain text
+                }
+                $ed->insert($e->char); // insert() replaces any selection
+                return true;
+            case Key::Backspace:
+                $e->ctrl ? $ed->deleteWordLeft() : $ed->backspace();
+                return true;
+            case Key::Delete:
+                $e->ctrl ? $ed->deleteWordRight() : $ed->delete();
+                return true;
+            case Key::Left:
+                $sel($ed, $e->shift);
+                $e->ctrl ? $ed->wordLeft() : $ed->left();
+                return true;
+            case Key::Right:
+                $sel($ed, $e->shift);
+                $e->ctrl ? $ed->wordRight() : $ed->right();
+                return true;
+            case Key::Home:
+                // Home → line start; Ctrl+Home (or any single-line field) → very start.
+                $sel($ed, $e->shift);
+                ($e->ctrl || !$multiline) ? $ed->home() : $ed->lineHome();
+                return true;
+            case Key::End:
+                // End → line end; Ctrl+End (or any single-line field) → very end.
+                $sel($ed, $e->shift);
+                ($e->ctrl || !$multiline) ? $ed->end() : $ed->lineEnd();
+                return true;
+            case Key::Up:
+                if (!$multiline) {
+                    return false; // single-line fields keep Up for history/list nav
+                }
+                $sel($ed, $e->shift);
+                $ed->upLine();
+                return true;
+            case Key::Down:
+                if (!$multiline) {
+                    return false;
+                }
+                $sel($ed, $e->shift);
+                $ed->downLine();
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Ctrl+C / Ctrl+X for a {@see LineEditor}-backed field: copy (or cut) the
+     * selection to the system clipboard (§19). Returns true when the key was a
+     * clipboard command (even with no selection, so it isn't mistaken for text).
+     */
+    private function editorClipboardKey(KeyEvent $e, LineEditor $ed): bool
+    {
+        if ($e->key !== Key::Char || !$e->ctrl || $e->alt) {
+            return false;
+        }
+        $c = strtolower($e->char);
+        if ($c !== 'c' && $c !== 'x') {
+            return false;
+        }
+        $sel = $ed->selectedText();
+        if ($sel !== '') {
+            $this->copyToClipboard($sel, 'selection (' . mb_strlen($sel) . ' chars)');
+            if ($c === 'x') {
+                $ed->deleteSelection();
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Insert bracketed-paste text at the CLI caret, replacing any selection (§4).
+     * Ignored unless the CLI is the plain input target (no modal/DATA focus owns
+     * input), so a paste can't leak into a popup or the grid.
+     */
+    private function handlePaste(PasteEvent $e): void
+    {
+        // Nothing owns keyboard input while a statement is running (§21), so
+        // there is no field for a paste to route to.
+        if ($this->state->queryRunning) {
+            return;
+        }
+
+        // Paste routes to whichever field owns keyboard input, so it works
+        // everywhere you can type — the CLI and every modal edit field, including
+        // the Assign-DD path picker (§4/§19). Multi-line fields (cell edit, DD
+        // comment) keep pasted newlines; single-line fields (the DD path, a JSON
+        // key/value) drop them so a stray newline can't corrupt the value.
+        $s = $this->state;
+        $modalEd = $this->activeModalEditor();
+        if ($modalEd !== null) {
+            // Multi-line fields (cell edit, DD comment) keep pasted newlines;
+            // single-line fields (DD path, JSON node) drop them.
+            $multiline = $modalEd === $s->cellEditor || $modalEd === $s->ddCommentEditor;
+            $modalEd->insertText($e->text, allowNewlines: $multiline);
+            return;
+        }
+
+        if ($s->focus !== State::FOCUS_CLI || $this->cliInputBlocked()) {
+            return;
+        }
+        $this->input->insertText($e->text);
+        $this->resetHistoryNav();
+    }
+
+    /** True when a modal/overlay currently owns keyboard input, so the CLI is not editable. */
+    private function cliInputBlocked(): bool
+    {
+        $s = $this->state;
+        return $s->help || $s->ddHint || $s->confirm || $s->pkPopup || $s->cellEdit
+            || $s->ddPicker || $s->ddViewer || $s->layoutPopup
+            || $s->systemMenu || $s->jsonView || $s->detail || $s->moveMode
+            || $s->widthAdjust || $s->completion || $s->themeEditor || $s->themeSelect
+            || $s->macrosView || $s->chooser !== null || $s->commentEdit || $s->promptAsk;
+    }
+
+    /** Whether screen row $y falls within the drawn CLI input region (§4). */
+    private function pointInCli(int $y): bool
+    {
+        return $this->state->cliTop >= 0
+            && $y >= $this->state->cliTop
+            && $y <= $this->state->cliBottom;
+    }
+
+    /**
+     * Map a screen (x, y) inside the CLI region to a buffer [lineIndex, column]
+     * (§4). Only the active line is horizontally scrolled, so other lines map at
+     * scroll 0. The result is a display [line, column]; the caller maps it to a
+     * flat grapheme offset via {@see LineEditor::offsetAt()}.
+     *
+     * @return array{0:int,1:int}
+     */
+    private function cliPosAt(int $x, int $y): array
+    {
+        $li = $this->state->cliLineStart + ($y - $this->state->cliTop);
+        $scroll = $li === $this->input->cursorRowCol()[0] ? $this->state->cliActiveScroll : 0;
+        $col = $scroll + max(0, $x - $this->state->cliTextX);
+        return [$li, $col];
     }
 
     private function inHistory(): bool
@@ -649,14 +1593,50 @@ final class App
 
     private function handleDataKey(KeyEvent $e): void
     {
+        // An empty grid has no keys of its own, but Esc still gets you out of it.
         if (!$this->state->hasResult()) {
+            if ($e->key === Key::Escape) {
+                $this->state->focus = State::FOCUS_CLI;
+            }
             return;
         }
-        // While moving the inspector, the arrows reposition it instead of the grid.
+        // While moving the inspector, the arrows reposition it instead of the
+        // grid — and Esc ends the move, so it has to come first.
         if ($this->state->cellView && $this->state->cellMoveMode) {
             $this->handleCellMoveKey($e);
             return;
         }
+
+        // Esc in the grid returns to the CLI (§7).
+        //
+        // Safe to answer here because everything nested has already had its Esc:
+        // the detail view, the JSON viewer, both popups, move and width modes,
+        // the DD viewer, the theme editor and every modal all return earlier in
+        // handleKey(), and the inspector move mode returns just above. The one
+        // overlay still standing at this point is the non-modal cell inspector,
+        // which keeps Esc for itself — closing it is the innermost thing left to
+        // undo, and only once it is gone does Esc mean "leave the grid".
+        //
+        // Deliberately above the vertical branch as well: vertical is an output
+        // mode of this view, not a window inside it, so Esc leaves from there
+        // too. handleVerticalKey() ignores Esc, so nothing is taken away.
+        if ($e->key === Key::Escape) {
+            if ($this->state->cellView) {
+                $this->state->cellView = false;
+                $this->state->cellMoveMode = false;
+                return;
+            }
+            // Mark mode is a mode of the grid, not a window over it, but it is
+            // still the innermost thing left to undo — so Esc leaves it (and
+            // drops the marks) before Esc means "leave the grid" (§22).
+            if ($this->state->markMode) {
+                $this->exitMarkMode();
+                return;
+            }
+            $this->state->focus = State::FOCUS_CLI;
+            return;
+        }
+
         // Vertical output scrolls by line; there is no cell selection (§5).
         if ($this->state->vertical) {
             $this->handleVerticalKey($e);
@@ -722,21 +1702,29 @@ final class App
             case Key::PageDown:
                 $this->state->selectedRow = min($maxRow, $this->state->selectedRow + $this->gridPageStep());
                 break;
-            case Key::Escape:
-                // Esc closes the (non-modal) cell inspector, like every other popup
-                // (§9). Nothing else in the plain grid consumes Esc.
-                if ($this->state->cellView) {
-                    $this->state->cellView = false;
-                    $this->state->cellMoveMode = false;
-                }
-                break;
+            // Escape is answered above the switch: it closes the cell inspector
+            // if one is open and otherwise returns to the CLI.
             case Key::Enter:
                 // Header row → column popup; data row → JSON editor if the value is
-                // a JSON document, else the inline cell editor (§9/§10).
+                // a JSON document, else the inline cell editor (§9/§10). In mark
+                // mode Enter ticks the row's checkbox instead — the mode exists to
+                // build a set of rows, and editing a cell is not part of that (§22).
                 if ($this->state->selectedRow === -1) {
-                    $this->openColumnPopup($this->state->selectedCol);
+                    $this->openLayoutPopup($this->state->selectedCol);
+                } elseif ($this->state->markMode) {
+                    $this->toggleRowMark();
                 } else {
                     $this->openCellOrJson();
+                }
+                break;
+            case Key::Delete:
+                // Del deletes the selected row; Ctrl+Del opens (or closes) the
+                // checkbox column for deleting several at once (§22). Inside mark
+                // mode Del is what commits the marked set.
+                if ($e->ctrl) {
+                    $this->toggleMarkMode();
+                } else {
+                    $this->requestDelete();
                 }
                 break;
             case Key::Char:
@@ -745,6 +1733,9 @@ final class App
                 if ($e->ctrl && $e->alt && strtolower($e->char) === 'c') {
                     // Ctrl+Alt+C → copy the whole selected row (tab-separated) (§19).
                     $this->copyRow();
+                } elseif ($e->ctrl && $e->alt && strtolower($e->char) === 'o') {
+                    // Ctrl+Alt+O → export the arranged grid to a CSV in the cwd (§19).
+                    $this->exportCsv();
                 } elseif ($e->ctrl && !$e->alt && strtolower($e->char) === 'c') {
                     // Ctrl+C → copy the selected cell value to the clipboard (§19).
                     $this->copyCell();
@@ -769,6 +1760,11 @@ final class App
                 } elseif (!$e->ctrl && !$e->alt && strtolower($e->char) === 'm' && $this->state->cellView) {
                     // m → enter move mode: arrows reposition the inspector (§9).
                     $this->state->cellMoveMode = true;
+                } elseif (!$e->ctrl && !$e->alt && $e->char === ' ' && $this->state->markMode) {
+                    // Space → tick the row's checkbox, alongside Enter (§22). Space
+                    // is the conventional key for a checkbox and costs nothing here:
+                    // the grid has no text entry, so it was doing nothing.
+                    $this->toggleRowMark();
                 }
                 break;
             default:
@@ -911,8 +1907,218 @@ final class App
         }
     }
 
+    /**
+     * The modal edit field that currently owns keyboard input, or null when none
+     * is open. Single source of truth for routing paste, clipboard, and mouse to
+     * the active field (§4). Ordered by which overlay sits on top.
+     */
+    private function activeModalEditor(): ?LineEditor
+    {
+        $s = $this->state;
+        if ($s->cellEdit && $s->cellEditor !== null) {
+            return $s->cellEditor;
+        }
+        if ($s->ddCommentEdit && $s->ddCommentEditor !== null) {
+            return $s->ddCommentEditor;
+        }
+        if ($s->ddPicker && $s->ddPickerStage === 0 && $s->ddPickerEditor !== null) {
+            return $s->ddPickerEditor;
+        }
+        if ($s->jsonEditor !== null) {
+            return $s->jsonEditor;
+        }
+        return null;
+    }
+
+    /**
+     * Move/resize the framed cell editor with the mouse (§9): press its title bar to
+     * drag the box, press the bottom-right grip to resize it, and a LEFT_DRAG
+     * continues whichever was grabbed. Returns true when the event was chrome — the
+     * caller then leaves the text alone.
+     *
+     * Two framed editors are movable: the roomy (Enter) cell-edit popup and the DD
+     * viewer's comment box. The inline in-cell overlay has no chrome, and the
+     * inspector's editor is positioned by the inspector itself.
+     */
+    private function handleEditorFrameMouse(MouseEvent $e): bool
+    {
+        $r = $this->state->editorFrameRect;
+        // Both framed editors are movable/resizable: the grid's roomy (Enter) cell
+        // editor and the DD viewer's comment editor. Each keeps its own geometry.
+        $framed = ($this->state->cellEdit && $this->state->cellEditPopup)
+            || $this->state->ddCommentEdit;
+        if (!$framed || $r === null) {
+            return false;
+        }
+        [$rx, $ry, $rw, $rh] = $r;
+
+        if ($e->kind === MouseEvent::LEFT_DRAG) {
+            if ($this->editorDrag !== null) {
+                [$dx, $dy] = $this->editorDrag;
+                $this->setEditorFramePos(max(0, $e->x - $dx), max(1, $e->y - $dy));
+                return true;
+            }
+            if ($this->editorResizing) {
+                // Drag the corner to where the box's bottom-right should land; the
+                // frame is 4 cols / 6 rows of chrome around the text body.
+                $this->setEditorFrameSize(max(24, $e->x - $rx + 1 - 4), max(1, $e->y - $ry + 1 - 6));
+                return true;
+            }
+            return false;
+        }
+        if ($e->kind !== MouseEvent::LEFT_DOWN) {
+            return false;
+        }
+
+        $this->editorDrag = null;
+        $this->editorResizing = false;
+        // A press on the chrome is not a press on the text: drop any selection latch
+        // left by an earlier press in the body, so releasing a chrome grab can never
+        // leave a drag silently selecting text.
+        $this->modalSelecting = false;
+
+        // Grip first: it sits on the border, which the title-bar test would miss
+        // anyway, but order it explicitly so the corner is never ambiguous.
+        if ($e->x === $rx + $rw - 1 && $e->y === $ry + $rh - 1) {
+            // Pin the current position before the size starts changing, or an
+            // auto-centred box would drift as it grows.
+            $this->pinEditorFrame($rx, $ry);
+            $this->editorResizing = true;
+            return true;
+        }
+        if ($e->y === $ry + 1 && $e->x >= $rx && $e->x < $rx + $rw) {
+            $this->editorDrag = [$e->x - $rx, $e->y - $ry];
+            $this->pinEditorFrame($rx, $ry);
+            return true;
+        }
+        return false;
+    }
+
+    /** Freeze an auto-centred editor box at where it is currently drawn (§9). */
+    private function pinEditorFrame(int $rx, int $ry): void
+    {
+        $s = $this->state;
+        if ($s->ddCommentEdit) {
+            if ($s->ddEditX < 0) {
+                $s->ddEditX = $rx;
+            }
+            if ($s->ddEditY < 0) {
+                $s->ddEditY = $ry;
+            }
+            return;
+        }
+        if ($s->cellEditX < 0) {
+            $s->cellEditX = $rx;
+        }
+        if ($s->cellEditY < 0) {
+            $s->cellEditY = $ry;
+        }
+    }
+
+    /** Move the active framed editor, writing to its own geometry store (§9/§11). */
+    private function setEditorFramePos(int $x, int $y): void
+    {
+        if ($this->state->ddCommentEdit) {
+            $this->state->ddEditX = $x;
+            $this->state->ddEditY = $y;
+            return;
+        }
+        $this->state->cellEditX = $x;
+        $this->state->cellEditY = $y;
+    }
+
+    /** Resize the active framed editor, writing to its own geometry store (§9/§11). */
+    private function setEditorFrameSize(int $wInner, int $hRows): void
+    {
+        if ($this->state->ddCommentEdit) {
+            $this->state->ddEditW = $wInner;
+            $this->state->ddEditH = $hRows;
+            return;
+        }
+        $this->state->cellEditW = $wInner;
+        $this->state->cellEditH = $hRows;
+    }
+
+    /**
+     * CLI-grade mouse for a modal edit field: LEFT_DOWN inside the field places the
+     * caret and anchors a selection; a following LEFT_DRAG extends it. A press
+     * outside the field is swallowed so the field stays modal (§4). Geometry comes
+     * from {@see State::$editFieldRegion}, republished by the renderer each frame.
+     */
+    private function handleEditFieldMouse(MouseEvent $e, LineEditor $ed): void
+    {
+        $r = $this->state->editFieldRegion;
+        if ($e->kind === MouseEvent::LEFT_DRAG) {
+            if ($this->modalSelecting && $r !== null) {
+                $ed->setCursorOffset($this->editFieldOffsetAt($ed, $r, $e->x, $e->y));
+            }
+            return;
+        }
+        if ($e->kind !== MouseEvent::LEFT_DOWN) {
+            return;
+        }
+        $this->modalSelecting = false;
+        if ($r === null || !$this->pointInEditField($r, $e->x, $e->y)) {
+            return; // click outside the field: swallow, stay modal
+        }
+        $ed->clearSelection();
+        $ed->setCursorOffset($this->editFieldOffsetAt($ed, $r, $e->x, $e->y));
+        $ed->startSelection(); // anchor at the click so a drag extends from here
+        $this->modalSelecting = true;
+    }
+
+    /** @param array{top:int,left:int,width:int,rows:int,vScroll:int,curRow:int,curHScroll:int} $r */
+    private function pointInEditField(array $r, int $x, int $y): bool
+    {
+        return $y >= $r['top'] && $y < $r['top'] + $r['rows']
+            && $x >= $r['left'] && $x < $r['left'] + $r['width'];
+    }
+
+    /**
+     * Map a screen (x, y) inside a modal edit field to a grapheme offset in its
+     * editor (§4). Non-cursor lines are drawn unscrolled, so only the cursor's own
+     * line carries a horizontal scroll.
+     *
+     * @param array{top:int,left:int,width:int,rows:int,vScroll:int,curRow:int,curHScroll:int} $r
+     */
+    private function editFieldOffsetAt(LineEditor $ed, array $r, int $x, int $y): int
+    {
+        $row = max(0, min($r['rows'] - 1, $y - $r['top']));
+        $li = $r['vScroll'] + $row;
+        // The framed editor scrolls every line together ('hUniform'); the inline
+        // in-cell overlay scrolls only the cursor's own line.
+        $lineHScroll = ($r['hUniform'] ?? false)
+            ? $r['curHScroll']
+            : ($li === $r['curRow'] ? $r['curHScroll'] : 0);
+        $col = max(0, $x - $r['left']) + $lineHScroll;
+        return $ed->offsetAt($li, $col);
+    }
+
     private function handleMouse(MouseEvent $e): void
     {
+        // Swallowed while a statement is running, for the reason given in
+        // handleKey(): the grid on screen is about to be replaced, so selecting
+        // in it, sorting it or opening a popup over it all lead somewhere that
+        // will not exist in a moment (§21).
+        if ($this->state->queryRunning) {
+            return;
+        }
+
+        // Any open modal edit field gets CLI-grade mouse: a click places the caret,
+        // a drag extends the selection. Handled before the per-mode swallowing
+        // below so it works in the Assign-DD path, cell edit, DD comment, and JSON
+        // node fields (§4).
+        $modalEd = $this->activeModalEditor();
+        if ($modalEd !== null) {
+            // The framed editor's own chrome (title bar = move, corner grip =
+            // resize) gets first refusal; anything else is text interaction (§9).
+            if ($this->handleEditorFrameMouse($e)) {
+                return;
+            }
+            $this->handleEditFieldMouse($e, $modalEd);
+            return;
+        }
+
         // The Assign-DD picker is keyboard-driven; swallow mouse so clicks can't
         // leak through to the grid beneath it (§11).
         if ($this->state->ddPicker) {
@@ -954,10 +2160,15 @@ final class App
             return;
         }
 
-        // A left-drag moves the inspector if one was grabbed, else steers whichever
-        // scrollbar the press latched onto (§6/§9).
+        // A left-drag extends a CLI selection if a press started there; else it
+        // moves the inspector if one was grabbed, else steers whichever scrollbar
+        // the press latched onto (§4/§6/§9).
         if ($e->kind === MouseEvent::LEFT_DRAG) {
-            if ($this->popupDrag !== null) {
+            if ($this->cliSelecting) {
+                [$li, $col] = $this->cliPosAt($e->x, $e->y);
+                // setCursorOffset leaves the anchor alone → the selection grows.
+                $this->input->setCursorOffset($this->input->offsetAt($li, $col));
+            } elseif ($this->popupDrag !== null) {
                 $this->moveCellPopup($e->x, $e->y);
             } else {
                 $this->dragScrollbar($e);
@@ -970,6 +2181,7 @@ final class App
         // A fresh press ends any prior drag latch before deciding what was hit.
         $this->scrollDrag = '';
         $this->popupDrag = null;
+        $this->cliSelecting = false;
 
         // The inline editor stays modal: a click does nothing beneath it (§6).
         if ($this->state->cellEdit) {
@@ -1009,6 +2221,30 @@ final class App
             return;
         }
 
+        // A press in the CLI input region sets the caret there (and focuses the
+        // CLI), starting a text selection that a subsequent drag extends (§4).
+        if ($this->pointInCli($e->y)) {
+            $this->state->focus = State::FOCUS_CLI;
+            [$li, $col] = $this->cliPosAt($e->x, $e->y);
+            $this->input->clearSelection();
+            $this->input->setCursorOffset($this->input->offsetAt($li, $col));
+            $this->input->startSelection();
+            $this->cliSelecting = true;
+            return;
+        }
+
+        // A click on a query error copies the whole thing (§19). The error is the
+        // one thing on screen a user needs verbatim somewhere else — a ticket, a
+        // search, a colleague — and it is also the one thing they cannot read in
+        // full, since both its lines are truncated to the result box.
+        if ($this->state->errorRect !== null) {
+            [$ex, $ey, $ew, $eh] = $this->state->errorRect;
+            if ($e->x >= $ex && $e->x < $ex + $ew && $e->y >= $ey && $e->y < $ey + $eh) {
+                $this->copyErrorToClipboard();
+                return;
+            }
+        }
+
         // Click anywhere on the vertical "Layout Config" label (right margin)
         // opens the Layout popup (§6).
         if ($this->state->layoutIndicatorW > 0
@@ -1016,7 +2252,7 @@ final class App
             && $e->x < $this->state->layoutIndicatorX + $this->state->layoutIndicatorW
             && $e->y >= $this->state->layoutIndicatorY
             && $e->y < $this->state->layoutIndicatorY + $this->state->layoutIndicatorH) {
-            $this->openLayoutPopup();
+            $this->openLayoutPopup($this->state->selectedCol);
             return;
         }
 
@@ -1039,20 +2275,26 @@ final class App
         }
         $hitCol = $gl->columnAt($e->x);
 
-        // Header click → open the column popup for that column (§6).
+        // Header click → open Data View Configuration on that column (§6).
         if ($e->y === $gl->headerY) {
             if ($hitCol !== null) {
                 $this->state->selectedCol = $hitCol;
-                $this->openColumnPopup($hitCol);
+                $this->openLayoutPopup($hitCol);
             }
             return;
         }
 
-        // Data click → select the row (and column when one is hit).
+        // Data click → select the row (and column when one is hit). A click in
+        // the mark-mode checkbox gutter selects the row *and* ticks it, which is
+        // the whole point of the column being clickable (§22).
         if ($e->y >= $gl->dataTop && $e->y < $gl->dataTop + $gl->dataRows) {
             $row = $gl->rowOffset + ($e->y - $gl->dataTop);
             if ($row <= $this->state->maxRow()) {
                 $this->state->selectedRow = $row;
+                if ($gl->isMarkColumn($e->x)) {
+                    $this->toggleRowMark();
+                    return;
+                }
                 if ($hitCol !== null) {
                     $this->state->selectedCol = $hitCol;
                 }
@@ -1130,7 +2372,6 @@ final class App
             || $this->state->pkPopup
             || $this->state->help
             || $this->state->completion
-            || $this->state->columnPopup
             || $this->state->layoutPopup
             || $this->state->systemMenu;
     }
@@ -1146,8 +2387,6 @@ final class App
             $this->state->help = false;
         } elseif ($this->state->completion) {
             $this->state->completion = false;
-        } elseif ($this->state->columnPopup) {
-            $this->state->columnPopup = false;
         } elseif ($this->state->layoutPopup) {
             $this->state->layoutPopup = false;
         } elseif ($this->state->systemMenu) {
@@ -1207,20 +2446,561 @@ final class App
 
     // --- column & layout popups (§6) ---------------------------------------
 
-    private function openColumnPopup(int $visibleColIdx): void
+    /**
+     * Open Data View Configuration (§6), scoped to one column.
+     *
+     * There is one grid-configuration menu, not two: the per-column actions and
+     * the table-wide resets were split across F2 and Ctrl+L, which meant knowing
+     * in advance which of the two owned "sort" or "hide" before you could look
+     * for it. $visibleColIdx is the column the per-column half acts on — the
+     * selected one for a keypress, the clicked one for a header click.
+     */
+    private function openLayoutPopup(int $visibleColIdx): void
     {
         if (!$this->state->hasResult() || $this->state->totalCols() === 0) {
             return;
         }
         $this->state->popupCol = max(0, min($visibleColIdx, $this->state->totalCols() - 1));
-        $this->state->popupItem = 0; // first item is selectable
-        $this->state->columnPopup = true;
-    }
-
-    private function openLayoutPopup(): void
-    {
         $this->state->layoutPopup = true;
         $this->state->layoutItem = 0;
+    }
+
+    // --- theme selection + editor (§13) ------------------------------------
+
+    /**
+     * The standalone "Select Theme" picker: switching themes without editing
+     * one, which is the common case.
+     *
+     * Arrowing through the list applies each scheme to the live UI immediately,
+     * so you choose by looking at the actual app rather than at a name. Enter
+     * keeps the highlighted one and persists it; Esc puts back the theme you
+     * arrived with.
+     */
+    private function openThemeSelect(): void
+    {
+        $s = $this->state;
+        $s->themePickerItems = $this->themeNames();
+        $idx = array_search($this->theme->name, $s->themePickerItems, true);
+        $s->themePickerSel = is_int($idx) ? $idx : 0;
+        $s->themePickerOffset = 0;
+        $s->themeSelect = true;
+        $this->themeBackup = $this->theme;
+        $this->previewSelectedTheme();
+    }
+
+    /** Apply the highlighted scheme to the live UI (no persistence). */
+    private function previewSelectedTheme(): void
+    {
+        $s = $this->state;
+        $name = $s->themePickerItems[$s->themePickerSel] ?? '';
+        if ($name === '') {
+            return;
+        }
+        $reason = null;
+        $scheme = $this->loadScheme($name, $reason);
+        if ($scheme === null) {
+            // A broken file shouldn't blank the screen mid-browse: keep whatever
+            // is on and say why in the status line.
+            $this->state->statusLine = 'Theme ' . $name . ' could not be loaded: ' . (string) $reason;
+            $this->state->statusIsError = true;
+            return;
+        }
+        $this->applyTheme(new Theme($name, $scheme));
+    }
+
+    private function handleThemeSelectKey(KeyEvent $e): void
+    {
+        $s = $this->state;
+        $count = count($s->themePickerItems);
+        switch ($e->key) {
+            case Key::Escape:
+                if ($this->themeBackup !== null) {
+                    $this->applyTheme($this->themeBackup);
+                }
+                $this->themeBackup = null;
+                $s->themeSelect = false;
+                $s->themePickerItems = [];
+                return;
+            case Key::Up:
+                $s->themePickerSel = $this->clampIndex($s->themePickerSel - 1, $count);
+                break;
+            case Key::Down:
+                $s->themePickerSel = $this->clampIndex($s->themePickerSel + 1, $count);
+                break;
+            case Key::PageUp:
+                $s->themePickerSel = $this->clampIndex($s->themePickerSel - self::DD_PAGE, $count);
+                break;
+            case Key::PageDown:
+                $s->themePickerSel = $this->clampIndex($s->themePickerSel + self::DD_PAGE, $count);
+                break;
+            case Key::Home:
+                $s->themePickerSel = 0;
+                break;
+            case Key::End:
+                $s->themePickerSel = $this->clampIndex($count - 1, $count);
+                break;
+            case Key::Enter:
+                $name = $s->themePickerItems[$s->themePickerSel] ?? '';
+                $this->themeBackup = null;
+                $s->themeSelect = false;
+                $s->themePickerItems = [];
+                if ($name !== '') {
+                    $this->settings->setTheme($name);
+                    $this->state->statusLine = 'Theme: ' . $name;
+                    $this->state->statusIsError = false;
+                }
+                return;
+            default:
+                return;
+        }
+        $this->previewSelectedTheme();
+    }
+
+    /**
+     * Open the live theme editor on the active palette.
+     *
+     * The editor is a modal panel, not a full-screen mode, precisely so the app
+     * behind it keeps rendering: every edit rebuilds the {@see Theme} and hands
+     * it to the Renderer, so the header, grid, borders and status line recolour
+     * as you nudge a channel. Cheap enough to do per keystroke — a Theme is ~57
+     * Style value objects derived from 16 hex strings.
+     */
+    private function openThemeEditor(): void
+    {
+        $s = $this->state;
+        $this->themeBackup = $this->theme;
+        $s->themeEditor = true;
+        $s->themeName = $this->theme->name;
+        $s->themeColors = $this->theme->scheme()->colors();
+        $s->themeSel = 0;
+        $s->themeChannel = 0;
+        $s->themeDirty = false;
+        $s->themeEscArmed = false;
+        $s->themeHexEdit = false;
+        $s->themeHexEditor = null;
+        $s->themeSaveAs = false;
+        $s->themeSaveEditor = null;
+        $s->themeOverwriteArmed = false;
+        $s->themePicker = false;
+        $this->themeNote('Editing ' . $s->themeName . ' — the screen behind updates as you type.');
+    }
+
+    /** Close the editor, restoring the pre-edit theme when $revert (Esc). */
+    private function closeThemeEditor(bool $revert): void
+    {
+        $s = $this->state;
+        if ($revert && $this->themeBackup !== null) {
+            $this->applyTheme($this->themeBackup);
+        }
+        $this->themeBackup = null;
+        $s->themeEditor = false;
+        $s->themeHexEdit = false;
+        $s->themeHexEditor = null;
+        $s->themeSaveAs = false;
+        $s->themeSaveEditor = null;
+        $s->themePicker = false;
+        $s->themePickerItems = [];
+        $s->themeMessage = '';
+        $s->themeMessageError = false;
+    }
+
+    private function applyTheme(Theme $theme): void
+    {
+        $this->theme = $theme;
+        $this->renderer->setTheme($theme);
+    }
+
+    /** Rebuild the live Theme from the palette under edit and apply it. */
+    private function rebuildEditedTheme(): void
+    {
+        $name = $this->state->themeName !== '' ? $this->state->themeName : 'custom';
+        $this->applyTheme(new Theme($name, new Scheme($name, $this->state->themeColors)));
+    }
+
+    private function themeNote(string $message, bool $isError = false): void
+    {
+        $this->state->themeMessage = $message;
+        $this->state->themeMessageError = $isError;
+    }
+
+    private function handleThemeEditorKey(KeyEvent $e): void
+    {
+        $s = $this->state;
+        // Sub-modals own input while open (innermost first).
+        if ($s->themeHexEdit) {
+            $this->handleThemeHexKey($e);
+            return;
+        }
+        if ($s->themeSaveAs) {
+            $this->handleThemeSaveKey($e);
+            return;
+        }
+        if ($s->themePicker) {
+            $this->handleThemePickerKey($e);
+            return;
+        }
+
+        // Anything but a second Esc cancels a pending discard prompt.
+        if ($e->key !== Key::Escape) {
+            $s->themeEscArmed = false;
+        }
+
+        switch ($e->key) {
+            case Key::Escape:
+                // Closing throws away unsaved edits, so make it take two presses.
+                if ($s->themeDirty && !$s->themeEscArmed) {
+                    $s->themeEscArmed = true;
+                    $this->themeNote('Unsaved changes — Esc again to discard, or s to save.', true);
+                    return;
+                }
+                $this->closeThemeEditor(revert: true);
+                return;
+            case Key::Up:
+                $s->themeSel = ($s->themeSel + 15) % 16;
+                return;
+            case Key::Down:
+                $s->themeSel = ($s->themeSel + 1) % 16;
+                return;
+            // The 16 slots are drawn as two columns of eight, so ±8 is "other column".
+            case Key::PageUp:
+            case Key::PageDown:
+                $s->themeSel = ($s->themeSel + 8) % 16;
+                return;
+            case Key::Left:
+                $this->nudgeThemeChannel($e->shift ? -16 : -1);
+                return;
+            case Key::Right:
+                $this->nudgeThemeChannel($e->shift ? 16 : 1);
+                return;
+            case Key::Tab:
+                $s->themeChannel = ($s->themeChannel + 1) % 3;
+                return;
+            case Key::Home:
+                $s->themeSel = 0;
+                return;
+            case Key::End:
+                $s->themeSel = 15;
+                return;
+            case Key::Enter:
+                $this->openThemeHexEdit();
+                return;
+            case Key::Char:
+                break;
+            default:
+                return;
+        }
+
+        if ($e->ctrl || $e->alt) {
+            return;
+        }
+        switch (strtolower($e->char)) {
+            case 'r':
+                $s->themeChannel = 0;
+                break;
+            case 'g':
+                $s->themeChannel = 1;
+                break;
+            case 'b':
+                $s->themeChannel = 2;
+                break;
+            case 'e':
+                $this->openThemeHexEdit();
+                break;
+            case 'l':
+                $this->openThemePicker();
+                break;
+            case 's':
+                $this->openThemeSaveAs();
+                break;
+            default:
+                break;
+        }
+    }
+
+    /** Shift the selected slot's active R/G/B channel by $delta, clamped 0-255. */
+    private function nudgeThemeChannel(int $delta): void
+    {
+        $s = $this->state;
+        $slot = Scheme::SLOTS[$s->themeSel];
+        $rgb = Style::parseHex($s->themeColors[$slot] ?? '') ?? [0, 0, 0];
+        $rgb[$s->themeChannel] = max(0, min(255, $rgb[$s->themeChannel] + $delta));
+        $this->setThemeSlot($slot, self::toHex($rgb));
+    }
+
+    private function setThemeSlot(string $slot, string $hex): void
+    {
+        $this->state->themeColors[$slot] = $hex;
+        $this->state->themeDirty = true;
+        $this->rebuildEditedTheme();
+    }
+
+    /** @param array{0:int,1:int,2:int} $rgb */
+    private static function toHex(array $rgb): string
+    {
+        return sprintf('#%02x%02x%02x', $rgb[0], $rgb[1], $rgb[2]);
+    }
+
+    private function openThemeHexEdit(): void
+    {
+        $slot = Scheme::SLOTS[$this->state->themeSel];
+        $editor = new LineEditor();
+        $editor->setText($this->state->themeColors[$slot] ?? '');
+        $editor->end();
+        $this->state->themeHexEditor = $editor;
+        $this->state->themeHexEdit = true;
+    }
+
+    private function handleThemeHexKey(KeyEvent $e): void
+    {
+        $editor = $this->state->themeHexEditor;
+        if ($editor === null) {
+            $this->state->themeHexEdit = false;
+            return;
+        }
+        switch ($e->key) {
+            case Key::Escape:
+                $this->state->themeHexEdit = false;
+                $this->state->themeHexEditor = null;
+                return;
+            case Key::Enter:
+                $text = trim($editor->text());
+                $rgb = Style::parseHex($text);
+                if ($rgb === null) {
+                    $this->themeNote('Not a hex colour: ' . $text, true);
+                    return;
+                }
+                $this->setThemeSlot(Scheme::SLOTS[$this->state->themeSel], self::toHex($rgb));
+                $this->state->themeHexEdit = false;
+                $this->state->themeHexEditor = null;
+                $this->themeNote('');
+                return;
+        }
+        if ($this->editorClipboardKey($e, $editor)) {
+            return;
+        }
+        $this->applyEditingKey($editor, $e, multiline: false);
+    }
+
+    private function openThemePicker(): void
+    {
+        $s = $this->state;
+        $s->themePickerItems = $this->themeNames();
+        $s->themePickerSel = 0;
+        $s->themePickerOffset = 0;
+        $s->themePicker = true;
+    }
+
+    private function handleThemePickerKey(KeyEvent $e): void
+    {
+        $s = $this->state;
+        $items = $s->themePickerItems;
+        $count = count($items);
+        switch ($e->key) {
+            case Key::Escape:
+                $s->themePicker = false;
+                return;
+            case Key::Up:
+                $s->themePickerSel = $this->clampIndex($s->themePickerSel - 1, $count);
+                return;
+            case Key::Down:
+                $s->themePickerSel = $this->clampIndex($s->themePickerSel + 1, $count);
+                return;
+            case Key::PageUp:
+                $s->themePickerSel = $this->clampIndex($s->themePickerSel - self::DD_PAGE, $count);
+                return;
+            case Key::PageDown:
+                $s->themePickerSel = $this->clampIndex($s->themePickerSel + self::DD_PAGE, $count);
+                return;
+            case Key::Home:
+                $s->themePickerSel = 0;
+                return;
+            case Key::End:
+                $s->themePickerSel = $this->clampIndex($count - 1, $count);
+                return;
+            case Key::Enter:
+                $this->loadThemeIntoEditor($items[$s->themePickerSel] ?? '');
+                return;
+            default:
+                return;
+        }
+    }
+
+    /**
+     * Replace the palette under edit with a scheme from the search path.
+     *
+     * Loading is *adopted*, not previewed: the loaded scheme becomes the new
+     * revert point and is persisted as the active theme. Picking a scheme by
+     * name is an explicit act (you confirmed it with Enter in the picker), so a
+     * later Esc should undo the tweaks you made on top of it — not silently put
+     * back the theme you started the session with.
+     *
+     * `<default>` loads like any other scheme — it is a perfectly good starting
+     * point to tweak — but has no file behind it, so saving needs a new name
+     * (see {@see saveEditedTheme()}).
+     */
+    private function loadThemeIntoEditor(string $name): void
+    {
+        $s = $this->state;
+        $s->themePicker = false;
+        if ($name === '') {
+            return;
+        }
+        $reason = null;
+        $scheme = $this->loadScheme($name, $reason);
+        if ($scheme === null) {
+            $this->themeNote('Could not load ' . $name . ': ' . (string) $reason, true);
+            return;
+        }
+        $s->themeColors = $scheme->colors();
+        $s->themeName = $name;
+        $s->themeDirty = false;
+        $s->themeEscArmed = false;
+        $this->rebuildEditedTheme();
+        // Adopt it: new revert point, and it survives closing the editor.
+        $this->themeBackup = $this->theme;
+        $this->settings->setTheme($name);
+        $this->themeNote($name === Scheme::BUILT_IN
+            ? 'Loaded ' . $name . ' — built-in, so `s` must save under a new name.'
+            : 'Loaded ' . $name . ' — now the active theme.');
+    }
+
+    private function openThemeSaveAs(): void
+    {
+        $editor = new LineEditor();
+        // The built-in can't be saved over, so don't prefill a name that Enter
+        // would only reject — offer 'custom' to type over instead.
+        $name = $this->state->themeName;
+        $editor->setText($name !== '' && $name !== Scheme::BUILT_IN ? $name : 'custom');
+        $editor->end();
+        $this->state->themeSaveEditor = $editor;
+        $this->state->themeSaveAs = true;
+        $this->state->themeOverwriteArmed = false;
+        $this->themeNote('');
+    }
+
+    private function handleThemeSaveKey(KeyEvent $e): void
+    {
+        $editor = $this->state->themeSaveEditor;
+        if ($editor === null) {
+            $this->state->themeSaveAs = false;
+            return;
+        }
+        switch ($e->key) {
+            case Key::Escape:
+                $this->state->themeSaveAs = false;
+                $this->state->themeSaveEditor = null;
+                $this->state->themeOverwriteArmed = false;
+                return;
+            case Key::Enter:
+                $this->saveEditedTheme(trim($editor->text()));
+                return;
+        }
+        if ($this->editorClipboardKey($e, $editor)) {
+            return;
+        }
+        // Editing the name invalidates a pending overwrite confirmation — it was
+        // armed for whatever target the *previous* text resolved to.
+        $this->state->themeOverwriteArmed = false;
+        $this->applyEditingKey($editor, $e, multiline: false);
+    }
+
+    /**
+     * Write the palette out as a Base16 scheme file and adopt the name.
+     *
+     * Saving under the name currently being edited just overwrites that scheme
+     * (the expected "keep tweaking one theme" flow). Any *other* existing name
+     * takes a second Enter, so a mistyped name can't silently clobber a scheme.
+     *
+     * `<default>` is the one name that can never be a target: it lives in code,
+     * not in a file. The name validator below would reject it anyway, but it
+     * gets its own message so "why won't it save?" is answered on the spot.
+     */
+    private function saveEditedTheme(string $name): void
+    {
+        $s = $this->state;
+        if ($name === Scheme::BUILT_IN) {
+            $this->themeNote(Scheme::BUILT_IN . ' is built in and cannot be changed — save under another name.', true);
+            return;
+        }
+        if (!preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]*$/', $name)) {
+            $this->themeNote('Name must be letters, digits, dot, dash or underscore.', true);
+            return;
+        }
+        $path = $this->themeSaveTarget($name);
+        if ($name !== $s->themeName && is_file($path) && !$s->themeOverwriteArmed) {
+            $s->themeOverwriteArmed = true;
+            $this->themeNote($path . ' exists — Enter again to overwrite.', true);
+            return;
+        }
+
+        if (!$this->writeThemeFile($path, $name, $s->themeColors)) {
+            $this->themeNote('Could not write ' . $path, true);
+            return;
+        }
+
+        $s->themeName = $name;
+        $s->themeDirty = false;
+        $s->themeEscArmed = false;
+        $s->themeSaveAs = false;
+        $s->themeSaveEditor = null;
+        $s->themeOverwriteArmed = false;
+        // Rebuild so the live Theme carries the saved name, and persist the
+        // choice so the next launch starts in it.
+        $this->rebuildEditedTheme();
+        // Adopt it as the revert point too, exactly as loading one does —
+        // otherwise the Esc that closes the editor would put the pre-edit
+        // colours back on screen and silently undo what was just saved.
+        $this->themeBackup = $this->theme;
+        $this->settings->setTheme($name);
+        $this->themeNote('Saved ' . $path);
+        my::lineout('FILE:FILE', 'theme saved', $name, $path);
+    }
+
+    /**
+     * Where a save under $name should land. An existing writable file for that
+     * name wins, so re-saving a theme edits it in place; otherwise the first
+     * dir on the search path (closest project `.sqli/themes/`, else global).
+     */
+    private function themeSaveTarget(string $name): string
+    {
+        $existing = $this->themeLoader()->find($name);
+        if ($existing !== null && is_writable($existing)) {
+            return $existing;
+        }
+        $dirs = $this->config->themeDirs();
+        $dir = $dirs[0]; // always non-empty: the global themes dir is last
+        return rtrim($dir, '/\\') . DIRECTORY_SEPARATOR . $name . '.yaml';
+    }
+
+    /**
+     * Write the 16 slots as a standard Base16 scheme file — the same shape any
+     * upstream scheme has, so a theme saved here is portable and reloads through
+     * the identical {@see SchemeLoader} path.
+     *
+     * @param array<string,string> $colors
+     */
+    private function writeThemeFile(string $path, string $name, array $colors): bool
+    {
+        $dir = dirname($path);
+        if (!is_dir($dir) && !@mkdir($dir, 0777, true) && !is_dir($dir)) {
+            return false;
+        }
+        // base00 is the ground, so its lightness is what "variant" means here.
+        $ground = Style::parseHex($colors['base00'] ?? '') ?? [0, 0, 0];
+        $variant = (($ground[0] + $ground[1] + $ground[2]) / 3) > 127 ? 'light' : 'dark';
+
+        $lines = [
+            '# Base16 scheme written by the sqli theme editor.',
+            'system: "base16"',
+            'name: "' . $name . '"',
+            'author: "sqli"',
+            'variant: "' . $variant . '"',
+            'palette:',
+        ];
+        foreach (Scheme::SLOTS as $slot) {
+            $lines[] = '  ' . $slot . ': "' . ($colors[$slot] ?? '#000000') . '"';
+        }
+        return @file_put_contents($path, implode("\n", $lines) . "\n") !== false;
     }
 
     // --- system menu (§12) -------------------------------------------------
@@ -1228,8 +3008,7 @@ final class App
     /**
      * Build the system-menu model fresh each time it's needed so labels and
      * enabled-state stay live (debug on/off, "Show DD" greyed until a DD loads,
-     * "Layout Config" only with a result). Assign-DD and Theme are present but
-     * disabled until their subsystems land (backlog H-pickers / J).
+     * "Layout Config" only with a result).
      *
      * @return list<array{label:string,action:string,enabled:bool}>
      */
@@ -1238,10 +3017,15 @@ final class App
         return [
             ['label' => 'Assign Data Dictionary', 'action' => 'assign_dd', 'enabled' => true],
             ['label' => 'Show Data Dictionary',   'action' => 'show_dd',   'enabled' => $this->dictionaryAvailable()],
-            ['label' => 'Theme',                  'action' => 'theme',     'enabled' => false],
+            ['label' => 'Select Theme',           'action' => 'theme_select', 'enabled' => true],
+            ['label' => 'Edit Theme',             'action' => 'theme',     'enabled' => true],
+            ['label' => 'Header Comment' . ($this->state->comment !== '' ? ': ' . $this->state->comment : ''),
+                'action' => 'comment', 'enabled' => true],
+            ['label' => 'Macros (' . $this->macros->count() . ')', 'action' => 'macros_view', 'enabled' => true],
+            ['label' => 'Create Local sqli Config', 'action' => 'create_config', 'enabled' => true],
             ['label' => 'Debug Logging: ' . ($this->state->debugLogging ? 'on' : 'off'),
                 'action' => 'debug_logging', 'enabled' => true],
-            ['label' => 'Layout Config', 'action' => 'layout_config', 'enabled' => $this->state->hasResult()],
+            ['label' => 'Data View Configuration', 'action' => 'layout_config', 'enabled' => $this->state->hasResult()],
         ];
     }
 
@@ -1285,7 +3069,7 @@ final class App
                 if ($e->char === '/' && !$e->ctrl && !$e->alt) {
                     $this->state->systemMenu = false;
                     if ($this->state->focus === State::FOCUS_CLI) {
-                        $this->input->editor()->insert('/');
+                        $this->input->insert('/');
                         $this->resetHistoryNav();
                     }
                 }
@@ -1324,7 +3108,7 @@ final class App
                 break;
             case 'layout_config':
                 if ($this->state->hasResult()) {
-                    $this->openLayoutPopup();
+                    $this->openLayoutPopup($this->state->selectedCol);
                 }
                 break;
             case 'show_dd':
@@ -1333,11 +3117,501 @@ final class App
             case 'assign_dd':
                 $this->openDdPicker();
                 break;
-            // theme (backlog J) wires in once the theme system exists; its entry
-            // stays disabled until then.
+            case 'theme_select':
+                $this->openThemeSelect();
+                break;
+            case 'theme':
+                $this->openThemeEditor();
+                break;
+            case 'comment':
+                $this->openCommentEdit();
+                break;
+            case 'macros_view':
+                $this->openMacrosView();
+                break;
+            case 'create_config':
+                $this->openCreateConfigChooser();
+                break;
             default:
                 break;
         }
+    }
+
+    // --- macros (§23) ----------------------------------------------------
+
+    /**
+     * Open the read-only macros viewer (system menu → Macros).
+     *
+     * Read-only is the whole design: the file is a text file the user edits in
+     * their editor, and a TUI that could also write it would be two owners of
+     * one document, racing. What the viewer is *for* is the other half of that
+     * arrangement — seeing what a name currently expands to without leaving
+     * sqli, and picking the edit up with `r` when it is made.
+     */
+    private function openMacrosView(): void
+    {
+        $this->state->macrosView = true;
+        $this->state->macrosSel = 0;
+        $this->state->macrosOffset = 0;
+        $this->macrosPublish();
+    }
+
+    /** Copy what {@see Macros} holds into the State the renderer reads. */
+    private function macrosPublish(): void
+    {
+        $rows = [];
+        $scoped = [];
+        foreach ($this->macros->all() as $name => $value) {
+            $env = $this->macros->scopeOf($name);
+            if ($env !== null) {
+                $scoped[$env] = ($scoped[$env] ?? 0) + 1;
+            }
+            $rows[] = [
+                'name'  => $name,
+                'value' => $value,
+                'args'  => $this->macros->arity($name),
+                'env'   => $env,
+            ];
+        }
+        $this->state->macrosRows = $rows;
+
+        // The env line (§23). Written only when some layer actually uses
+        // `[env:…]` sections — the row is worth a line of the viewer for the
+        // names it says are *out of reach*, and worth nothing at all to a file
+        // that scopes nothing. The unreachable ones are named rather than
+        // counted: "?agency-id is not here because you are on dev" is the whole
+        // question this line exists to answer.
+        $hidden = $this->macros->hidden();
+        if ($this->macros->envsSeen() === []) {
+            $this->state->macrosScope = '';
+        } else {
+            $env = $this->macros->env();
+            $parts = [$env === null ? 'no env selected — start sqli with -e NAME' : 'env ' . $env];
+            // Counted per section rather than in one lump, because more than one
+            // can load: an env that `extends` another (§16) inherits its macros,
+            // and crediting a parent's definitions to the selected env would name
+            // a section the reader could then not find. Chain order, least
+            // specific first, so it reads the way the file was applied.
+            if ($scoped !== [] && $env !== null) {
+                $counts = [];
+                foreach ($this->macros->envChain() as $from) {
+                    $n = $scoped[$from] ?? 0;
+                    if ($n > 0) {
+                        $counts[] = $n . ($n === 1 ? ' macro' : ' macros') . ' from [env:' . $from . ']';
+                    }
+                }
+                $parts[] = implode(', ', $counts);
+            }
+            if ($hidden !== []) {
+                $parts[] = count($hidden) . (count($hidden) === 1 ? ' macro' : ' macros')
+                    . ' in another env, not loaded: ' . implode(', ', array_keys($hidden));
+            }
+            $this->state->macrosScope = implode(' · ', $parts);
+        }
+        $this->state->macrosSel = max(0, min($this->state->macrosSel, max(0, count($rows) - 1)));
+
+        // Which file(s) answered — and, when none did, where one would go. An
+        // empty viewer that names the path it looked in is the difference
+        // between "the feature is broken" and "the file isn't there yet".
+        $files = $this->macros->files();
+        if ($files !== []) {
+            $this->state->macrosSource = count($files) === 1
+                ? $files[0]
+                : implode('  ←  ', array_reverse($files)); // closest (winning) first
+        } else {
+            $dirs = $this->macros->dirs();
+            $where = $dirs === []
+                ? Macros::FILE
+                : rtrim((string) end($dirs), '/\\') . DIRECTORY_SEPARATOR . Macros::FILE;
+            $this->state->macrosSource = 'no ' . Macros::FILE . ' yet — create ' . $where;
+        }
+        $this->state->macrosProblem = implode(' · ', $this->macros->problems());
+    }
+
+    private function handleMacrosViewKey(KeyEvent $e): void
+    {
+        $n = count($this->state->macrosRows);
+        switch ($e->key) {
+            case Key::Up:
+                $this->state->macrosSel = max(0, $this->state->macrosSel - 1);
+                return;
+            case Key::Down:
+                $this->state->macrosSel = min(max(0, $n - 1), $this->state->macrosSel + 1);
+                return;
+            case Key::PageUp:
+                $this->state->macrosSel = max(0, $this->state->macrosSel - 10);
+                return;
+            case Key::PageDown:
+                $this->state->macrosSel = min(max(0, $n - 1), $this->state->macrosSel + 10);
+                return;
+            case Key::Home:
+                $this->state->macrosSel = 0;
+                return;
+            case Key::End:
+                $this->state->macrosSel = max(0, $n - 1);
+                return;
+            case Key::Escape:
+                $this->state->macrosView = false;
+                return;
+            case Key::Char:
+                if (!$e->ctrl && !$e->alt && strtolower($e->char) === 'r') {
+                    $this->reloadMacros();
+                }
+                return;
+            default:
+                return;
+        }
+    }
+
+    /**
+     * Re-read every macro layer from disk and say what came back (§23).
+     *
+     * The count is reported even when it did not change: the point of pressing
+     * `r` is to find out whether the edit just made in the other window landed,
+     * and silence would answer neither way.
+     */
+    private function reloadMacros(): void
+    {
+        $this->macros->reload();
+        $this->macrosPublish();
+        $problems = $this->macros->problems();
+        $n = $this->macros->count();
+        $this->state->statusLine = $problems !== []
+            ? implode(' · ', $problems)
+            : 'Macros reloaded — ' . ($n === 1 ? '1 macro' : $n . ' macros');
+        $this->state->statusIsError = $problems !== [];
+    }
+
+    // --- ?{name} prompts (§23) ----------------------------------------------
+
+    /**
+     * Ask the next unanswered question of the suspended submission, or run it
+     * when there are none left.
+     *
+     * The title carries `(2 of 3)` when there is more than one, because the
+     * difference between "one more question" and "four more questions" decides
+     * whether the user answers or presses Esc, and a bare name does not say.
+     */
+    private function openNextPrompt(): void
+    {
+        $pending = $this->pendingPrompt;
+        if ($pending === null) {
+            return;
+        }
+        $total = count($pending['names']);
+        $done = count($pending['answers']);
+        if ($done >= $total) {
+            $this->pendingPrompt = null;
+            $this->closePrompt();
+            $this->runSubmission(
+                $pending['sql'],
+                $pending['typed'],
+                $pending['vertical'],
+                $pending['tab'],
+                $pending['answers'],
+            );
+            return;
+        }
+        $name = $pending['names'][$done];
+        $editor = new LineEditor();
+        $this->state->promptEditor = $editor;
+        $this->state->promptName = $name;
+        $this->state->promptTitle = ' ' . $name . ($total > 1 ? ' (' . ($done + 1) . ' of ' . $total . ')' : '') . ' ';
+        $this->state->promptAsk = true;
+    }
+
+    private function handlePromptKey(KeyEvent $e): void
+    {
+        $editor = $this->state->promptEditor;
+        if ($editor === null) {
+            $this->cancelPrompt();
+            return;
+        }
+        switch ($e->key) {
+            case Key::Escape:
+                // Esc drops the whole submission, not just this question. Half a
+                // set of answers is not a statement anyone asked to run, and the
+                // line is still on the CLI to try again.
+                $this->cancelPrompt();
+                return;
+            case Key::Enter:
+                $pending = $this->pendingPrompt;
+                if ($pending === null) {
+                    $this->cancelPrompt();
+                    return;
+                }
+                // An empty answer is an answer: `?{limit}` left blank is how a
+                // fragment that is optional gets left out, and refusing to accept
+                // it would need a second key to mean "nothing".
+                $pending['answers'][$this->state->promptName] = $editor->text();
+                $this->pendingPrompt = $pending;
+                $this->closePrompt();
+                $this->openNextPrompt();
+                return;
+        }
+        if ($this->editorClipboardKey($e, $editor)) {
+            return;
+        }
+        $this->applyEditingKey($editor, $e, multiline: false);
+    }
+
+    /** Drop the question and the submission behind it. */
+    private function cancelPrompt(): void
+    {
+        $this->pendingPrompt = null;
+        $this->closePrompt();
+        $this->state->statusLine = 'Cancelled — nothing was run';
+        $this->state->statusIsError = false;
+    }
+
+    private function closePrompt(): void
+    {
+        $this->state->promptAsk = false;
+        $this->state->promptEditor = null;
+        $this->state->promptName = '';
+        $this->state->promptTitle = '';
+    }
+
+    // --- the header comment (§7) --------------------------------------------
+
+    /** Longest comment kept; the header truncates further to fit the row. */
+    private const COMMENT_MAX_LEN = 40;
+
+    /**
+     * Squeeze whatever arrived — a config value, a typed line — into something a
+     * single header row can hold: one line, no control characters, bounded.
+     *
+     * Bounded here rather than only at draw time so the system-menu label that
+     * echoes it back cannot itself grow the menu off the screen.
+     */
+    private static function cleanComment(string $text): string
+    {
+        $text = trim((string) preg_replace('/\s+/u', ' ', $text));
+        return mb_strlen($text) > self::COMMENT_MAX_LEN
+            ? rtrim(mb_substr($text, 0, self::COMMENT_MAX_LEN))
+            : $text;
+    }
+
+    /**
+     * "Header Comment" from the system menu: a one-line prompt prefilled with
+     * the current note, so the common edit is a tweak rather than a retype.
+     */
+    private function openCommentEdit(): void
+    {
+        $editor = new LineEditor();
+        $editor->setText($this->state->comment);
+        $editor->end();
+        $this->state->commentEditor = $editor;
+        $this->state->commentEdit = true;
+    }
+
+    private function handleCommentEditKey(KeyEvent $e): void
+    {
+        $editor = $this->state->commentEditor;
+        if ($editor === null) {
+            $this->state->commentEdit = false;
+            return;
+        }
+        switch ($e->key) {
+            case Key::Escape:
+                $this->closeCommentEdit();
+                return;
+            case Key::Enter:
+                // An empty line clears it. That is the whole "remove the note"
+                // gesture — a second menu item to delete a 6-character string
+                // would be more UI than the thing it manages.
+                $this->state->comment = self::cleanComment($editor->text());
+                $this->closeCommentEdit();
+                $this->state->statusLine = $this->state->comment === ''
+                    ? 'Header comment cleared'
+                    : 'Header comment set to ' . $this->state->comment;
+                $this->state->statusIsError = false;
+                return;
+        }
+        if ($this->editorClipboardKey($e, $editor)) {
+            return;
+        }
+        $this->applyEditingKey($editor, $e, multiline: false);
+    }
+
+    private function closeCommentEdit(): void
+    {
+        $this->state->commentEdit = false;
+        $this->state->commentEditor = null;
+    }
+
+    // --- .sqli config creation (§16) ----------------------------------------
+
+    /**
+     * "Create Local sqli Config": pick which directory (the cwd or any of its
+     * ancestors) should get a fresh `.sqli/` — for when a project deserves its
+     * own config/state instead of inheriting whatever is further up the tree.
+     */
+    private function openCreateConfigChooser(): void
+    {
+        $items = [];
+        foreach ($this->candidateConfigDirs() as $dir) {
+            $items[] = $dir;
+        }
+        if ($items === []) {
+            $this->state->statusLine = 'Every directory from here to the root already has a .sqli config.';
+            $this->state->statusIsError = false;
+            return;
+        }
+        $this->openChooser('create_config', ' Create .sqli config in… ', $items,
+            'Enter: create here · Esc: cancel');
+    }
+
+    /**
+     * The "where should sqli save its state?" prompt: opened lazily by the main
+     * loop the first time something needs persisting and no `.sqli/` exists
+     * anywhere (closest-project or global). Never fires at idle startup.
+     */
+    private function openStateDirPrompt(): void
+    {
+        $items = [$this->config->globalSqliDir() . '   (home — applies everywhere)'];
+        foreach ($this->candidateConfigDirs() as $dir) {
+            $items[] = $dir . DIRECTORY_SEPARATOR . '.sqli';
+        }
+        $items[] = 'Don\'t save anything this session';
+        $this->openChooser('state_dir', ' No .sqli config found — save settings where? ', $items,
+            'Enter: create + save · Esc: not now');
+    }
+
+    /** Dirs from the cwd to the root that do not already have a `.sqli/` (home excluded). */
+    private function candidateConfigDirs(): array
+    {
+        $home = rtrim($this->config->globalSqliDir(), '/\\');
+        $homeParent = dirname($home);
+        $dirs = [];
+        $dir = getcwd() ?: '.';
+        $prev = null;
+        while ($dir !== '' && $dir !== $prev) {
+            if (!is_dir($dir . DIRECTORY_SEPARATOR . '.sqli')
+                && rtrim($dir, '/\\') !== $homeParent) {
+                $dirs[] = $dir;
+            }
+            $prev = $dir;
+            $dir = dirname($dir);
+        }
+        return $dirs;
+    }
+
+    private function openChooser(string $purpose, string $title, array $items, string $hint): void
+    {
+        $s = $this->state;
+        $s->chooser = $purpose;
+        $s->chooserTitle = $title;
+        $s->chooserHint = $hint;
+        $s->chooserItems = $items;
+        $s->chooserSel = 0;
+        $s->chooserOffset = 0;
+    }
+
+    private function closeChooser(): void
+    {
+        $s = $this->state;
+        $s->chooser = null;
+        $s->chooserItems = [];
+    }
+
+    private function handleChooserKey(KeyEvent $e): void
+    {
+        $s = $this->state;
+        $count = count($s->chooserItems);
+        switch ($e->key) {
+            case Key::Escape:
+                $purpose = $s->chooser;
+                $this->closeChooser();
+                if ($purpose === 'state_dir') {
+                    // Esc = "not now": stop asking, hold state in memory.
+                    $this->settings->mute();
+                    $this->state->statusLine = 'Not saving settings this session.';
+                    $this->state->statusIsError = false;
+                }
+                return;
+            case Key::Up:
+                $s->chooserSel = $this->clampIndex($s->chooserSel - 1, $count);
+                return;
+            case Key::Down:
+                $s->chooserSel = $this->clampIndex($s->chooserSel + 1, $count);
+                return;
+            case Key::PageUp:
+                $s->chooserSel = $this->clampIndex($s->chooserSel - self::DD_PAGE, $count);
+                return;
+            case Key::PageDown:
+                $s->chooserSel = $this->clampIndex($s->chooserSel + self::DD_PAGE, $count);
+                return;
+            case Key::Home:
+                $s->chooserSel = 0;
+                return;
+            case Key::End:
+                $s->chooserSel = $this->clampIndex($count - 1, $count);
+                return;
+            case Key::Enter:
+                $purpose = (string) $s->chooser;
+                $sel = $s->chooserSel;
+                $this->closeChooser();
+                $this->applyChooser($purpose, $sel);
+                return;
+            default:
+                return;
+        }
+    }
+
+    private function applyChooser(string $purpose, int $sel): void
+    {
+        if ($purpose === 'create_config') {
+            $dirs = $this->candidateConfigDirs();
+            $dir = $dirs[$sel] ?? null;
+            if ($dir !== null) {
+                $this->createSqliConfigAt($dir . DIRECTORY_SEPARATOR . '.sqli', relocateState: true);
+            }
+            return;
+        }
+        if ($purpose === 'state_dir') {
+            $candidates = $this->candidateConfigDirs();
+            $last = count($candidates) + 1; // items: [home, ...candidates, "don't save"]
+            if ($sel === $last) {
+                $this->settings->mute();
+                $this->state->statusLine = 'Not saving settings this session.';
+                $this->state->statusIsError = false;
+                return;
+            }
+            if ($sel === 0) {
+                $this->createSqliConfigAt($this->config->globalSqliDir(), relocateState: true);
+                return;
+            }
+            $dir = $candidates[$sel - 1] ?? null;
+            if ($dir !== null) {
+                $this->createSqliConfigAt($dir . DIRECTORY_SEPARATOR . '.sqli', relocateState: true);
+            }
+        }
+    }
+
+    /**
+     * Create + seed a `.sqli/` dir, report exactly what was made where, and
+     * (optionally) move the live state/formatting persistence into it. Any
+     * write failure surfaces as a status-line error with the path and reason.
+     */
+    private function createSqliConfigAt(string $sqliDir, bool $relocateState): void
+    {
+        $err = $this->config->scaffoldAt($sqliDir);
+        if ($err !== null) {
+            $this->state->statusLine = $err;
+            $this->state->statusIsError = true;
+            my::lineout('FILE:FILE', 'config scaffold failed', $sqliDir, $err);
+            return;
+        }
+        if ($relocateState) {
+            $this->settings->relocate($sqliDir);
+        }
+        $this->state->statusLine = 'Created ' . $sqliDir
+            . ' (sqli_config.json, sqli_credentials.json, themes/)';
+        $this->state->statusIsError = false;
+        my::lineout('FILE:FILE', 'config scaffolded', $sqliDir);
+        // A write error from the relocation (e.g. read-only dir) trumps the
+        // success message — surfaced on the next frame by the main loop.
     }
 
     private function toggleDebugLogging(): void
@@ -1378,6 +3652,10 @@ final class App
         $this->ddLockNextCheck = microtime(true) + self::DD_LOCK_POLL;
         $this->state->ddViewer = true;
         $this->state->ddFkView = false;
+        $this->state->ddNewView = false;
+        $this->state->ddNewChecked = [];
+        $this->state->ddNewSel = 0;
+        $this->state->ddNewOffset = 0;
         $this->state->ddPanel = 0;
         $this->state->ddFilter = '';
         $this->state->ddFilterCur = 0;
@@ -1591,12 +3869,43 @@ final class App
         $this->state->ddTableBadges = $badges;
         $this->state->ddFieldStatus = $fieldStatus;
         $this->state->ddMissingFields = $missing;
+        $this->state->ddNewTables = $this->ddUndocumentedTables();
     }
 
     /** True when a live connection can supply schema for diffing (any table back). */
     private function ddDiffAvailable(): bool
     {
         return $this->schema->tables() !== [];
+    }
+
+    /**
+     * Live tables the DD doesn't document, sorted A-Z (§11). The table-level
+     * counterpart of SchemaDiff's field-level "missing": the DD viewer lists only
+     * documented tables, so without this a new table is invisible and the user is
+     * never told it needs documenting.
+     *
+     * Purely derived — nothing is written to the DD until the user creates the
+     * entries with Ctrl+N. Empty with no live schema (nothing to compare against).
+     *
+     * @return list<string>
+     */
+    private function ddUndocumentedTables(): array
+    {
+        if ($this->dictionary === null || !$this->ddDiffAvailable()) {
+            return [];
+        }
+        $documented = [];
+        foreach ($this->dictionary->tableNames() as $name) {
+            $documented[strtolower($name)] = true; // MySQL table names are ci
+        }
+        $new = [];
+        foreach ($this->schema->tables() as $table) {
+            if (!isset($documented[strtolower($table)])) {
+                $new[] = $table;
+            }
+        }
+        usort($new, static fn (string $a, string $b): int => strcasecmp($a, $b));
+        return $new;
     }
 
     /** '' = matches / 'diff' = field-level differences / 'orphan' = no live table. */
@@ -1653,7 +3962,7 @@ final class App
         $total = max(1, count($ddTables));
         $done = 0;
         $lastPct = -1;
-        $this->state->busyMessage = 'Loading Data Dictionary …';
+        $this->state->busyMessage = 'Loading and comparing Data Dictionary …';
         $this->flushFrame();
         try {
             foreach ($ddTables as $t) {
@@ -1662,7 +3971,7 @@ final class App
                 $pct = intdiv($done * 100, $total);
                 if ($pct !== $lastPct) { // only repaint when the number changes
                     $lastPct = $pct;
-                    $this->state->busyMessage = 'Loading Data Dictionary   ' . $pct . '%';
+                    $this->state->busyMessage = 'Loading and comparing Data Dictionary   ' . $pct . '%';
                     $this->flushFrame();
                 }
             }
@@ -1711,8 +4020,47 @@ final class App
             return;
         }
 
+        // The add-undocumented-tables popup owns input while open (§11).
+        if ($this->state->ddNewView) {
+            $this->handleDdNewTablesKey($e);
+            return;
+        }
+
+        // The single-field detail view stays open and navigable: Up/Down/Home/End
+        // walk the table's fields (rebuilding the box for each), Esc closes it, and
+        // any other key is ignored so the box holds (§11).
+        if ($this->state->ddRowView) {
+            switch ($e->key) {
+                case Key::Escape:
+                    $this->state->ddRowView = false;
+                    break;
+                case Key::Up:
+                    $this->ddRowViewSelect($this->state->ddFieldSel - 1);
+                    break;
+                case Key::Down:
+                    $this->ddRowViewSelect($this->state->ddFieldSel + 1);
+                    break;
+                case Key::Home:
+                    $this->ddRowViewSelect(0);
+                    break;
+                case Key::End:
+                    $this->ddRowViewSelect(PHP_INT_MAX);
+                    break;
+                default:
+                    break;
+            }
+            return;
+        }
+
         $onTables = $this->state->ddPanel === 0;
         switch ($e->key) {
+            case Key::Tab:
+                // Ctrl+I / Tab opens a read-only detail of the selected field —
+                // the DD analog of the data view's `i` (§11). Uses Tab because the
+                // DD viewer filters as you type, so plain `i` isn't free; Ctrl+I is
+                // the same byte (0x09) as Tab, so this key serves both.
+                $this->openDdRowView();
+                break;
             case Key::Enter:
                 // Enter on the tables panel drills into the fields panel; on the
                 // fields panel it opens the inline comment editor — except on the
@@ -1774,15 +4122,346 @@ final class App
                 $this->ddBackspaceFilter();
                 break;
             case Key::Char:
-                // Printable characters extend the single search box; ctrl/alt
-                // combos are ignored here.
-                if (!$e->ctrl && !$e->alt && $e->char !== '') {
+                // Ctrl+U syncs the selected table's structure from the live DB and
+                // Ctrl+N opens the add-undocumented-tables popup (§11). Other
+                // printable characters extend the single search box; remaining
+                // ctrl/alt combos are ignored here.
+                if ($e->ctrl && !$e->alt && strtolower($e->char) === 'u') {
+                    $this->syncDdTable();
+                } elseif ($e->ctrl && !$e->alt && strtolower($e->char) === 'n') {
+                    $this->openDdNewTables();
+                } elseif (!$e->ctrl && !$e->alt && $e->char !== '') {
                     $this->ddInsertFilter($e->char);
                 }
                 break;
             default:
                 break;
         }
+    }
+
+    /**
+     * Sync the DD-viewer's selected table from the live schema (Ctrl+U, §11).
+     * Re-fetches a fresh `SHOW COLUMNS`, rewrites the DD's structural cells while
+     * preserving comments, adds undocumented live fields, and saves the CSV. Runs
+     * behind a "please wait" popup; archives the DD first (opt-in) like any edit.
+     */
+    private function syncDdTable(): void
+    {
+        if ($this->dictionary === null) {
+            return;
+        }
+        // Don't attempt a write we can't complete: the file is held open elsewhere.
+        if ($this->state->ddLocked || $this->dictionary->isLocked()) {
+            $this->state->ddLocked = true;
+            $this->state->statusLine = 'DD file is open in another program — sync disabled until it is closed.';
+            $this->state->statusIsError = true;
+            return;
+        }
+        $table = $this->ddCurrentTable();
+        if ($table === '') {
+            return;
+        }
+        if (!$this->dictionary->hasTable($table)) {
+            // The viewer only lists DD tables, so this is defensive; the spec's
+            // "create a new entry" flow for an undocumented table is not yet built.
+            $this->state->statusLine = 'Table ' . $table . ' is not in the data dictionary.';
+            $this->state->statusIsError = true;
+            return;
+        }
+        if (!$this->schema->hasTable($table)) {
+            $this->state->statusLine = 'Table ' . $table . ' not found in the live database — cannot sync.';
+            $this->state->statusIsError = true;
+            return;
+        }
+
+        $this->withBusy('Syncing ' . $table . ' from live schema …', function () use ($table): void {
+            $this->schema->forget($table); // force a fresh SHOW COLUMNS
+            $live = $this->schema->describeRows($table);
+            if ($live === []) {
+                $this->state->statusLine = 'Could not read live columns for ' . $table . ' — sync aborted.';
+                $this->state->statusIsError = true;
+                return;
+            }
+            $this->archiveDdBeforeEdit();
+            $result = $this->dictionary->sync($table, $live);
+            $this->applySyncResult($table, $result);
+        });
+    }
+
+    /**
+     * Open the "add undocumented tables" popup (Ctrl+N in the DD viewer, §11).
+     * Lists the live tables the DD doesn't document; nothing is written until the
+     * user confirms with Enter.
+     */
+    private function openDdNewTables(): void
+    {
+        if ($this->state->ddNewTables === []) {
+            $this->state->statusLine = $this->state->ddDiffReady
+                ? 'Every live table is documented in the data dictionary.'
+                : 'No live database to compare against.';
+            $this->state->statusIsError = false;
+            return;
+        }
+        $this->state->ddNewView = true;
+        $this->state->ddNewSel = 0;
+        $this->state->ddNewOffset = 0;
+        $this->state->ddNewChecked = [];
+    }
+
+    /**
+     * Keys for the add-undocumented-tables popup (§11): Up/Down/PageUp/PageDown/
+     * Home/End move, Space ticks one, Ctrl+A ticks/unticks all, Enter creates the
+     * ticked tables (or the highlighted one if none are ticked), Esc closes without
+     * writing.
+     */
+    private function handleDdNewTablesKey(KeyEvent $e): void
+    {
+        $n = count($this->state->ddNewTables);
+        if ($n === 0) {
+            $this->state->ddNewView = false;
+            return;
+        }
+        $move = function (int $to): void {
+            $this->state->ddNewSel = max(0, min(count($this->state->ddNewTables) - 1, $to));
+        };
+        switch ($e->key) {
+            case Key::Escape:
+                $this->state->ddNewView = false;
+                break;
+            case Key::Up:
+                $move($this->state->ddNewSel - 1);
+                break;
+            case Key::Down:
+                $move($this->state->ddNewSel + 1);
+                break;
+            case Key::PageUp:
+                $move($this->state->ddNewSel - $this->ddNewPageStep());
+                break;
+            case Key::PageDown:
+                $move($this->state->ddNewSel + $this->ddNewPageStep());
+                break;
+            case Key::Home:
+                $move(0);
+                break;
+            case Key::End:
+                $move($n - 1);
+                break;
+            case Key::Enter:
+                $this->createDdTables($this->ddNewSelection());
+                break;
+            case Key::Char:
+                if ($e->ctrl && !$e->alt && strtolower($e->char) === 'a') {
+                    $this->ddNewToggleAll();
+                } elseif (!$e->ctrl && !$e->alt && $e->char === ' ') {
+                    $this->ddNewToggle($this->state->ddNewSel);
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    /** One PageUp/PageDown step in the add-tables popup: a full visible page. */
+    private function ddNewPageStep(): int
+    {
+        return max(1, $this->ddNewVisibleRows());
+    }
+
+    /**
+     * Rows the add-tables popup can show at once. Mirrors the renderer's geometry
+     * (box borders + title + hint line), so paging matches what's on screen.
+     */
+    private function ddNewVisibleRows(): int
+    {
+        return max(1, min(count($this->state->ddNewTables), $this->screen->height() - 6));
+    }
+
+    /** Tick/untick one table in the add-tables popup. */
+    private function ddNewToggle(int $idx): void
+    {
+        $table = $this->state->ddNewTables[$idx] ?? null;
+        if ($table === null) {
+            return;
+        }
+        if (isset($this->state->ddNewChecked[$table])) {
+            unset($this->state->ddNewChecked[$table]);
+        } else {
+            $this->state->ddNewChecked[$table] = true;
+        }
+    }
+
+    /** Ctrl+A in the add-tables popup: tick all, or untick all if all are ticked. */
+    private function ddNewToggleAll(): void
+    {
+        if (count($this->state->ddNewChecked) === count($this->state->ddNewTables)) {
+            $this->state->ddNewChecked = [];
+            return;
+        }
+        $this->state->ddNewChecked = [];
+        foreach ($this->state->ddNewTables as $table) {
+            $this->state->ddNewChecked[$table] = true;
+        }
+    }
+
+    /**
+     * What Enter acts on in the add-tables popup: every ticked table, or — when
+     * nothing is ticked — just the highlighted one, so the common "add this one"
+     * case needs no Space first.
+     *
+     * @return list<string>
+     */
+    private function ddNewSelection(): array
+    {
+        $checked = [];
+        foreach ($this->state->ddNewTables as $table) {
+            if (isset($this->state->ddNewChecked[$table])) {
+                $checked[] = $table;
+            }
+        }
+        if ($checked !== []) {
+            return $checked;
+        }
+        $one = $this->state->ddNewTables[$this->state->ddNewSel] ?? null;
+        return $one === null ? [] : [$one];
+    }
+
+    /**
+     * Create DD entries for the given undocumented live tables (§11): fetch each
+     * one's columns, write them all in a single archived, atomic CSV update, and
+     * refresh the viewer so they appear as ordinary DD tables with empty comments.
+     *
+     * @param list<string> $tables
+     */
+    private function createDdTables(array $tables): void
+    {
+        if ($this->dictionary === null || $tables === []) {
+            return;
+        }
+        // Don't attempt a write we can't complete: the file is held open elsewhere.
+        if ($this->state->ddLocked || $this->dictionary->isLocked()) {
+            $this->state->ddLocked = true;
+            $this->state->statusLine = 'DD file is open in another program — adding tables is disabled until it is closed.';
+            $this->state->statusIsError = true;
+            return;
+        }
+
+        $msg = count($tables) === 1
+            ? 'Adding ' . $tables[0] . ' to the data dictionary …'
+            : 'Adding ' . count($tables) . ' tables to the data dictionary …';
+        $this->withBusy($msg, function () use ($tables): void {
+            $spec = [];
+            $unreadable = [];
+            foreach ($tables as $table) {
+                $live = $this->schema->describeRows($table);
+                if ($live === []) {
+                    $unreadable[] = $table;
+                    continue;
+                }
+                $spec[$table] = $live;
+            }
+            if ($spec === []) {
+                $this->state->statusLine = 'Could not read live columns for '
+                    . implode(', ', $unreadable) . ' — nothing added.';
+                $this->state->statusIsError = true;
+                return;
+            }
+            $this->archiveDdBeforeEdit();
+            $result = $this->dictionary->createTables($spec);
+            $this->applyCreateResult($result, $unreadable);
+        });
+    }
+
+    /**
+     * Turn a {@see DataDictionary::createTables()} result into a status line, close
+     * the popup on success, and drop cached diffs so the new tables pick up badges.
+     *
+     * @param array{status:string,created:list<string>,fields:int,skipped:list<string>} $result
+     * @param list<string> $unreadable tables whose live columns couldn't be read
+     */
+    private function applyCreateResult(array $result, array $unreadable = []): void
+    {
+        if ($result['status'] === DataDictionary::SAVE_LOCKED) {
+            $this->state->ddLocked = true;
+            $this->state->statusLine = 'DD file is open in another program — try Ctrl+N again once it is closed.';
+            $this->state->statusIsError = true;
+            return;
+        }
+        if ($result['status'] === DataDictionary::SAVE_FAILED) {
+            $this->state->statusLine = 'Adding tables to the DD failed — check file permissions';
+            $this->state->statusIsError = true;
+            return;
+        }
+        $created = $result['created'];
+        if ($created === []) {
+            // Everything requested was already documented — the likeliest cause is a
+            // co-worker's entry merging in from disk on the way to writing.
+            $this->state->statusLine = 'Already in the data dictionary — nothing added.';
+            $this->state->statusIsError = false;
+            $this->state->ddNewView = false;
+            return;
+        }
+
+        // The DD gained tables → the derived lists and every cached diff are stale.
+        $this->ddDiffCache = [];
+        $this->state->ddNewView = false;
+        $this->state->ddNewChecked = [];
+        $this->state->ddNewSel = 0;
+        $this->state->ddNewOffset = 0;
+
+        $parts = [count($created) . ' table(s) added (' . implode(', ', $created) . ')'];
+        $parts[] = $result['fields'] . ' field(s)';
+        if ($unreadable !== []) {
+            $parts[] = 'skipped ' . implode(', ', $unreadable) . ' (could not read columns)';
+        }
+        if ($result['status'] === DataDictionary::SAVE_MERGED) {
+            $parts[] = 'merged external changes';
+        }
+        $this->state->statusLine = 'DD updated · ' . implode(' · ', $parts)
+            . ' — comments are empty, fill them in with Enter.';
+        $this->state->statusIsError = false;
+
+        // Land the table panel on the first table just created so the user is
+        // looking straight at what they need to document.
+        $this->state->ddTableSel = $this->ddIndexOfTable($created[0]);
+        $this->state->ddFieldSel = 0;
+        $this->state->ddPanel = 0;
+    }
+
+    /**
+     * Turn a {@see DataDictionary::sync()} result into a status line and refresh
+     * the viewer's diff cache so badges reflect the new structure.
+     *
+     * @param array{status:string,updated:int,added:list<string>,removed:list<string>} $result
+     */
+    private function applySyncResult(string $table, array $result): void
+    {
+        if ($result['status'] === DataDictionary::SAVE_LOCKED) {
+            $this->state->ddLocked = true;
+            $this->state->statusLine = 'DD file is open in another program — try Ctrl+U again once it is closed.';
+            $this->state->statusIsError = true;
+            return;
+        }
+        if ($result['status'] === DataDictionary::SAVE_FAILED) {
+            $this->state->statusLine = 'DD sync failed — check file permissions';
+            $this->state->statusIsError = true;
+            return;
+        }
+        // Structure changed → drop cached diffs so badges re-compute on next draw.
+        $this->ddDiffCache = [];
+        $added = $result['added'];
+        $removed = $result['removed'] ?? [];
+        $parts = [$result['updated'] . ' updated'];
+        if ($added !== []) {
+            $parts[] = count($added) . ' added (' . implode(', ', $added) . ')';
+        }
+        if ($removed !== []) {
+            $parts[] = count($removed) . ' removed (' . implode(', ', $removed) . ')';
+        }
+        $merged = $result['status'] === DataDictionary::SAVE_MERGED
+            ? ' (merged external changes)' : '';
+        $this->state->statusLine = 'DD synced · ' . $table . ' · '
+            . implode(', ', $parts) . $merged;
+        $this->state->statusIsError = false;
     }
 
     /**
@@ -1870,6 +4549,84 @@ final class App
         $this->state->ddFkView = true;
     }
 
+    /**
+     * Open a read-only detail popup for the selected DD field — the DD viewer's
+     * answer to the data view's `i` (§11). Every column of the field is stacked as
+     * a label:value line so long comments and narrow columns are readable in full.
+     * Once open, Up/Down/Home/End walk the table's fields and Esc closes it. The
+     * foreign-keys pseudo-row opens its own dedicated FK view instead.
+     */
+    private function openDdRowView(): void
+    {
+        $field = $this->ddFilteredFields()[$this->state->ddFieldSel] ?? null;
+        if ($field === null) {
+            return;
+        }
+        // The synthetic "-- Foreign Keys --" row has its own dedicated view.
+        if ($field['fk'] ?? false) {
+            $this->openDdFkView((string) $field['comment']);
+            return;
+        }
+        $this->buildDdRowView();
+        $this->state->ddRowView = true;
+    }
+
+    /** Number of real (non-FK-summary) fields in the current filtered field list. */
+    private function ddRealFieldCount(): int
+    {
+        $fields = $this->ddFilteredFields();
+        $n = count($fields);
+        if ($n > 0 && ($fields[$n - 1]['fk'] ?? false)) {
+            $n--; // the trailing "-- Foreign Keys --" pseudo-row isn't a field
+        }
+        return $n;
+    }
+
+    /**
+     * Move the open field-detail popup to another field of the same table (Up/Down/
+     * Home/End), clamped to the real fields (never the FK pseudo-row), and rebuild
+     * the box for the newly selected field (§11).
+     */
+    private function ddRowViewSelect(int $idx): void
+    {
+        $n = $this->ddRealFieldCount();
+        if ($n <= 0) {
+            return;
+        }
+        $this->state->ddFieldSel = max(0, min($n - 1, $idx));
+        $this->buildDdRowView();
+    }
+
+    /** Populate the field-detail popup's title + body for the selected field (§11). */
+    private function buildDdRowView(): void
+    {
+        $field = $this->ddFilteredFields()[$this->state->ddFieldSel] ?? null;
+        if ($field === null || ($field['fk'] ?? false)) {
+            return;
+        }
+        $table = $this->ddCurrentTable();
+        $dash = static fn (string $v): string => $v !== '' ? $v : '—';
+        $lines = [
+            'Field:    ' . $field['name'],
+            'Type:     ' . $dash($field['type']),
+            'Null:     ' . $dash($field['nullable']),
+            'Key:      ' . $dash($field['key']),
+            'Default:  ' . $dash($field['default']),
+        ];
+        $format = $this->dictionary?->format($table, $field['name']) ?? '';
+        if ($format !== '') {
+            $lines[] = 'Format:   ' . $format;
+        }
+        $lines[] = '';
+        $lines[] = 'Comment:';
+        $lines[] = $field['comment'] !== '' ? $field['comment'] : '(none)';
+        $lines[] = '';
+        $lines[] = '↑/↓ fields · Home/End · Esc close';
+
+        $this->state->ddRowTitle = ($table !== '' ? $table . '.' : '') . $field['name'];
+        $this->state->ddRowText = implode("\n", $lines);
+    }
+
     private function openDdCommentEdit(): void
     {
         if ($this->dictionary === null) {
@@ -1908,52 +4665,27 @@ final class App
             $this->state->ddCommentEdit = false;
             return;
         }
+        // Field specials first (Esc cancel, Enter=newline, Ctrl+S save — the
+        // editor-window convention, §11), then shared clipboard + base editing so
+        // the comment box matches the CLI: a multi-line field.
         switch ($e->key) {
             case Key::Escape:
                 $this->closeDdCommentEdit();
-                break;
+                return;
             case Key::Enter:
-                // Enter adds a line; Ctrl+S saves (the editor-window convention,
-                // §11). DD comments are multi-line and round-trip as quoted CSV.
                 $editor->insertNewline();
-                break;
-            case Key::Backspace:
-                $e->ctrl ? $editor->deleteWordLeft() : $editor->backspace();
-                break;
-            case Key::Delete:
-                $e->ctrl ? $editor->deleteWordRight() : $editor->delete();
-                break;
-            case Key::Left:
-                $e->ctrl ? $editor->wordLeft() : $editor->left();
-                break;
-            case Key::Right:
-                $e->ctrl ? $editor->wordRight() : $editor->right();
-                break;
-            case Key::Up:
-                $editor->upLine();
-                break;
-            case Key::Down:
-                $editor->downLine();
-                break;
-            case Key::Home:
-                // Home → start of the current line; Ctrl+Home → very start.
-                $e->ctrl ? $editor->home() : $editor->lineHome();
-                break;
-            case Key::End:
-                // End → end of the current line; Ctrl+End → very end.
-                $e->ctrl ? $editor->end() : $editor->lineEnd();
-                break;
+                return;
             case Key::Char:
-                // Ctrl+S commits the edit (the shared editor-window save key, §11).
                 if ($e->ctrl && !$e->alt && strtolower($e->char) === 's') {
                     $this->saveDdComment();
-                } elseif (!$e->ctrl && !$e->alt && $e->char !== '') {
-                    $editor->insert($e->char);
+                    return;
                 }
                 break;
-            default:
-                break;
         }
+        if ($this->editorClipboardKey($e, $editor)) {
+            return;
+        }
+        $this->applyEditingKey($editor, $e, multiline: true);
     }
 
     /** Write the edited comment into the DD and save the CSV immediately (§11). */
@@ -1971,6 +4703,7 @@ final class App
                     $this->state->statusLine = 'DD comment unchanged · ' . $table . '.' . $field;
                     $this->state->statusIsError = false;
                 } else {
+                    $this->archiveDdBeforeEdit();
                     $this->dictionary->setComment($table, $field, $new);
                     $status = $this->dictionary->save();
                     if ($status === DataDictionary::SAVE_LOCKED) {
@@ -2011,6 +4744,30 @@ final class App
         $this->state->ddCommentField = '';
     }
 
+    /**
+     * Before the **first** edit of a given DD file this session, drop a numbered
+     * snapshot of it into a sibling `Archives/` subdir if one exists (§11). Once
+     * per file per session (tracked by path, so it survives DD reloads); a no-op
+     * when there is no Archives dir. Never blocks or fails the edit itself.
+     */
+    private function archiveDdBeforeEdit(): void
+    {
+        if ($this->dictionary === null) {
+            return;
+        }
+        $path = $this->dictionary->path();
+        if ($path === '' || in_array($path, $this->ddArchivedPaths, true)) {
+            return;
+        }
+        $archived = $this->dictionary->archive();
+        if ($archived !== null) {
+            // Mark done only on a real snapshot, so a mid-session `mkdir Archives`
+            // (or a transient copy failure) still gets picked up on the next edit.
+            $this->ddArchivedPaths[] = $path;
+            my::lineout('FILE:FILE', 'DD archived', $archived);
+        }
+    }
+
     // --- Assign Data Dictionary picker (§11) -------------------------------
 
     /**
@@ -2020,8 +4777,8 @@ final class App
      */
     private function openDdPicker(): void
     {
-        $db = $this->database->currentDatabase();
-        $saved = $db !== '' ? $this->settings->getDictionary($db) : null;
+        $scope = $this->database->stateKey();
+        $saved = $scope !== '' ? $this->settings->getDictionary($scope) : null;
         $dir = ($saved !== null && $saved !== '') ? dirname($saved) : (getcwd() ?: '.');
 
         $editor = new LineEditor();
@@ -2064,39 +4821,20 @@ final class App
             $this->closeDdPicker();
             return;
         }
+        // Field specials first, then the shared clipboard + base editing so the
+        // path box behaves exactly like the CLI (§4): a single-line field.
         switch ($e->key) {
             case Key::Escape:
                 $this->closeDdPicker();
-                break;
+                return;
             case Key::Enter:
                 $this->ddPickerScanDir($editor->text());
-                break;
-            case Key::Backspace:
-                $e->ctrl ? $editor->deleteWordLeft() : $editor->backspace();
-                break;
-            case Key::Delete:
-                $e->ctrl ? $editor->deleteWordRight() : $editor->delete();
-                break;
-            case Key::Left:
-                $e->ctrl ? $editor->wordLeft() : $editor->left();
-                break;
-            case Key::Right:
-                $e->ctrl ? $editor->wordRight() : $editor->right();
-                break;
-            case Key::Home:
-                $editor->home();
-                break;
-            case Key::End:
-                $editor->end();
-                break;
-            case Key::Char:
-                if (!$e->ctrl && !$e->alt && $e->char !== '') {
-                    $editor->insert($e->char);
-                }
-                break;
-            default:
-                break;
+                return;
         }
+        if ($this->editorClipboardKey($e, $editor)) {
+            return;
+        }
+        $this->applyEditingKey($editor, $e, multiline: false);
     }
 
     /** Stage 1: choosing a file. Up/Down move, Enter assigns, Esc returns to entry. */
@@ -2223,7 +4961,7 @@ final class App
             return;
         }
         $path = $this->state->ddPickerDir . DIRECTORY_SEPARATOR . $name;
-        $this->loadDictionary($this->database->currentDatabase(), $path);
+        $this->loadDictionary($this->database->stateKey(), $path);
         if ($this->dictionary !== null) {
             $this->state->statusLine = 'Data dictionary assigned · ' . $name
                 . ' (' . count($this->dictionary->tableNames()) . ' tables)';
@@ -2242,7 +4980,7 @@ final class App
      */
     private function openDdHint(): void
     {
-        $editor = $this->input->editor();
+        $editor = $this->input;
         $before = mb_substr($editor->text(), 0, $editor->cursor()); // includes the '?'
         if (preg_match('/([\p{L}\p{N}_]+)\?$/u', $before, $m) !== 1) {
             return;
@@ -2259,7 +4997,7 @@ final class App
             $this->state->ddHintMessage =
                 'No data dictionary for this database — assign one from the system menu (press /).';
         } else {
-            $table = $this->extractTableFromSql($this->input->combinedText());
+            $table = $this->extractTableFromSql($this->cliText());
             if ($table === '') {
                 $this->state->ddHintMessage = "No FROM table to look up '$word' in.";
             } else {
@@ -2273,30 +5011,6 @@ final class App
             }
         }
         $this->state->ddHint = true;
-    }
-
-    private function handleColumnPopupKey(KeyEvent $e): void
-    {
-        switch ($e->key) {
-            case Key::Up:
-                $this->state->popupItem = $this->popupMove(State::COLUMN_POPUP, $this->state->popupItem, -1);
-                break;
-            case Key::Down:
-                $this->state->popupItem = $this->popupMove(State::COLUMN_POPUP, $this->state->popupItem, 1);
-                break;
-            case Key::Escape:
-                $this->state->columnPopup = false;
-                break;
-            case Key::Enter:
-                $action = State::COLUMN_POPUP[$this->state->popupItem][1] ?? null;
-                $this->state->columnPopup = false;
-                if ($action !== null) {
-                    $this->applyColumnAction($action);
-                }
-                break;
-            default:
-                break;
-        }
     }
 
     private function handleLayoutPopupKey(KeyEvent $e): void
@@ -2321,7 +5035,14 @@ final class App
                 // Unhiding a single column keeps the popup open so several can be
                 // unhidden in a row; everything else closes it.
                 $keepOpen = str_starts_with($action, 'unhide:');
-                $this->applyLayoutActionStr($action);
+                // The per-column half and the table-wide half share one menu, so
+                // the dispatch asks which half the chosen action belongs to. The
+                // column actions need $popupCol, which openLayoutPopup() set.
+                if (in_array($action, self::COLUMN_ACTIONS, true)) {
+                    $this->applyColumnAction($action);
+                } else {
+                    $this->applyLayoutActionStr($action);
+                }
                 if ($keepOpen) {
                     $this->state->layoutItem = $this->clampMenuIndex(
                         $this->layoutPopupItems(),
@@ -2334,24 +5055,6 @@ final class App
             default:
                 break;
         }
-    }
-
-    /**
-     * Step the popup selection past separators (null-action items).
-     *
-     * @param list<array{0:?string,1:?string}> $items
-     */
-    private function popupMove(array $items, int $cur, int $dir): int
-    {
-        $n = count($items);
-        $i = $cur;
-        for ($step = 0; $step < $n; $step++) {
-            $i = ($i + $dir + $n) % $n;
-            if (($items[$i][1] ?? null) !== null) {
-                return $i;
-            }
-        }
-        return $cur;
     }
 
     private function applyColumnAction(string $action): void
@@ -2370,10 +5073,6 @@ final class App
             case 'sort_desc':
                 $this->state->sortCol = $name;
                 $this->state->sortDir = 'desc';
-                $this->state->applySort();
-                break;
-            case 'sort_clear':
-                $this->state->sortCol = null;
                 $this->state->applySort();
                 break;
             case 'move':
@@ -2396,6 +5095,10 @@ final class App
                 }
                 $this->persistWidths();
                 break;
+            case 'format_epoch':
+                // Toggle the epoch → local-time display format on this column (§6).
+                $this->toggleColumnFormat($name, ColumnFormats::EPOCH);
+                break;
             case 'copy_col':
                 $this->copyColumn();
                 break;
@@ -2411,23 +5114,28 @@ final class App
      * columns" and one "Unhide: <name>" entry per hidden column so they can be
      * restored individually (§6).
      *
+     * Display formats get the same treatment (§6): a formatted column can be
+     * cleared from here, and a format the **DD suggests but which is not applied**
+     * can be applied from here. Without that, formats were the one Layout Config
+     * item reachable only through the popup of the specific column carrying it —
+     * you had to already know which column that was.
+     *
      * @return list<array{label:?string,action:?string,enabled:bool}>
      */
     public function layoutPopupItems(): array
     {
-        // Spell out the active sort on the "Clear sort" entry so the user can see
-        // what it would clear (and disable it when nothing is sorted).
-        $sortLabel = 'Clear sort';
-        if ($this->state->sortCol !== null) {
-            $arrow = $this->state->sortDir === 'desc' ? '↓' : '↑';
-            $sortLabel = 'Clear sort (' . $this->state->sortCol . ' ' . $arrow . ')';
-        }
-        $items = [
+        // The per-column half first, then the table-wide half: "do something to
+        // this column" is the common errand, "put the whole table back" the rare
+        // one. Clear sort lives in the column block above, next to Sort ASC/DESC.
+        $items = $this->columnBlockItems();
+        $items[] = ['label' => null, 'action' => null, 'enabled' => false];
+        foreach ([
             ['label' => 'Reset column widths', 'action' => 'reset_widths', 'enabled' => true],
             ['label' => 'Reset column order',  'action' => 'reset_order',  'enabled' => true],
-            ['label' => $sortLabel,            'action' => 'clear_sort',   'enabled' => $this->state->sortCol !== null],
             ['label' => 'Reset all',           'action' => 'reset_all',    'enabled' => true],
-        ];
+        ] as $item) {
+            $items[] = $item;
+        }
         if ($this->state->hiddenCols !== []) {
             $items[] = ['label' => null, 'action' => null, 'enabled' => false];
             $items[] = ['label' => 'Show all hidden columns', 'action' => 'unhide_all', 'enabled' => true];
@@ -2435,7 +5143,118 @@ final class App
                 $items[] = ['label' => 'Unhide: ' . $name, 'action' => 'unhide:' . $name, 'enabled' => true];
             }
         }
+        foreach ($this->formatPopupItems() as $item) {
+            $items[] = $item;
+        }
         return $items;
+    }
+
+    /**
+     * The per-column half of Data View Configuration (§6): everything that acts
+     * on {@see State::$popupCol} alone. Formerly the F2 popup, now the top block
+     * of the one menu.
+     *
+     * The format entry toggles, so its label reflects the current state: when the
+     * column already shows a datetime, offer to revert to the raw epoch, and
+     * vice-versa. The DD may *suggest* a format (§11) without applying it — a raw
+     * column the DD marks epoch gets the action flagged `(DD)`, so the suggestion
+     * is visible at the place you would act on it.
+     *
+     * Built here rather than in the renderer because the renderer is a pure
+     * reader of State: the labels depend on the format registry and the DD, which
+     * are App's to know about.
+     *
+     * @return list<array{label:?string,action:?string,enabled:bool}>
+     */
+    private function columnBlockItems(): array
+    {
+        $name = $this->state->visibleColumnNames()[$this->state->popupCol] ?? null;
+        if ($name === null) {
+            return [];
+        }
+        $isEpoch = $this->state->formatOf($name) === ColumnFormats::EPOCH;
+        $suggestsEpoch = $this->state->ddSuggestedFormat($name) === ColumnFormats::EPOCH;
+        $formatLabel = $isEpoch
+            ? 'Show as epoch'
+            : 'Show as date/time' . ($suggestsEpoch ? ' (DD)' : '');
+
+        // One "Clear sort", here beside Sort ASC/DESC rather than down in the
+        // table-wide block, and labelled with what it will actually clear — which
+        // may be a different column than the one this block is scoped to.
+        $sortLabel = 'Clear sort';
+        if ($this->state->sortCol !== null) {
+            $arrow = $this->state->sortDir === 'desc' ? '↓' : '↑';
+            $sortLabel = 'Clear sort (' . $this->state->sortCol . ' ' . $arrow . ')';
+        }
+        return [
+            ['label' => 'Sort ASC',           'action' => 'sort_asc',     'enabled' => true],
+            ['label' => 'Sort DESC',          'action' => 'sort_desc',    'enabled' => true],
+            ['label' => $sortLabel,           'action' => 'clear_sort',   'enabled' => $this->state->sortCol !== null],
+            ['label' => null,                 'action' => null,           'enabled' => false],
+            ['label' => 'Move column',        'action' => 'move',         'enabled' => true],
+            ['label' => 'Change width',       'action' => 'width',        'enabled' => true],
+            ['label' => 'Fit to content',     'action' => 'fit',          'enabled' => true],
+            ['label' => 'Fit all to content', 'action' => 'fit_all',      'enabled' => true],
+            ['label' => $formatLabel,         'action' => 'format_epoch', 'enabled' => true],
+            ['label' => 'Copy column',        'action' => 'copy_col',     'enabled' => true],
+            ['label' => 'Hide column',        'action' => 'hide',         'enabled' => true],
+        ];
+    }
+
+    /**
+     * The display-format block of the Layout popup: what is formatted now, and
+     * what the DD offers that isn't applied yet (§6/§11). Empty — no separator,
+     * no heading — when there is nothing to say, so a table with no formats and
+     * no DD sees exactly the popup it saw before.
+     *
+     * @return list<array{label:?string,action:?string,enabled:bool}>
+     */
+    private function formatPopupItems(): array
+    {
+        $applied = $this->state->formattedColumns();
+
+        // A suggestion is only worth offering when it isn't already in effect.
+        // Comparing against the applied id (not merely "is this column
+        // formatted") means a column the user has put on a *different* format
+        // still shows the DD's alternative rather than silently hiding it.
+        $suggested = [];
+        foreach ($this->state->visibleColumnNames() as $name) {
+            $id = $this->state->ddSuggestedFormat($name);
+            if ($id !== null && ColumnFormats::has($id) && ($applied[$name] ?? null) !== $id) {
+                $suggested[$name] = $id;
+            }
+        }
+        if ($applied === [] && $suggested === []) {
+            return [];
+        }
+
+        $items = [['label' => null, 'action' => null, 'enabled' => false]];
+        if ($applied !== []) {
+            $items[] = ['label' => 'Clear all formats', 'action' => 'clear_formats', 'enabled' => true];
+            foreach ($applied as $name => $id) {
+                $items[] = [
+                    'label' => 'Clear format: ' . $name . ' (' . self::formatLabel($id) . ')',
+                    'action' => 'clear_format:' . $name,
+                    'enabled' => true,
+                ];
+            }
+        }
+        foreach ($suggested as $name => $id) {
+            $items[] = [
+                'label' => 'Apply DD format: ' . $name . ' (' . self::formatLabel($id) . ')',
+                // The id leads so the column name — which may contain anything,
+                // including a colon — can be taken as the unsplit remainder.
+                'action' => 'apply_format:' . $id . ':' . $name,
+                'enabled' => true,
+            ];
+        }
+        return $items;
+    }
+
+    /** Human-readable name for a format id, falling back to the id itself. */
+    private static function formatLabel(string $id): string
+    {
+        return ColumnFormats::get($id)?->label ?? $id;
     }
 
     private function applyLayoutActionStr(string $action): void
@@ -2450,10 +5269,29 @@ final class App
             $this->clampSelectedCol();
             return;
         }
+        if (str_starts_with($action, 'clear_format:')) {
+            unset($this->state->colFormats[substr($action, strlen('clear_format:'))]);
+            $this->persistColFormats();
+            return;
+        }
+        if (str_starts_with($action, 'apply_format:')) {
+            // 'apply_format:<id>:<column>' — the id is a known-safe token, so the
+            // column name is whatever is left, colons included.
+            [, $id, $name] = explode(':', $action, 3) + [2 => ''];
+            if ($name !== '' && ColumnFormats::has($id)) {
+                $this->state->colFormats[$name] = $id;
+                $this->persistColFormats();
+            }
+            return;
+        }
         switch ($action) {
             case 'unhide_all':
                 $this->state->hiddenCols = [];
                 $this->persistHidden();
+                break;
+            case 'clear_formats':
+                $this->state->colFormats = [];
+                $this->persistColFormats();
                 break;
             case 'reset_widths':
                 $this->state->colWidthOverride = [];
@@ -2471,11 +5309,13 @@ final class App
                 $this->state->hiddenCols = [];
                 $this->state->colWidthOverride = [];
                 $this->state->colOrder = [];
+                $this->state->colFormats = [];
                 $this->state->sortCol = null;
                 $this->state->applySort();
                 $this->persistHidden();
                 $this->persistWidths();
                 $this->persistColOrder();
+                $this->persistColFormats();
                 break;
         }
         $this->clampSelectedCol();
@@ -2563,7 +5403,9 @@ final class App
         $max = mb_strlen($name);
         foreach ($result->rows as $row) {
             $v = $row[$name] ?? null;
-            $len = $v === null ? 4 : mb_strlen((string) $v);
+            // Measure the *displayed* width so a formatted column (e.g. epoch →
+            // datetime, wider than the raw int) isn't clipped (§6).
+            $len = $v === null ? 4 : mb_strlen($this->formatDisplay($name, (string) $v));
             if ($len > $max) {
                 $max = $len;
             }
@@ -2608,29 +5450,82 @@ final class App
 
     private function persistWidths(): void
     {
-        $db = $this->database->currentDatabase();
-        if ($db === '' || $this->state->currentTable === '') {
+        $scope = $this->database->stateKey();
+        if ($scope === '' || $this->state->currentTable === '') {
             return;
         }
-        $this->settings->setColWidths($db, $this->state->currentTable, $this->state->colWidthOverride);
+        $this->settings->setColWidths($scope, $this->state->currentTable, $this->state->colWidthOverride);
     }
 
     private function persistHidden(): void
     {
-        $db = $this->database->currentDatabase();
-        if ($db === '' || $this->state->currentTable === '') {
+        $scope = $this->database->stateKey();
+        if ($scope === '' || $this->state->currentTable === '') {
             return;
         }
-        $this->settings->setHiddenCols($db, $this->state->currentTable, array_values($this->state->hiddenCols));
+        $this->settings->setHiddenCols($scope, $this->state->currentTable, array_values($this->state->hiddenCols));
     }
 
     private function persistColOrder(): void
     {
-        $db = $this->database->currentDatabase();
-        if ($db === '' || $this->state->currentTable === '') {
+        $scope = $this->database->stateKey();
+        if ($scope === '' || $this->state->currentTable === '') {
             return;
         }
-        $this->settings->setColOrder($db, $this->state->currentTable, array_values($this->state->colOrder));
+        $this->settings->setColOrder($scope, $this->state->currentTable, array_values($this->state->colOrder));
+    }
+
+    private function persistColFormats(): void
+    {
+        $scope = $this->database->stateKey();
+        if ($scope === '' || $this->state->currentTable === '') {
+            return;
+        }
+        $this->settings->setColFormats($scope, $this->state->currentTable, $this->state->colFormats);
+    }
+
+    /**
+     * Toggle a display format on the popup's target column (§6, backlog S).
+     * Setting the format it already has clears it; the raw value is untouched —
+     * only how it renders/edits changes. Persisted as a Layout Config item.
+     *
+     * The DD's {@see State::$ddColFormats} is only a suggestion (§11), so this is
+     * a plain on/off toggle over the manual {@see State::$colFormats}.
+     */
+    private function toggleColumnFormat(string $col, string $formatId): void
+    {
+        if ($this->state->formatOf($col) === $formatId) {
+            unset($this->state->colFormats[$col]);
+        } else {
+            $this->state->colFormats[$col] = $formatId;
+        }
+        $this->persistColFormats();
+    }
+
+    /**
+     * Populate DD-suggested column formats for the current table (§6/§11).
+     * The DD's optional `Format` column marks a field's suggested display format
+     * (e.g. `epoch`); these are *not* applied automatically — they surface in the
+     * column popup for the user to accept. Only consults a DD that is associated
+     * with this db (loading it lazily, once); a no-DD db costs nothing.
+     */
+    private function applyDdFormats(): void
+    {
+        $this->state->ddColFormats = [];
+        $table = $this->state->currentTable;
+        if ($table === '' || !$this->dictionaryAvailable()) {
+            return;
+        }
+        $this->ensureDictionaryLoaded();
+        if ($this->dictionary === null || !$this->dictionary->hasTable($table)) {
+            return;
+        }
+        foreach ($this->dictionary->columns($table) as $field) {
+            $fid = $this->dictionary->format($table, $field);
+            if ($fid !== '' && ColumnFormats::has($fid)) {
+                $this->state->ddColFormats[$field] = $fid;
+            }
+        }
     }
 
     /**
@@ -2652,12 +5547,53 @@ final class App
     }
 
     /**
+     * Restore the saved per-table layout — widths, hidden columns, column order,
+     * display formats — for the statement that just ran (§6), and set
+     * {@see State::$currentTable} from it.
+     *
+     * Two of the four are withheld when the SQL names its own field list. A user
+     * who types `SELECT name, id FROM users` has already said which columns and
+     * in what order; the server returns exactly that, and it is the answer they
+     * asked for. Restoring a stored `colOrder` over it put the columns back in
+     * the arrangement saved from some earlier `SELECT *`, and a stored hidden set
+     * dropped a column that had just been named by hand — the view disagreeing
+     * with the query that made it.
+     *
+     * Widths and formats are keyed by column name and neither reorder nor remove
+     * anything, so they always apply: a column shown as date/time last time is
+     * still date/time here. `SELECT *` names nothing and keeps the whole saved
+     * arrangement, which is the case the saved arrangement was built for.
+     */
+    private function applySavedLayout(string $sql): void
+    {
+        $this->state->currentTable = $this->extractTableFromSql($sql);
+        $scope = $this->database->stateKey();
+        $table = $this->state->currentTable;
+        if ($table === '' || $scope === '') {
+            $this->state->colWidthOverride = [];
+            $this->state->hiddenCols = [];
+            $this->state->colOrder = [];
+            $this->state->colFormats = [];
+            return;
+        }
+        $named = Normalizer::namesColumns($sql);
+        $this->state->colWidthOverride = $this->settings->getColWidths($scope, $table);
+        $this->state->hiddenCols = $named ? [] : $this->settings->getHiddenCols($scope, $table);
+        $this->state->colOrder   = $named ? [] : $this->settings->getColOrder($scope, $table);
+        $this->state->colFormats = $this->settings->getColFormats($scope, $table);
+    }
+
+    /**
      * Best-effort table name from a SQL statement (FROM / INTO / UPDATE).
-     * Shared by per-table layout persistence and, later, tab completion + DD.
+     * Shared by per-table layout persistence, the DD hint, and the guards below.
+     *
+     * Comments come out first: a commented-out `FROM` names a table the statement
+     * never touches, and this answer decides which table's layout is restored and
+     * which table a dangerous-query prompt reports.
      */
     private function extractTableFromSql(string $sql): string
     {
-        if (preg_match('/\b(?:FROM|INTO|UPDATE)\s+`?([A-Za-z0-9_]+)`?/i', $sql, $m)) {
+        if (preg_match('/\b(?:FROM|INTO|UPDATE)\s+`?([A-Za-z0-9_]+)`?/i', Splitter::stripComments($sql), $m)) {
             return $m[1];
         }
         return '';
@@ -2668,11 +5604,32 @@ final class App
      * (§5). Returns the popup message when confirmation is required, or null when
      * the statement is safe to run immediately. DELETE/UPDATE are nuanced (only a
      * broad WHERE prompts); every other modifying command always prompts.
+     *
+     * $strict withdraws the DELETE/UPDATE nuance. It is set for statements inside
+     * multi-statement input, where the trust a PK-scoped WHERE earns on its own
+     * does not carry over: the user is running something they did not compose one
+     * statement at a time, most likely pasted (beta-readiness item 9). It is also
+     * set for a DELETE built by the data view (§22), which is PK-scoped by
+     * construction and so would otherwise never report its row count at all.
+     * $strictReason is what the message gives as the reason in that case.
+     *
+     * The comments are stripped before anything below reads the text. Naming the
+     * command can be done past a comment ({@see Splitter::commandKeyword()}), but
+     * judging one cannot: every check from here down is a regex over the
+     * statement, and a commented-out `WHERE id = 1` under a bare
+     * `DELETE FROM users` satisfied both the WHERE test and the primary-key test
+     * and took the whole table with no prompt at all.
      */
-    private function dangerCheck(string $sql, string $type): ?string
-    {
+    private function dangerCheck(
+        string $sql,
+        string $type,
+        bool $strict = false,
+        string $strictReason = 'PK-scoped, but one of several statements',
+    ): ?string {
+        $sql = Splitter::stripComments($sql);
+
         if ($type === 'DELETE' || $type === 'UPDATE') {
-            return $this->dangerCheckDml($sql, $type);
+            return $this->dangerCheckDml($sql, $type, $strict, $strictReason);
         }
         return $this->dangerCheckDdl($sql, $type);
     }
@@ -2680,11 +5637,16 @@ final class App
     /**
      * DELETE/UPDATE: confirm only when the statement is broad — no WHERE clause,
      * or a WHERE that doesn't reference a primary-key column. A PK-scoped
-     * statement runs immediately (returns null). The message reports the query
-     * type, table, whether a WHERE was present, and an estimated affected count.
+     * statement runs immediately (returns null) unless $strict. The message
+     * reports the query type, table, why it is being asked about, and an
+     * estimated affected count.
      */
-    private function dangerCheckDml(string $sql, string $type): ?string
-    {
+    private function dangerCheckDml(
+        string $sql,
+        string $type,
+        bool $strict = false,
+        string $strictReason = 'PK-scoped, but one of several statements',
+    ): ?string {
         $table = $this->extractTableFromSql($sql);
         $hasWhere = preg_match('/\bWHERE\b(.*)$/is', $sql, $m) === 1;
         $whereClause = $hasWhere ? $m[1] : '';
@@ -2703,13 +5665,20 @@ final class App
             }
         }
 
-        if ($hasWhere && $refsPk) {
+        if ($hasWhere && $refsPk && !$strict) {
             return null; // scoped to specific rows by PK — safe to run
         }
 
         $count = $this->estimateAffected($table, $hasWhere ? $whereClause : null);
         $tbl = $table !== '' ? '`' . $table . '`' : '(unknown table)';
-        $reason = $hasWhere ? 'WHERE present but no PK column' : 'no WHERE clause (all rows)';
+        if ($hasWhere && $refsPk) {
+            // Strict mode, and the statement *is* PK-scoped: whoever set $strict
+            // says why it is being asked about anyway - one of several typed
+            // statements, or a delete started from the grid (§22).
+            $reason = $strictReason;
+        } else {
+            $reason = $hasWhere ? 'WHERE present but no PK column' : 'no WHERE clause (all rows)';
+        }
         $est = $count === null ? 'an unknown number of' : '~' . number_format($count);
 
         return $type . ' on ' . $tbl . ': ' . $reason . ' — affects ' . $est . ' row(s). Run anyway?';
@@ -2827,7 +5796,9 @@ final class App
         $current = $this->state->pending[$rawIdx][$col]
             ?? $this->state->result->rows[$rawIdx][$col]
             ?? null;
-        $value = $current === null ? '' : (string) $current;
+        // A formatted column edits in its displayed form (e.g. a datetime); the
+        // edit is converted back to the raw value on commit (§6).
+        $value = $this->formatDisplay($col, $current === null ? '' : (string) $current);
         $editor = new LineEditor();
         $editor->setText($value);
         $this->state->cellEditor = $editor;
@@ -2899,7 +5870,8 @@ final class App
         $current = $this->state->pending[$rawIdx][$col]
             ?? ($this->state->result->rows[$rawIdx][$col] ?? null);
         $editor = new LineEditor();
-        $editor->setText($current === null ? '' : (string) $current);
+        // Edit in the column's displayed form; converted back on commit (§6).
+        $editor->setText($this->formatDisplay($col, $current === null ? '' : (string) $current));
         $this->state->cellEditor = $editor;
         $this->state->cellEditRow = $rawIdx;
         $this->state->cellEditCol = $col;
@@ -2991,50 +5963,27 @@ final class App
             $this->state->cellEdit = false;
             return;
         }
+        // Field specials first (Ctrl+S save, Enter=newline, Esc cancel — §9), then
+        // shared clipboard + base editing so the cell box matches the CLI: a
+        // multi-line field.
         switch ($e->key) {
             case Key::Char:
-                // Ctrl+S commits the edit (the shared editor-window save key, §9);
-                // plain characters are inserted. Enter adds a line (below).
                 if ($e->ctrl && !$e->alt && strtolower($e->char) === 's') {
                     $this->confirmCellEdit();
-                } elseif (!$e->ctrl && !$e->alt) {
-                    $editor->insert($e->char);
+                    return;
                 }
                 break;
-            case Key::Backspace:
-                $e->ctrl ? $editor->deleteWordLeft() : $editor->backspace();
-                break;
-            case Key::Delete:
-                $e->ctrl ? $editor->deleteWordRight() : $editor->delete();
-                break;
-            case Key::Left:
-                $e->ctrl ? $editor->wordLeft() : $editor->left();
-                break;
-            case Key::Right:
-                $e->ctrl ? $editor->wordRight() : $editor->right();
-                break;
-            case Key::Up:
-                $editor->upLine();
-                break;
-            case Key::Down:
-                $editor->downLine();
-                break;
-            case Key::Home:
-                $e->ctrl ? $editor->home() : $editor->lineHome();
-                break;
-            case Key::End:
-                $e->ctrl ? $editor->end() : $editor->lineEnd();
-                break;
             case Key::Enter:
-                // Enter adds a line; the cell editor grows downward (§9).
                 $editor->insertNewline();
-                break;
+                return;
             case Key::Escape:
                 $this->closeCellEdit();
-                break;
-            default:
-                break;
+                return;
         }
+        if ($this->editorClipboardKey($e, $editor)) {
+            return;
+        }
+        $this->applyEditingKey($editor, $e, multiline: true);
     }
 
     private function confirmCellEdit(): void
@@ -3047,6 +5996,19 @@ final class App
             return;
         }
         $new = $editor->text();
+        // A formatted column is edited in its display form (e.g. a datetime);
+        // convert it back to the raw stored value before diffing/staging (§6). An
+        // unparseable entry keeps the editor open with an error, like a type miss.
+        $fmt = ColumnFormats::get($this->state->formatOf($col));
+        if ($fmt !== null) {
+            $parsed = $fmt->parse($new);
+            if ($parsed === null) {
+                $this->state->statusLine = 'Invalid ' . $fmt->label . ' value — expected e.g. 2026-07-08 14:30:00';
+                $this->state->statusIsError = true;
+                return;
+            }
+            $new = $parsed;
+        }
         $orig = $this->state->result->rows[$rawIdx][$col] ?? null;
         $origStr = $orig === null ? '' : (string) $orig;
 
@@ -3075,6 +6037,11 @@ final class App
         $this->state->cellEditor = null;
         $this->state->cellEditPopup = false;
         $this->state->cellEditFromView = false;
+        // Drop any half-finished mouse grab; the box the user was dragging is gone.
+        // The chosen position/size deliberately survive — see State::$cellEditX.
+        $this->editorDrag = null;
+        $this->editorResizing = false;
+        $this->modalSelecting = false;
     }
 
     /**
@@ -3139,6 +6106,10 @@ final class App
             return;
         }
         $this->revertInFlight();
+        // An un-run delete and an un-run edit cannot both own the CLI, and the
+        // edit is what the user just asked for (§22). Mirrors stageDelete().
+        $this->autoDelete = null;
+        $this->state->deleteMarks = [];
         $this->state->pending[$rawIdx][$col] = $newValue;
         $sql = $this->buildUpdate($rawIdx); // one pending col → single-cell UPDATE
         if ($sql === null) {
@@ -3147,7 +6118,7 @@ final class App
             return;
         }
         $this->autoUpdate = ['rawIdx' => $rawIdx, 'col' => $col, 'sql' => $sql];
-        $this->input->setSingle($sql);
+        $this->input->setText($sql);
         // Surface the CLI: close the modal detail view and the (non-modal) cell
         // inspector so the UPDATE is reachable to run or cancel.
         $this->state->detail = false;
@@ -3180,7 +6151,7 @@ final class App
             return;
         }
         $this->revertInFlight();
-        $this->input->setSingle('');
+        $this->input->setText('');
         $this->resetHistoryNav();
         $this->state->focus = State::FOCUS_DATA;
         $this->state->statusLine = 'Edit cancelled';
@@ -3224,7 +6195,7 @@ final class App
                 . $res->affectedRows . ' row' . ($res->affectedRows === 1 ? '' : 's') . ')';
             $this->state->statusIsError = false;
         }
-        $this->input->setSingle('');
+        $this->input->setText('');
         $this->resetHistoryNav();
         $this->screen->invalidate();
     }
@@ -3246,6 +6217,319 @@ final class App
             $r->error,
             $r->isSelect,
         );
+    }
+
+    // --- row deletion (§22) -------------------------------------------------
+
+    /**
+     * Ctrl+Del: open or close the multi-row checkbox column (§22).
+     *
+     * Closing always drops the marks. A mark is a raw row index into the result
+     * on screen, and the only thing that made it visible was the mode - leaving
+     * marks set behind an invisible checkbox would arm a later Del with rows the
+     * user can no longer see.
+     */
+    private function toggleMarkMode(): void
+    {
+        if (!$this->state->hasResult()) {
+            return;
+        }
+        if ($this->state->readOnly) {
+            $this->setError('[RO] Read-only mode - deleting is blocked');
+            return;
+        }
+        if ($this->state->markMode) {
+            $this->exitMarkMode();
+            return;
+        }
+        $this->state->markMode = true;
+        $this->state->deleteMarks = [];
+        $this->state->statusLine = 'Mark rows: Enter/Space/click to tick · Del deletes the marked rows · Esc cancels';
+        $this->state->statusIsError = false;
+        // The checkbox column shifts every data column one gutter to the right.
+        $this->screen->invalidate();
+    }
+
+    /** Leave mark mode, dropping every mark (§22). */
+    private function exitMarkMode(): void
+    {
+        $this->state->markMode = false;
+        $this->state->deleteMarks = [];
+        $this->state->statusLine = 'Marks cleared';
+        $this->state->statusIsError = false;
+        $this->screen->invalidate();
+    }
+
+    /** Tick or un-tick the row under the cursor (§22). */
+    private function toggleRowMark(): void
+    {
+        $rawIdx = $this->state->displayOrder()[$this->state->selectedRow] ?? null;
+        if ($rawIdx === null) {
+            return;
+        }
+        if (isset($this->state->deleteMarks[$rawIdx])) {
+            unset($this->state->deleteMarks[$rawIdx]);
+        } else {
+            $this->state->deleteMarks[$rawIdx] = true;
+        }
+        $n = $this->state->markedCount();
+        $this->state->statusLine = $n === 0
+            ? 'No rows marked · Enter/Space/click to tick · Esc cancels'
+            : $n . ' row' . ($n === 1 ? '' : 's') . ' marked · Del to delete · Esc cancels';
+        $this->state->statusIsError = false;
+    }
+
+    /**
+     * Del in the data view (§22): work out which rows are being deleted, build the
+     * DELETE for them, and put the affected-row count in front of the user.
+     *
+     * Outside mark mode this is the selected row, and it gets marked on the way
+     * through so the record about to go is visible while the confirm is up -
+     * "delete this one" should never be answered from memory of where the cursor
+     * was. Inside mark mode it is the ticked set, and Del is what commits it.
+     */
+    private function requestDelete(): void
+    {
+        if (!$this->state->hasResult()) {
+            return;
+        }
+        if ($this->state->readOnly) {
+            $this->setError('[RO] Read-only mode - deleting is blocked');
+            return;
+        }
+        if ($this->state->markMode) {
+            $rawIdxs = $this->state->markedRawIndices();
+            if ($rawIdxs === []) {
+                $this->setError('No rows marked - Enter, Space or click a checkbox to mark one');
+                return;
+            }
+        } else {
+            $rawIdx = $this->state->displayOrder()[$this->state->selectedRow] ?? null;
+            if ($rawIdx === null) {
+                return; // header row, or nothing selected
+            }
+            // One row at a time outside mark mode: any older mark belongs to a
+            // delete that was never carried out.
+            $this->state->deleteMarks = [$rawIdx => true];
+            $rawIdxs = [$rawIdx];
+        }
+
+        $built = $this->buildDelete($rawIdxs);
+        if ($built === null) {
+            // buildDelete() has already said why (missing table / PK popup).
+            if (!$this->state->markMode) {
+                $this->state->deleteMarks = [];
+            }
+            return;
+        }
+
+        // The affected-row count comes from the same COUNT(*) the CLI's own
+        // dangerous-query guard uses, over the same WHERE - so a DELETE started
+        // from the grid is judged by exactly the rule a typed one is (§5).
+        $message = $this->dangerCheck(
+            $built['sql'],
+            'DELETE',
+            strict: true,
+            strictReason: 'PK-scoped, ' . count($rawIdxs) . ' row(s) marked in the data view',
+        );
+        $this->pendingDelete = [
+            'sql'     => $built['sql'],
+            'rawIdxs' => $rawIdxs,
+            'count'   => count($rawIdxs),
+        ];
+        $this->openConfirm(
+            'grid_delete',
+            $message ?? 'DELETE ' . count($rawIdxs) . ' row(s). Run anyway?',
+            [['Y', 'Delete'], ['N', 'Cancel']],
+        );
+    }
+
+    /**
+     * Build the DELETE for $rawIdxs, plus the bare WHERE clause behind it (§22).
+     * Returns null when the statement cannot be formed, having reported why.
+     *
+     * The primary-key rules are {@see buildUpdate()}'s, for the same reason: a
+     * statement that cannot name the exact rows it means must not be written at
+     * all. A single-column key becomes `IN (...)` and a composite one a series of
+     * OR'd AND-groups - both forms name the key as an operand, so
+     * {@see dangerCheckDml()} recognises them as PK-scoped.
+     *
+     * @param  list<int> $rawIdxs
+     * @return array{sql:string,where:string}|null
+     */
+    private function buildDelete(array $rawIdxs): ?array
+    {
+        $table = $this->state->currentTable;
+        if ($table === '') {
+            $this->setError('Cannot build DELETE: table is unknown');
+            return null;
+        }
+        $pk = $this->schema->primaryKey($table);
+        if ($pk === []) {
+            $this->setError('Cannot build DELETE: no primary key on ' . $table);
+            return null;
+        }
+        $rows = $this->state->result?->rows ?? [];
+        $missing = [];
+        foreach ($pk as $k) {
+            foreach ($rawIdxs as $rawIdx) {
+                if (!array_key_exists($k, $rows[$rawIdx] ?? [])) {
+                    $missing[] = $k;
+                    continue 2;
+                }
+            }
+        }
+        if ($missing !== []) {
+            // Same offer an edit gets: re-run the query with the key added.
+            $this->openPkPopup($missing);
+            return null;
+        }
+
+        if (count($pk) === 1) {
+            $col = $pk[0];
+            $vals = [];
+            foreach ($rawIdxs as $rawIdx) {
+                $vals[] = $this->sqlQuote((string) ($rows[$rawIdx][$col] ?? ''));
+            }
+            $where = '`' . $col . '` IN (' . implode(', ', $vals) . ')';
+        } else {
+            $groups = [];
+            foreach ($rawIdxs as $rawIdx) {
+                $parts = [];
+                foreach ($pk as $k) {
+                    $parts[] = '`' . $k . '` = ' . $this->sqlQuote((string) ($rows[$rawIdx][$k] ?? ''));
+                }
+                $groups[] = '(' . implode(' AND ', $parts) . ')';
+            }
+            $where = implode(' OR ', $groups);
+        }
+
+        return [
+            'sql'   => 'DELETE FROM `' . $table . '` WHERE ' . $where . ';',
+            'where' => $where,
+        ];
+    }
+
+    /**
+     * The confirm was answered Y: put the DELETE on the CLI to run or cancel
+     * (§22). The marks stay on so the rows stay visible while the statement is
+     * read - the grid is the only place that says *which* records these are.
+     */
+    private function stageDelete(): void
+    {
+        $d = $this->pendingDelete;
+        $this->pendingDelete = null;
+        if ($d === null) {
+            return;
+        }
+        // An un-run cell edit and an un-run delete cannot both own the CLI.
+        $this->revertInFlight();
+        $this->autoDelete = $d;
+        $this->input->setText($d['sql']);
+        $this->state->detail = false;
+        $this->state->cellView = false;
+        $this->state->cellMoveMode = false;
+        $this->state->focus = State::FOCUS_CLI;
+        $this->resetHistoryNav();
+        $n = count($d['rawIdxs']);
+        $this->state->statusLine = 'DELETE ready - ' . $n . ' row' . ($n === 1 ? '' : 's')
+            . ' - Enter to run, Esc to cancel';
+        $this->state->statusIsError = false;
+    }
+
+    /**
+     * Cancel the in-flight delete: clear the CLI, drop the marks and go back to
+     * the grid (§22). Mark mode itself survives, so a mis-ticked set can be
+     * corrected rather than rebuilt from nothing.
+     */
+    private function cancelInFlightDelete(): void
+    {
+        if ($this->autoDelete === null) {
+            return;
+        }
+        $this->autoDelete = null;
+        $this->state->deleteMarks = [];
+        $this->input->setText('');
+        $this->resetHistoryNav();
+        $this->state->focus = State::FOCUS_DATA;
+        $this->state->statusLine = 'Delete cancelled';
+        $this->state->statusIsError = false;
+    }
+
+    /**
+     * Run the in-flight DELETE, then re-run the SELECT behind the grid so what is
+     * on screen is what is in the table (§22).
+     *
+     * Re-running rather than dropping the rows locally is a deliberate cost: a
+     * DELETE can take more rows than the grid knows about - an ON DELETE CASCADE,
+     * a trigger, a row someone else changed between the count and the statement -
+     * and a grid quietly out of step with its table is worse than a round trip.
+     */
+    private function runAutoDelete(): void
+    {
+        $ad = $this->autoDelete;
+        $this->autoDelete = null;
+        if ($ad === null) {
+            return;
+        }
+        $res = $this->withBusy(
+            'Deleting …',
+            fn () => $this->database->query(rtrim($ad['sql'], ';')),
+        );
+        $this->input->setText('');
+        $this->resetHistoryNav();
+        $this->state->deleteMarks = [];
+        $this->state->markMode = false;
+
+        if ($res->hasError()) {
+            $this->state->focus = State::FOCUS_DATA;
+            $this->setError('DELETE failed: ' . ($res->error ?? 'unknown error'));
+            $this->screen->invalidate();
+            return;
+        }
+
+        $n = $res->affectedRows;
+        $note = $n . ' row' . ($n === 1 ? '' : 's') . ' deleted';
+        $reload = $this->state->lastSql;
+        if ($reload === '' || !$this->looksReloadable($reload)) {
+            // Nothing safe to re-run (the grid came from something other than a
+            // plain SELECT). Say so rather than leaving deleted rows on screen as
+            // though they were still there.
+            $this->state->focus = State::FOCUS_DATA;
+            $this->state->statusLine = $note . ' - re-run your query to refresh the view';
+            $this->state->statusIsError = false;
+            $this->screen->invalidate();
+            return;
+        }
+        // Through submit(), not execute(), so the reload gets the same batch
+        // bookkeeping any typed statement does. The status line it will write is
+        // the reload's own, so the sentence that actually matters is parked where
+        // applyResult() can lead with it.
+        $this->deleteNote = $note;
+        $this->submit($reload, false);
+    }
+
+    /**
+     * True when $sql is safe to re-issue on its own after a delete (§22): a single
+     * plain SELECT. Anything else - a modifying statement, a batch - must not be
+     * replayed as a side effect of deleting a row.
+     */
+    private function looksReloadable(string $sql): bool
+    {
+        if (count(Splitter::split($sql)) !== 1) {
+            return false;
+        }
+        return Splitter::commandKeyword($sql) === 'SELECT';
+    }
+
+    /** True when $sql is (ignoring a trailing `;`/space) the in-flight DELETE. */
+    private function isInFlightDelete(string $sql): bool
+    {
+        if ($this->autoDelete === null) {
+            return false;
+        }
+        $norm = static fn (string $v): string => rtrim(trim($v), '; ');
+        return $norm($sql) === $norm($this->autoDelete['sql']);
     }
 
     /** True when $sql is (ignoring a trailing `;`/space) the in-flight UPDATE. */
@@ -3325,6 +6609,10 @@ final class App
         $this->state->jsonRow = $rawIdx;
         $this->state->jsonEdit = false;
         $this->state->jsonEditor = null;
+        // A fresh open is always at the top level, whatever was open before.
+        $this->jsonStack = [];
+        $this->state->jsonPath = [];
+        $this->state->jsonNotice = '';
         $tree = JsonTree::parse($value);
         if ($tree === null) {
             $this->jsonTree = null;
@@ -3379,6 +6667,13 @@ final class App
 
     private function closeJson(): void
     {
+        // Closing from inside an embedded document still means "done with this
+        // field", so every open level folds back into the one above it first —
+        // otherwise an edit made two levels down would be dropped by the very
+        // action the user takes to keep it (§10).
+        while ($this->jsonStack !== []) {
+            $this->jsonAscend();
+        }
         // Closing = "done editing this field": if the document changed vs the DB
         // value, drop its UPDATE on the CLI like any other cell edit (§9/§10). Node
         // edits were already committed to the tree, so Esc-to-close commits them.
@@ -3414,6 +6709,9 @@ final class App
         $this->jsonTree = null;
         $this->jsonRows = [];
         $this->state->jsonNodes = [];
+        $this->jsonStack = [];
+        $this->state->jsonPath = [];
+        $this->state->jsonNotice = '';
     }
 
     /** One PageUp/PageDown step in the JSON tree (a full visible page, §10). */
@@ -3435,6 +6733,9 @@ final class App
             $this->closeJson();
             return;
         }
+        // A notice explains the key that was just pressed, so it lives exactly
+        // until the next one.
+        $this->state->jsonNotice = '';
         $count = count($this->state->jsonNodes);
         $last = max(0, $count - 1);
         switch ($e->key) {
@@ -3460,7 +6761,13 @@ final class App
                 $this->jsonDeleteSelected();
                 break;
             case Key::Escape:
-                $this->closeJson();
+                // Innermost window first: inside an embedded document, Esc comes
+                // back up one level rather than closing the whole viewer (§10).
+                if ($this->jsonStack !== []) {
+                    $this->jsonAscend();
+                } else {
+                    $this->closeJson();
+                }
                 break;
             case Key::Enter:
                 // Container → toggle collapse; scalar leaf → edit its value (§10).
@@ -3489,6 +6796,11 @@ final class App
                         $this->state->jsonSel = 0;
                         $this->publishJson();
                         break;
+                    case 'j':
+                    case 'J':
+                        // Open a JSON document held *inside* a string leaf (§10).
+                        $this->jsonDescend();
+                        break;
                     case 'a':
                         // Add a child inside the selected container (§10).
                         $this->jsonAdd(child: true);
@@ -3510,8 +6822,90 @@ final class App
         }
     }
 
+    /**
+     * `j`/`J` inside the viewer: a string leaf whose text is itself a JSON
+     * document opens as its own tree (§10).
+     *
+     * A blob inside a blob is stored as an escaped string, so the tree can only
+     * show it as one long unreadable line — which is the whole reason this key
+     * exists. Only a **string** leaf qualifies: a container is already open in
+     * front of the user, and a number or a bool has nothing inside it.
+     */
+    private function jsonDescend(): void
+    {
+        $row = $this->jsonRows[$this->state->jsonSel] ?? null;
+        if ($row === null || $this->jsonTree === null) {
+            return;
+        }
+        $node = $row['node'];
+        if ($node->isContainer()) {
+            $this->state->jsonNotice = 'That is already an open ' . $node->type
+                . ' — j opens a document held inside a string.';
+            return;
+        }
+        if ($node->type !== JsonNode::STRING || !is_string($node->scalar)) {
+            $this->state->jsonNotice = 'Only a string can hold an embedded document.';
+            return;
+        }
+        $child = JsonTree::parse($node->scalar);
+        if ($child === null) {
+            // Same gate as the cell level: a bare scalar that happens to parse
+            // (`42`, `"x"`) is not a document and must not open a viewer (§10).
+            $this->state->jsonNotice = trim($node->scalar) === ''
+                ? 'Empty string — nothing to open.'
+                : 'Not an embedded JSON document — nothing to open here.';
+            return;
+        }
+        $this->jsonStack[] = [
+            'tree' => $this->jsonTree,
+            'node' => $node,
+            'original' => $node->scalar,
+            'sel' => $this->state->jsonSel,
+            'offset' => $this->state->jsonOffset,
+        ];
+        $this->state->jsonPath[] = $row['label'] !== '' ? $row['label'] : '(value)';
+        $this->jsonTree = $child;
+        $this->state->jsonSel = 0;
+        $this->state->jsonOffset = 0;
+        $this->publishJson();
+    }
+
+    /**
+     * Come back up one level: the nested document is re-encoded into the string
+     * leaf it came from, and the viewer returns to the parent tree at the row the
+     * user descended from.
+     *
+     * **It writes back only when the content actually changed.** `encode()`
+     * normalizes — whitespace gone, unescaped slashes — so re-encoding a document
+     * nobody edited would rewrite the cell for the crime of having been looked
+     * at, and that rewrite would then be offered as an UPDATE by
+     * {@see closeJson()}. The comparison is against the *parsed* original for the
+     * same reason: a pretty-printed blob and its compact form are the same
+     * document.
+     */
+    private function jsonAscend(): void
+    {
+        $frame = array_pop($this->jsonStack);
+        if ($frame === null) {
+            return;
+        }
+        $child = $this->jsonTree;
+        if ($child !== null) {
+            $encoded = $child->encode();
+            $originalNorm = JsonTree::parse($frame['original'])?->encode() ?? $frame['original'];
+            if ($encoded !== $originalNorm) {
+                $frame['tree']->setScalar($frame['node'], $encoded);
+            }
+        }
+        $this->jsonTree = $frame['tree'];
+        array_pop($this->state->jsonPath);
+        $this->publishJson();
+        $this->state->jsonSel = $this->clampIndex($frame['sel'], count($this->state->jsonNodes));
+        $this->state->jsonOffset = $frame['offset'];
+    }
+
     /** The JsonNode under the current selection, or null. */
-    private function selectedJsonNode(): ?\Sqli2\Json\JsonNode
+    private function selectedJsonNode(): ?\Sqli\Json\JsonNode
     {
         return $this->jsonRows[$this->state->jsonSel]['node'] ?? null;
     }
@@ -3649,34 +7043,13 @@ final class App
             $this->state->jsonEdit = false;
             return;
         }
+        // Field specials first (Enter confirms — the node value is single-line,
+        // §10 — and Esc abandons), then shared clipboard + base editing so the
+        // JSON node box matches the CLI: a single-line field.
         switch ($e->key) {
-            case Key::Char:
-                if (!$e->ctrl && !$e->alt) {
-                    $editor->insert($e->char);
-                }
-                break;
-            case Key::Backspace:
-                $e->ctrl ? $editor->deleteWordLeft() : $editor->backspace();
-                break;
-            case Key::Delete:
-                $e->ctrl ? $editor->deleteWordRight() : $editor->delete();
-                break;
-            case Key::Left:
-                $e->ctrl ? $editor->wordLeft() : $editor->left();
-                break;
-            case Key::Right:
-                $e->ctrl ? $editor->wordRight() : $editor->right();
-                break;
-            case Key::Home:
-                $editor->lineHome();
-                break;
-            case Key::End:
-                $editor->lineEnd();
-                break;
             case Key::Enter:
-                // The node value is single-line, so Enter confirms (§10).
                 $this->confirmJsonNodeEdit();
-                break;
+                return;
             case Key::Escape:
                 // Cancelling the key prompt for a new member simply abandons the
                 // add (no node was created yet); a value edit just closes.
@@ -3684,10 +7057,12 @@ final class App
                 $this->state->jsonEditor = null;
                 $this->state->jsonEditKind = '';
                 $this->jsonAddContainer = null;
-                break;
-            default:
-                break;
+                return;
         }
+        if ($this->editorClipboardKey($e, $editor)) {
+            return;
+        }
+        $this->applyEditingKey($editor, $e, multiline: false);
     }
 
     private function confirmJsonNodeEdit(): void
@@ -3797,7 +7172,21 @@ final class App
         if ($v === 'NULL') {
             return 'NULL';
         }
-        return "'" . str_replace(['\\', "'"], ['\\\\', "''"], $v) . "'";
+        // Line breaks are escaped rather than embedded literally. A generated
+        // statement has to survive a round trip through the CLI (§9: a cell edit
+        // puts its UPDATE there to run or cancel), and the CLI is line-based —
+        // submitting joins its lines with a space. A value with real newlines in it
+        // would therefore reach the database with every break turned into a space.
+        // Escaped, the statement stays one line: it displays and edits normally on
+        // the CLI, and MySQL turns `\n` back into a newline on the way in.
+        //
+        // Order matters: backslashes are doubled FIRST, so the `\n`/`\r` we add
+        // afterwards stay escape sequences instead of being doubled into literals.
+        return "'" . str_replace(
+            ['\\', "'", "\n", "\r"],
+            ['\\\\', "''", '\\n', '\\r'],
+            $v,
+        ) . "'";
     }
 
     // --- PK-missing popup (§5) ---------------------------------------------
@@ -3884,11 +7273,37 @@ final class App
                 $q = $this->pendingDangerous;
                 $this->pendingDangerous = null;
                 if ($q !== null) {
+                    // This statement suspended a batch; run it, then pick the
+                    // queue back up where it left off (§5).
+                    $this->batchStop = '';
                     $this->execute((string) $q['sql'], (bool) $q['vertical'], confirmedDangerous: true);
+                    if ($this->continueBatch()) {
+                        $this->runBatch();
+                    }
                 }
             } elseif ($key === 'n' || $key === 'c' || $key === 'esc') {
                 $this->closeConfirm();
                 $this->pendingDangerous = null;
+                $this->cancelBatch();
+            }
+            return;
+        }
+
+        if ($kind === 'grid_delete') {
+            if ($key === 'y') {
+                $this->closeConfirm();
+                $this->stageDelete();
+            } elseif ($key === 'n' || $key === 'c' || $key === 'esc') {
+                $this->closeConfirm();
+                $this->pendingDelete = null;
+                // Outside mark mode the mark was made by Del itself, so cancelling
+                // takes it back. In mark mode the ticks are the user's own work and
+                // survive, ready to be corrected (§22).
+                if (!$this->state->markMode) {
+                    $this->state->deleteMarks = [];
+                }
+                $this->state->statusLine = 'Delete cancelled';
+                $this->state->statusIsError = false;
             }
             return;
         }
@@ -3937,10 +7352,16 @@ final class App
         $this->state->sortCol = null;
         $this->state->applySort();
         $this->state->pending = [];
+        $this->state->deleteMarks = [];
+        $this->state->markMode = false;
         $this->state->focus = State::FOCUS_CLI;
         $this->state->statusLine = 'Data view cleared';
         $this->state->statusIsError = false;
-        $this->input->clearAll();
+        $this->state->autoLimitedAt = 0;
+        // `clear` empties *this* view only, so its tab goes back to reading as
+        // unused while the other four keep whatever they are holding (§20).
+        $this->refreshTabLabel();
+        $this->input->clear();
         // A blank result reshapes the whole screen; force a clean repaint.
         $this->screen->invalidate();
         $this->resetHistoryNav();
@@ -3962,18 +7383,121 @@ final class App
         return $v === null ? '' : (string) $v;
     }
 
+    /**
+     * Apply column $col's display format to a raw value (§6, backlog S). Returns
+     * the value unchanged when the column carries no format or the value is empty
+     * — the raw value stays the source of truth; only how it's shown changes.
+     */
+    private function formatDisplay(string $col, string $raw): string
+    {
+        $fmt = ColumnFormats::get($this->state->formatOf($col));
+        return $fmt === null || $raw === '' ? $raw : $fmt->display($raw);
+    }
+
+    /** The displayed (format-applied) value of a cell, for copy/inspection (§6/§19). */
+    private function displayValueAt(int $rawIdx, string $col): string
+    {
+        return $this->formatDisplay($col, $this->cellValueAt($rawIdx, $col));
+    }
+
+    /**
+     * A prominent, transient notice on the top line (§19) plus the status line
+     * for good measure — the confirmation style the copy/export family shares.
+     */
+    private function notifyTop(string $msg, bool $isError = false): void
+    {
+        $this->state->flashMessage = $msg;
+        $this->state->flashUntil = microtime(true) + self::FLASH_SECONDS;
+        $this->state->statusLine = $msg;
+        $this->state->statusIsError = $isError;
+    }
+
+    /**
+     * Put the failed statement and its error on the clipboard, in full.
+     *
+     * Both parts go, in the order they are shown, because an error without the
+     * SQL that provoked it is half a bug report — and the SQL is what makes it
+     * searchable. Untruncated: what the screen had to cut is exactly what the
+     * clipboard is for.
+     */
+    private function copyErrorToClipboard(): void
+    {
+        $result = $this->state->result;
+        if ($result === null || !$result->hasError()) {
+            return;
+        }
+        $sql = $this->state->lastSql;
+        $text = ($sql !== '' ? 'input: ' . $sql . PHP_EOL : '') . 'ERROR: ' . (string) $result->error;
+        $this->copyToClipboard($text, 'error');
+    }
+
     /** Push $data to the system clipboard via OSC 52 and confirm to the user. */
     private function copyToClipboard(string $data, string $what): void
     {
         // OSC 52 paints nothing, so no Screen::invalidate() is needed.
         $this->terminal->write(Ansi::clipboardSet($data));
-        $msg = 'Copied ' . $what . ' to clipboard';
-        // Prominent, transient confirmation on the top line (§19) plus the
-        // status line for good measure.
-        $this->state->flashMessage = $msg;
-        $this->state->flashUntil = microtime(true) + self::FLASH_SECONDS;
-        $this->state->statusLine = $msg;
-        $this->state->statusIsError = false;
+        $this->notifyTop('Copied ' . $what . ' to clipboard');
+    }
+
+    /**
+     * Export the arranged data view to a timestamped CSV in the cwd (§19, #4).
+     *
+     * "As arranged" is the whole point of the feature: the file mirrors the
+     * screen — {@see State::visibleColumnNames()} gives column order with hidden
+     * columns dropped, {@see State::displayOrder()} gives the active sort, and
+     * {@see displayValueAt()} applies each column's display format, so a column
+     * shown as date/time exports as date/time rather than as an epoch. It also
+     * picks up an in-flight cell edit, because `cellValueAt()` reads `pending`
+     * first — you export what you are looking at.
+     *
+     * Rows are the current result set, so a query that was auto-LIMITed exports
+     * the capped set; that is what "the table contents" means on screen.
+     *
+     * NOTE: {@see handleDataKey()} already returns early when there is no
+     * result, so the first guard below cannot fire from Ctrl+Alt+O today. It is
+     * kept because it is the correct behaviour if export is ever also offered
+     * from the system menu, where no result may be loaded.
+     */
+    private function exportCsv(): void
+    {
+        $s = $this->state;
+        if (!$s->hasResult()) {
+            $this->notifyTop('Nothing to export — run a query first.', true);
+            return;
+        }
+        $cols = $s->visibleColumnNames();
+        if ($cols === []) {
+            $this->notifyTop('Nothing to export — every column is hidden.', true);
+            return;
+        }
+        $dir = getcwd();
+        if ($dir === false) {
+            $this->notifyTop('Cannot export: the working directory is unavailable.', true);
+            return;
+        }
+
+        $rows = [];
+        foreach ($s->displayOrder() as $rawIdx) {
+            $row = [];
+            foreach ($cols as $col) {
+                $row[] = $this->displayValueAt($rawIdx, $col);
+            }
+            $rows[] = $row;
+        }
+
+        $path = rtrim($dir, '/\\') . DIRECTORY_SEPARATOR
+            . CsvExport::fileName($s->currentDatabase, $s->currentTable);
+        // A wide grid can take a moment to render and write; say so first.
+        $reason = $this->withBusy('Exporting ' . count($rows) . ' rows to CSV …',
+            static fn (): ?string => CsvExport::write($path, $cols, $rows));
+
+        if ($reason !== null) {
+            $this->notifyTop('Export failed: ' . $reason, true);
+            my::lineout('FILE:FILE', 'csv export failed', $path, $reason);
+            return;
+        }
+        $this->notifyTop('Exported ' . count($rows) . ' rows × ' . count($cols) . ' cols → ' . $path);
+        my::lineout('FILE:FILE', 'csv export', $path, (string) count($rows), (string) count($cols));
     }
 
     /** Copy the selected cell's value (§19, #1). */
@@ -3987,7 +7511,7 @@ final class App
         if ($col === null || $rawIdx === null) {
             return;
         }
-        $this->copyToClipboard($this->cellValueAt($rawIdx, $col), "cell '" . $this->qualifiedField($col) . "'");
+        $this->copyToClipboard($this->displayValueAt($rawIdx, $col), "cell '" . $this->qualifiedField($col) . "'");
     }
 
     /** Copy the selected row as tab-separated visible-column values (§19, #2). */
@@ -4001,7 +7525,7 @@ final class App
             return;
         }
         $cols = $this->state->visibleColumnNames();
-        $vals = array_map(fn (string $c): string => $this->cellValueAt($rawIdx, $c), $cols);
+        $vals = array_map(fn (string $c): string => $this->displayValueAt($rawIdx, $c), $cols);
         $this->copyToClipboard(implode("\t", $vals), 'row (' . count($cols) . ' cols)');
     }
 
@@ -4017,7 +7541,7 @@ final class App
         }
         $vals = [];
         foreach ($this->state->displayOrder() as $rawIdx) {
-            $vals[] = $this->cellValueAt($rawIdx, $name);
+            $vals[] = $this->displayValueAt($rawIdx, $name);
         }
         $this->copyToClipboard(implode("\n", $vals), "column '" . $this->qualifiedField($name) . "' (" . count($vals) . ' rows)');
     }
@@ -4035,6 +7559,7 @@ final class App
     /** Open the popup from a Tab press; no-op if there's no completion context. */
     private function openCompletion(): void
     {
+        $this->input->clearSelection(); // a completion insert supersedes any selection (§4)
         // The first Tab triggers the initial schema load (SHOW TABLES, then a
         // SHOW COLUMNS per referenced table) which can stall on a big database.
         // Show a busy popup for that first fetch only; once the schema is cached
@@ -4044,6 +7569,16 @@ final class App
             : $this->withBusy('Loading schema, please wait …', fn () => $this->analyzeCompletion());
         if ($res === null) {
             $this->state->completion = false;
+            return;
+        }
+        // A single unambiguous table/field/macro candidate is inserted
+        // straight onto the line — no popup to dismiss (§4). Other contexts
+        // still open it.
+        if (count($res->items) === 1
+            && in_array($res->title, ['Tables', 'Columns', 'Databases', 'Procedures', Completion::MACROS], true)
+        ) {
+            $this->applyCompletion($res); // seeds items/start/idx for insertCompletion()
+            $this->insertCompletion();    // inserts the lone item; leaves completion off
             return;
         }
         $this->state->completion = true;
@@ -4063,6 +7598,7 @@ final class App
             // Context no longer yields any candidate pool: keep the box, empty
             // the list, and track the now-typed token so backspace can refill.
             $this->state->completionItems = [];
+            $this->state->completionDetails = [];
             $this->state->completionIdx = 0;
             $this->state->completionFilter = $this->currentToken($this->state->completionStart);
             return;
@@ -4072,18 +7608,22 @@ final class App
 
     private function analyzeCompletion(): ?CompletionResult
     {
-        $editor = $this->input->editor();
+        $editor = $this->input;
         return $this->completion->analyze(
             $editor->text(),
             $editor->cursor(),
             fn (): array => $this->schema->tables(),
             fn (string $t): array => $this->schema->columns($t),
+            fn (): array => $this->schema->databases(),
+            fn (): array => $this->schema->procedures(),
+            fn (): array => $this->macros->all(),
         );
     }
 
     private function applyCompletion(CompletionResult $res): void
     {
         $this->state->completionItems = $res->items;
+        $this->state->completionDetails = $res->details;
         $this->state->completionIdx = 0;
         $this->state->completionStart = $res->start;
         $this->state->completionTitle = $res->title;
@@ -4095,7 +7635,7 @@ final class App
     /** The token text from $start to the cursor (the live filter). */
     private function currentToken(int $start): string
     {
-        $editor = $this->input->editor();
+        $editor = $this->input;
         return mb_substr($editor->text(), $start, max(0, $editor->cursor() - $start));
     }
 
@@ -4137,10 +7677,10 @@ final class App
                 // then re-analyze so the list narrows (§4). Anything else
                 // (space, punctuation, ctrl/alt combos) closes the popup and is
                 // handled normally.
-                if ($e->ctrl || $e->alt || !$this->isWordChar($e->char)) {
+                if ($e->ctrl || $e->alt || !$this->extendsFilter($e->char)) {
                     return false;
                 }
-                $this->input->editor()->insert($e->char);
+                $this->input->insert($e->char);
                 $this->resetHistoryNav();
                 $this->refreshCompletion();
                 return true;
@@ -4149,10 +7689,10 @@ final class App
                 // trim — even down to an empty box, which refills as soon as a
                 // matching char is typed. Once it would reach before the token
                 // start, let the popup close and the keystroke fall through.
-                if ($e->ctrl || $this->input->editor()->cursor() <= $this->state->completionStart) {
+                if ($e->ctrl || $this->input->cursor() <= $this->state->completionStart) {
                     return false;
                 }
-                $this->input->editor()->backspace();
+                $this->input->backspace();
                 $this->refreshCompletion();
                 return true;
             default:
@@ -4166,6 +7706,23 @@ final class App
         return $c !== '' && preg_match('/^[\p{L}\p{N}_]$/u', $c) === 1;
     }
 
+    /**
+     * Whether typing $c should narrow the open popup rather than close it.
+     *
+     * Word characters everywhere, plus `-` and `.` while the list is macro
+     * names (§23) — those are legal in a name, and without this `?fl-` would
+     * dismiss the popup on the hyphen, one character into the very name it was
+     * offering.
+     */
+    private function extendsFilter(string $c): bool
+    {
+        if ($this->isWordChar($c)) {
+            return true;
+        }
+        return $this->state->completionTitle === Completion::MACROS
+            && ($c === '-' || $c === '.');
+    }
+
     private function insertCompletion(): void
     {
         $item = $this->state->completionItems[$this->state->completionIdx] ?? null;
@@ -4173,37 +7730,69 @@ final class App
         if ($item === null) {
             return;
         }
-        $editor = $this->input->editor();
+        $editor = $this->input;
         $text = $editor->text();
         $start = $this->state->completionStart;
         $cursor = $editor->cursor();
         if ($start < 0 || $start > $cursor) {
             return; // buffer changed under us; skip
         }
-        $new = mb_substr($text, 0, $start) . $item . mb_substr($text, $cursor);
+        $tail = mb_substr($text, $cursor);
+
+        // A `?name` reference has no closing delimiter to add — the name ends
+        // where the name characters do (§23). What still needs handling is Tab
+        // pressed in the *middle* of one, `?na▏me`, to swap the name: the rest
+        // of the old name is taken with it, or it would strand itself on the end
+        // of the new one as `?newme`.
+        if ($this->state->completionTitle === Completion::MACROS
+            && preg_match('/^[A-Za-z0-9_.\-]+/u', $tail, $m) === 1
+        ) {
+            $tail = mb_substr($tail, mb_strlen($m[0]));
+        }
+        $new = mb_substr($text, 0, $start) . $item . $tail;
         $editor->setText($new, $start + mb_strlen($item));
         $this->resetHistoryNav();
     }
 
     // --- query submission --------------------------------------------------
 
-    private function onEnter(): void
+    private function onEnter(KeyEvent $e): void
     {
-        $active = rtrim($this->input->editor()->text());
+        $this->input->clearSelection(); // submitting/continuing supersedes any selection (§4)
+        $active = rtrim($this->input->text());
 
         // Enter on the CLI only ever submits — an empty buffer has nothing to
         // submit, so it does nothing. (The detail view is now toggled from DATA
         // focus with `i`; Enter no longer changes the data view.)
-        if ($active === '' && $this->input->lineCount() === 1) {
+        if ($active === '' && count($this->input->lines()) === 1) {
+            return;
+        }
+
+        // **Alt+Enter always continues** (§4/§5): another line, whatever the
+        // buffer ends with. Now that a submission can hold several statements,
+        // a trailing `;` is no longer a reliable signal that the user is
+        // finished — it is just as likely to be the end of statement one of
+        // four — so there has to be a way to say "not yet" that the terminator
+        // cannot override. Quit words are skipped too: the key means "give me
+        // another line", with no exceptions to remember.
+        //
+        // Alt, not Shift, for a reason worth not rediscovering: under WSL in
+        // Windows Terminal, Shift+Enter and Ctrl+Enter are both byte-identical
+        // to Enter (0x0d). Telling them apart needs xterm `modifyOtherKeys`,
+        // which was tried and reverted. `$e->shift` is honoured anyway, at no
+        // cost, for terminals that do report it.
+        if ($e->alt || $e->shift) {
+            $this->cliPushLine();
+            $this->resetHistoryNav();
             return;
         }
 
         // Single-line CLI commands (optionally `;`-terminated): `exit`/`quit`
         // quit the app, `clear`/`cls` clear the data view. The pending-changes
         // guard runs first for both (§17/§18).
-        if ($this->input->lineCount() === 1) {
+        if (count($this->input->lines()) === 1) {
             $cmd = strtolower(rtrim($active, "; \t"));
-            if ($cmd === 'exit' || $cmd === 'quit') {
+            if (in_array($cmd, self::QUIT_WORDS, true)) {
                 $this->requestQuit();
                 return;
             }
@@ -4213,26 +7802,50 @@ final class App
             }
         }
 
-        // A `;` or `\G` on the active line terminates and submits. `\G` selects
-        // vertical output mode (rendered as normal until §5 lands).
+        // A `;`, `\G`, `\1`…`\9`, or a complete macro call (§23) on the active
+        // line terminates and submits.
+        // `\G` selects vertical output mode; `\N` sends the output to data view N
+        // and switches to it (§20). The digits are terminators in their own right
+        // for the same reason `\G` is — `select * from t \3` is a complete thought,
+        // and having to add a `;` after the routing suffix would be noise.
         $terminator = null;
+        $targetTab = null;
         if (str_ends_with($active, ';')) {
             $terminator = ';';
         } elseif (preg_match('/\\\\[Gg]$/', $active)) {
             $terminator = '\\G';
+        } elseif (preg_match('/\\\\([1-' . State::TAB_COUNT . '])$/', $active, $m)) {
+            $terminator = '\\' . $m[1];
+            $targetTab = (int) $m[1] - 1;
+        } elseif ($this->macros->endsWithCall($active)) {
+            // A macro call is a terminator in its own right (§23). `?who` is a
+            // complete thought: the statement it stands for carries its own `;`
+            // inside the value, and asking for a second one after the reference
+            // is asking the user to punctuate a sentence they cannot see.
+            //
+            // `$terminator` stays a *stripping* instruction, so this arm sets
+            // none — there is nothing on the end to remove. The check itself is
+            // narrow enough to be safe (see {@see Macros::endsWithCall()}): the
+            // name must be defined, must be the last thing on the line, and must
+            // already have its arguments. Alt+Enter still means "another line".
+            $sql = $this->cliText();
+            if (trim($sql) !== '') {
+                $this->submit($sql, false, null);
+            }
+            return;
         }
 
         if ($terminator !== null) {
             // Build the SQL without mutating the buffer, so Cancel can keep it.
-            $sql = $this->stripTerminator($this->input->combinedText(), $terminator);
+            $sql = $this->stripTerminator($this->cliText(), $terminator);
             if ($sql !== '') {
-                $this->submit($sql, $terminator === '\\G');
+                $this->submit($sql, $terminator === '\\G', $targetTab);
             }
             return;
         }
 
         // No terminator: push this line up and continue on a fresh line below.
-        $this->input->pushLine();
+        $this->cliPushLine();
         $this->resetHistoryNav();
     }
 
@@ -4242,27 +7855,512 @@ final class App
         if ($terminator === ';') {
             return rtrim(substr($s, 0, -1));
         }
-        return rtrim((string) preg_replace('/\\\\[Gg]$/', '', $s));
+        // `\G` and the `\1`…`\9` view suffixes (§20) are both a backslash plus one
+        // character, so one pattern strips either.
+        return rtrim((string) preg_replace('/\\\\[Gg1-' . State::TAB_COUNT . ']$/', '', $s));
+    }
+
+    // --- data view tabs (§20) ----------------------------------------------
+
+    /**
+     * Put data view $tab on screen, parking the one that was there (§20).
+     *
+     * The whole switch is a property swap: the active view lives in State, so
+     * after the restore every grid key, every mouse hit-test and the renderer
+     * are already talking about the new view with no further plumbing.
+     *
+     * Safe to call from anywhere a key is handled, because {@see handleKey()}
+     * only reaches the Alt+digit branch after every modal has had its chance to
+     * consume the key — so a switch can never strand a half-finished cell edit
+     * or an open popup on a tab you just left.
+     */
+    private function switchTab(int $tab): void
+    {
+        if ($tab < 0 || $tab >= State::TAB_COUNT || $tab === $this->state->activeTab) {
+            return;
+        }
+        $this->tabViews[$this->state->activeTab] = $this->state->captureView();
+        $this->state->restoreView($this->tabViews[$tab] ?? State::blankView());
+        $this->state->activeTab = $tab;
+        // A different result reshapes the whole grid (row count, gutter width,
+        // column set), so nothing from the old view may survive as leftover
+        // characters under the differential renderer.
+        $this->screen->invalidate();
+    }
+
+    /**
+     * Step $step views along and **wrap** — view 9 goes on to view 1, view 1
+     * back to view 9 (§20).
+     *
+     * Empty views are stepped through like any other. Skipping them would make
+     * the gesture's destination depend on history rather than on position, and
+     * an empty view is where a query is *sent* — `\7` on the CLI is how one gets
+     * used in the first place, and arriving there is how you decide to.
+     */
+    private function cycleTab(int $step): void
+    {
+        $count = State::TAB_COUNT;
+        $this->switchTab((($this->state->activeTab + $step) % $count + $count) % $count);
+    }
+
+    /**
+     * Re-label the active tab from what it is now showing (§20). An empty label
+     * means "never used", which the tab strip draws differently — so a view that
+     * ran a query and got no table name still reads as used.
+     */
+    private function refreshTabLabel(): void
+    {
+        $label = $this->state->currentTable;
+        if ($label === '' && $this->state->result !== null) {
+            $label = '·';
+        }
+        $this->state->tabLabels[$this->state->activeTab] = $label;
     }
 
     /**
      * Submit whatever is on the CLI. If it is the in-flight edit's UPDATE, run it
      * specially so the result grid survives and the value folds in (§9). Anything
      * else means the user moved on, so the un-run edit is reverted first.
+     *
+     * $targetTab is the `\1`…`\9` suffix (§20): the whole submission — every
+     * statement of a batch, and any dangerous-query re-run it suspends into —
+     * lands in that view, and the view is switched to before anything runs so
+     * the busy notice, the result and any error all appear where you sent them.
      */
-    private function submit(string $sql, bool $vertical): void
+    private function submit(string $sql, bool $vertical, ?int $targetTab = null): void
     {
         if ($this->isInFlightSubmit($sql)) {
             $this->runAutoUpdate();
             return;
         }
-        // Running some other statement abandons any un-submitted cell edit.
+        if ($this->isInFlightDelete($sql)) {
+            $this->runAutoDelete();
+            return;
+        }
+        // Running some other statement abandons any un-submitted cell edit. This
+        // has to happen BEFORE the tab switch below: the edit being abandoned
+        // belongs to the view we are leaving, not to the one we are going to.
         $this->revertInFlight();
-        $this->execute($sql, $vertical);
+        // Same for an un-run delete: the user typed over it, so the marks it was
+        // built from are no longer answering any question (§22).
+        $this->autoDelete = null;
+        $this->state->deleteMarks = [];
+        // The user typing something new outranks a statement waiting to go out
+        // again by itself: theirs is the newer request, and two statements racing
+        // onto one connection is not a thing anyone asked for. A fresh submission
+        // also earns a fresh automatic attempt.
+        $this->pendingResend = null;
+        $this->resendUsed = false;
+
+        // Macros (§23) are expanded **here**, before the splitter, and that
+        // ordering is the feature rather than an implementation detail: a macro
+        // may hold a whole statement, or several, so `?cleanup` has to become
+        // two statements the splitter can see and hand to the read-only check and
+        // the dangerous-query guard one at a time. Expanding any later would send
+        // them to the server in a single packet, past both.
+        //
+        // It is also what makes arguments work: `?ganl vegas` is one line in
+        // which the word `vegas` belongs to the reference and not to the SQL, and
+        // only a pass that runs before the splitter can take it *out* of the line
+        // rather than leave it trailing after the statement it was an argument to.
+        //
+        // Everything downstream — normalization, the guards, the executed-SQL
+        // history — therefore works on the expanded text, which is what actually
+        // ran. Only the typed history keeps the `?name` form (see below), so
+        // Up-arrow gives back a statement that re-reads the macro rather than
+        // yesterday's value baked into it.
+        $typed = $sql;
+        $expansion = $this->macros->expand($sql);
+        $problem = $expansion->problem();
+        if ($problem !== null) {
+            // Nothing runs and the CLI is left exactly as typed: the fix is an
+            // edit to the line that is still sitting there, not a retype.
+            $this->state->statusLine = $problem;
+            $this->state->statusIsError = true;
+            return;
+        }
+        $sql = $expansion->sql;
+        $this->submitTyped = $sql !== $typed ? $typed : null;
+        $this->macroNote = $expansion->note();
+
+        // `?{name}` (§23) is asked **after** expansion and **before** the
+        // split, which is the same seam macros use and for the same two reasons:
+        // a macro may carry the prompt, so it has to be expanded first for the
+        // question to exist at all; and an answer may contain a `;`, so it has to
+        // be in the text before the splitter runs or the second half would reach
+        // the server in one packet with the first, past the guards.
+        //
+        // Everything from here to `runSubmission()` is therefore suspended, not
+        // skipped: the popup takes the keyboard, and Enter on the last question
+        // resumes exactly where this left off.
+        $asks = Macros::promptsIn($sql);
+        if ($asks !== []) {
+            $this->pendingPrompt = [
+                'sql' => $sql, 'typed' => $typed, 'vertical' => $vertical,
+                'tab' => $targetTab, 'names' => $asks, 'answers' => [],
+            ];
+            $this->openNextPrompt();
+            return;
+        }
+
+        $this->runSubmission($sql, $typed, $vertical, $targetTab);
+    }
+
+    /**
+     * Run an expanded submission: fill in any prompt answers, split, and hand
+     * the statements to the batch runner (§5).
+     *
+     * Split out of {@see submit()} so the `?{name}` popup has somewhere to
+     * come back to. Everything above this in `submit()` is about deciding *what*
+     * runs; everything here is about running it, and a suspended submission
+     * needs only the second half.
+     *
+     * @param array<string,string> $answers what the user typed at each prompt
+     */
+    private function runSubmission(
+        string $sql,
+        string $typed,
+        bool $vertical,
+        ?int $targetTab,
+        array $answers = [],
+    ): void {
+        // Called with or without answers so there is one path rather than two;
+        // with none there is nothing to match and the text comes back as it went
+        // in.
+        $sql = Macros::fillPrompts($sql, $answers);
+
+        // Split first, then run one statement at a time (§5). A single statement
+        // is just a batch of one, so there is one path rather than two.
+        $statements = Splitter::split($sql);
+        if ($statements === []) {
+            return; // nothing but comments
+        }
+        // Only now that there is something to run does `\N` move the screen —
+        // `\3` after nothing but a comment should not silently change tabs (§20).
+        if ($targetTab !== null) {
+            $this->switchTab($targetTab);
+        }
+        $this->batchQueue    = $statements;
+        $this->batchTotal    = count($statements);
+        $this->batchDone     = 0;
+        $this->batchVertical = $vertical;
+        $this->batchStop     = '';
+        if ($this->batchTotal > 1) {
+            // One typed submit, one history entry: pushing each piece separately
+            // would leave Up-arrow unable to reassemble what was actually typed.
+            $this->pushHistory($typed);
+        }
+        $this->runBatch();
+    }
+
+    /**
+     * Run queued statements until one of them stops the batch (§5).
+     *
+     * Stops are not all the same: a dangerous-query confirm *suspends* the batch
+     * with its queue intact — {@see handleConfirmKey()} resumes it — while a
+     * read-only refusal or a server error drops what is left. Running on past an
+     * error would be the worst of both worlds, since the statements that follow
+     * were written expecting the one that failed to have succeeded.
+     */
+    private function runBatch(): void
+    {
+        while ($this->batchQueue !== []) {
+            $stmt = array_shift($this->batchQueue);
+            $this->batchStop = '';
+            $this->execute($stmt, $this->batchVertical);
+            if (!$this->continueBatch()) {
+                return;
+            }
+        }
+        $this->finishBatch(false);
+    }
+
+    /**
+     * Bookkeeping after one statement of a batch. Returns false when the batch
+     * must not continue — already suspended, blocked, or failed.
+     */
+    private function continueBatch(): bool
+    {
+        if ($this->batchStop === 'confirm') {
+            return false; // suspended with the queue intact; the answer resumes it
+        }
+        if ($this->batchStop === 'async') {
+            return false; // suspended with the queue intact; the result resumes it
+        }
+        if ($this->batchStop === 'blocked') {
+            $this->abandonBatch();
+            return false;
+        }
+        if ($this->pendingResend !== null) {
+            // Suspended with the queue intact, exactly as 'async' and 'confirm'
+            // are: the statement that failed is going out again, and the ones
+            // after it were written expecting it to have run. Counting it as
+            // done or as a failure here would drop them.
+            return false;
+        }
+        $this->batchDone++;
+        if ($this->state->result !== null && $this->state->result->hasError()) {
+            $this->finishBatch(true);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Close out a batch and summarise it on the status line. Single statements
+     * are left to speak for themselves — their own status line is the better
+     * message, and "1 statement run" tells nobody anything.
+     */
+    private function finishBatch(bool $failed): void
+    {
+        if ($this->batchTotal > 1) {
+            if ($failed) {
+                $left = count($this->batchQueue);
+                $this->state->statusLine = 'Statement ' . $this->batchDone . ' of ' . $this->batchTotal
+                    . ' — ' . $this->state->statusLine
+                    . ($left > 0 ? ' · ' . $left . ' not run' : '');
+                $this->state->statusIsError = true;
+            } else {
+                $this->state->statusLine = $this->batchTotal . ' statements run';
+                $this->state->statusIsError = false;
+            }
+        }
+        $this->resetBatch();
+    }
+
+    /**
+     * Drop the rest of a batch after a statement was refused before it ran,
+     * keeping the refusal's own status line and noting what did not run.
+     */
+    private function abandonBatch(): void
+    {
+        $left = count($this->batchQueue);
+        if ($this->batchTotal > 1 && $left > 0) {
+            $this->state->statusLine .= ' · ' . $left . ' statement(s) not run';
+        }
+        $this->resetBatch();
+    }
+
+    /** Drop the rest of a batch after the dangerous-query confirm was declined. */
+    private function cancelBatch(): void
+    {
+        // The declined statement is already off the queue, so it counts too.
+        $left = count($this->batchQueue) + 1;
+        if ($this->batchTotal > 1) {
+            $this->state->statusLine = 'Cancelled — ' . $left . ' of ' . $this->batchTotal
+                . ' statement(s) not run';
+            $this->state->statusIsError = false;
+        }
+        $this->resetBatch();
+    }
+
+    // --- a statement the connection died under (§2) --------------------------
+
+    /** What is done with a statement whose connection died under it. */
+    public const RESEND_AUTO      = 'auto';
+    public const RESEND_UNSAFE    = 'unsafe';
+    public const RESEND_EXHAUSTED = 'exhausted';
+
+    /**
+     * Which of the three, given what is known about the loss.
+     *
+     * The rule this encodes: **re-send anything that provably never reached the
+     * server, and any read.** A read costs nothing to repeat. A write that never
+     * left is the same statement the user would type again, so sending it for
+     * them is exactly the work being saved.
+     *
+     * What is left is the one case that must not be automatic: a write the
+     * server may have run before the socket died. It may have committed and been
+     * unable to say so, and re-sending it would apply it twice — the one failure
+     * mode here that costs more than the inconvenience it saves.
+     *
+     * `$alreadyTried` outranks both, because a re-send that is itself met by a
+     * dead connection means the server is gone rather than the session, and a
+     * loop a second wide helps nobody.
+     *
+     * Pure and static so all three claims are pinned without a server.
+     */
+    public static function resendDecision(bool $neverRan, bool $modifying, bool $alreadyTried): string
+    {
+        if ($alreadyTried) {
+            return self::RESEND_EXHAUSTED;
+        }
+        return ($neverRan || !$modifying) ? self::RESEND_AUTO : self::RESEND_UNSAFE;
+    }
+
+    /**
+     * What the user is told, for each of the three. Said next to the error
+     * itself rather than instead of it: the error is what happened, this is what
+     * is being done about it.
+     */
+    public static function lossNotice(string $decision): string
+    {
+        return match ($decision) {
+            self::RESEND_AUTO      => 'connection lost — reconnecting and re-sending it …',
+            self::RESEND_UNSAFE    => 'connection lost — not re-sent automatically, '
+                                      . 'because the server may have run it already. Check, then run it again.',
+            self::RESEND_EXHAUSTED => 'connection lost again — the server is not answering. '
+                                      . 'Run it again when it is back.',
+            default                => '',
+        };
+    }
+
+    /**
+     * Decide what happens to the statement that just lost the connection, and
+     * set it up. Returns the decision, because the caller does two different
+     * things with it: RESEND_AUTO means the screen is left alone entirely, and
+     * the other two mean the error is shown with {@see lossNotice()} beside it.
+     */
+    private function scheduleResend(string $original, string $first, bool $vertical, bool $confirmed): string
+    {
+        $decision = self::resendDecision(
+            $this->database->lostBeforeItRan(),
+            in_array($first, self::MODIFYING, true),
+            $this->resendUsed,
+        );
+        if ($decision === self::RESEND_AUTO) {
+            // The typed form, not the normalized one: the re-send goes back
+            // through the whole of execute(), so it re-normalizes, re-caps and
+            // re-checks exactly as the first attempt did.
+            $this->pendingResend = [
+                'sql'       => $original,
+                'vertical'  => $vertical,
+                'confirmed' => $confirmed,
+                'at'        => microtime(true) + self::RESEND_DELAY,
+            ];
+        }
+        return $decision;
+    }
+
+    /**
+     * Send the waiting statement once its moment has come. Called once a frame.
+     *
+     * The delay is waited out here rather than slept through, which is what
+     * keeps the second honest: the frame loop goes on drawing, the header goes
+     * on saying what is about to happen, and a keystroke still arrives.
+     */
+    private function maybeResend(): void
+    {
+        if ($this->pendingResend === null
+            || $this->state->queryRunning
+            || microtime(true) < $this->pendingResend['at']) {
+            return;
+        }
+        $resend = $this->pendingResend;
+        $this->pendingResend = null;
+        // Before the statement goes out, not after: if this one dies too, the
+        // decision above has to see that an attempt was already spent.
+        $this->resendUsed = true;
+        $this->resentStatement = true;
+        // execute() reopens the connection itself, with the header saying so,
+        // and re-runs every guard the first attempt faced.
+        $this->execute($resend['sql'], $resend['vertical'], $resend['confirmed']);
+        // The same resumption the async path uses: the rest of the submission
+        // carries on from here, or waits for this statement to come back.
+        if ($this->continueBatch()) {
+            $this->runBatch();
+        }
+    }
+
+    /**
+     * Collect a finished async statement, if there is one. Called once a frame
+     * (§21).
+     *
+     * This is the resumption point for a batch suspended by 'async', and the
+     * *only* place an async result is applied — so the ordering here is the
+     * ordering the rest of the app sees: the result becomes the screen, and only
+     * then does the next statement start.
+     */
+    private function pumpQuery(): void
+    {
+        if (!$this->state->queryRunning || !$this->database->asyncReady()) {
+            return;
+        }
+
+        // null means the answer is still arriving: a result set is taken across
+        // frames rather than in one blocking read, so that a query which starts
+        // replying at once and then streams keeps the clock counting, the
+        // spinner turning and Esc live for the whole transfer.
+        $result = $this->database->asyncReap();
+        if ($result === null) {
+            return;
+        }
+
+        $cancelled = $this->state->queryCancelling;
+        $this->state->queryRunning    = false;
+        $this->state->queryCancelling = false;
+
+        // Split the wall clock the user feels into the two halves that have
+        // different causes: `db` is the server plus the transfer, `paint` is this
+        // app turning the rows into a frame. "The query got slower" is not
+        // actionable until it says which half grew.
+        $reaped = microtime(true);
+        $this->applyResult($result, $cancelled);
+        my::lineout(
+            'FILE:FILE',
+            'query done rows', (string) $result->rowCount(),
+            'db', sprintf('%.3fs', $reaped - $this->state->queryStarted),
+            'paint', sprintf('%.3fs', microtime(true) - $reaped),
+            'cancelled', $cancelled ? 'yes' : 'no',
+        );
+
+        // A cancel stops the whole submission, not just the statement that was
+        // running. This holds even when the query beat the kill and came back
+        // clean: the user asked for the work to stop, and the statements after
+        // it were written expecting a state this one may not have reached.
+        if ($cancelled) {
+            $this->abandonBatch();
+            return;
+        }
+
+        $this->batchStop = '';
+        if ($this->continueBatch()) {
+            $this->runBatch();
+        }
+    }
+
+    /**
+     * Esc while a statement is running: ask the server to stop it (§21).
+     *
+     * The cancel is a *request*. What actually ends the statement is the server
+     * noticing, and what the user sees is whatever {@see pumpQuery()} reaps next
+     * — normally 1317, but a query that finished in the gap returns its rows and
+     * is not an error. So this sets a flag and returns; it never fabricates an
+     * outcome, and it never touches the result.
+     *
+     * A failed cancel leaves the query running and says so, because the honest
+     * alternative — clearing the notice — would claim something that did not
+     * happen and leave the loop waiting on a statement nothing is watching.
+     */
+    private function cancelQuery(): void
+    {
+        if (!$this->state->queryRunning || $this->state->queryCancelling) {
+            return;
+        }
+        $problem = $this->database->cancelAsync();
+        if ($problem !== null) {
+            $this->state->statusLine = 'Could not cancel: ' . $problem;
+            $this->state->statusIsError = true;
+            my::lineout('FILE:FILE', 'cancel failed', $problem);
+            return;
+        }
+        $this->state->queryCancelling = true;
+    }
+
+    private function resetBatch(): void
+    {
+        $this->batchQueue = [];
+        $this->batchTotal = 0;
+        $this->batchDone  = 0;
+        $this->batchStop  = '';
     }
 
     private function execute(string $sql, bool $vertical = false, bool $confirmedDangerous = false): void
     {
+        // Taken before anything can return early: a marker left lying around
+        // would turn up behind some later, unrelated statement's answer.
+        $resent = $this->resentStatement;
+        $this->resentStatement = false;
         if ($sql === '') {
             return;
         }
@@ -4277,12 +8375,22 @@ final class App
         $star = $this->normalizer->expandMixedStar($sql, fn (string $t): array => $this->resolveColumns($t));
         $sql = $star->sql;
 
-        $notes = array_filter([$norm->changed ? $norm->note : '', $star->changed ? $star->note : '']);
+        // The macro note is taken (and cleared) rather than read: it belongs
+        // to the submission, so a batch that came out of one expansion says it
+        // once, on the first statement, not on every one of them (§23).
+        $tplNote = $this->macroNote;
+        $this->macroNote = '';
 
-        $first = strtoupper(preg_split('/\s+/', $sql, 2)[0] ?? '');
+        $notes = array_filter([$tplNote, $norm->changed ? $norm->note : '', $star->changed ? $star->note : '']);
+
+        // The command this statement actually performs — read past any leading
+        // comment and past a CTE list, because both used to hide the verb from
+        // these guards (§5).
+        $first = Splitter::commandKeyword($sql);
         if ($this->state->readOnly && in_array($first, self::MODIFYING, true)) {
             $this->state->statusLine = '[RO] Read-only mode — ' . $first . ' is blocked';
             $this->state->statusIsError = true;
+            $this->batchStop = 'blocked';
             return;
         }
 
@@ -4292,7 +8400,7 @@ final class App
         // prompt. We hold the *original typed* form so the confirmed re-run
         // normalizes identically and history stays faithful.
         if (!$confirmedDangerous && in_array($first, self::MODIFYING, true)) {
-            $message = $this->dangerCheck($sql, $first);
+            $message = $this->dangerCheck($sql, $first, $this->batchTotal > 1);
             if ($message !== null) {
                 $this->pendingDangerous = ['sql' => $original, 'vertical' => $vertical];
                 $this->openConfirm(
@@ -4300,6 +8408,7 @@ final class App
                     $message,
                     [['Y', 'Run anyway'], ['N', 'Cancel']],
                 );
+                $this->batchStop = 'confirm';
                 return;
             }
         }
@@ -4310,11 +8419,131 @@ final class App
         // untouched below, so plain Up/Down shows exactly what the user typed.
         $autoLimited = false;
         $sql = $this->applyAutoLimit($sql, $first, $autoLimited);
-        if ($autoLimited) {
-            $notes[] = 'auto-limited to ' . self::AUTO_LIMIT . ' rows';
+
+        // Everything the second half needs, parked where the frame loop can find
+        // it: on the async path the result arrives some number of frames from
+        // now, and by then $sql, $notes and the rest are long out of scope.
+        $this->queryContext = [
+            'sql'      => $sql,
+            'first'    => $first,
+            'original' => $original,
+            'notes'    => $notes,
+            'vertical' => $vertical,
+            'capped'   => $autoLimited,
+            // Kept so a re-send can repeat the answer the user already gave to
+            // the dangerous-query confirm: being asked twice about one DELETE
+            // because the connection died is the friction this removes.
+            'confirmed' => $confirmedDangerous,
+            // Carried rather than read off the property at the far end: on the
+            // async path applyResult() runs frames later, by which time a second
+            // statement may already have taken the property for itself.
+            'resent'    => $resent,
+        ];
+
+        // A connection the server dropped is reopened here, in front of the
+        // user: the header has said SERVER DISCONNECTED since the loss, and this
+        // is the moment it says RECONNECTING instead, on the same line, before
+        // the statement goes anywhere.
+        //
+        // Nothing is replayed. The statement that met the dead socket was
+        // reported as an error when it failed; this is the user asking for
+        // something new, and it is the *new* one that goes out on a live
+        // session. That is what keeps this compatible with §21's refusal to
+        // retry an async statement — there is no retry here to be unsafe.
+        if ($this->database->isLost()) {
+            $this->state->linkState = State::LINK_RELINKING;
+            $this->flushFrame();
+            $problem = $this->database->reconnect();
+            $this->state->linkState = $this->database->isLost()
+                ? State::LINK_LOST
+                : State::LINK_OK;
+            if ($problem !== null) {
+                $this->applyResult(QueryResult::fromError('could not reconnect: ' . $problem));
+                return;
+            }
         }
 
-        $result = $this->database->query($sql);
+        // The cancellable path (§21): send the statement, suspend the batch, and
+        // let the loop keep drawing. `startAsync()` only returns a result when
+        // the statement could not be *sent*, which has nothing to wait for.
+        if ($this->database->supportsCancel()) {
+            $sendFailure = $this->database->startAsync($sql);
+            if ($sendFailure === null) {
+                $this->state->queryRunning    = true;
+                $this->state->queryStarted    = microtime(true);
+                $this->state->queryCancelling = false;
+                $this->batchStop              = 'async';
+                return;
+            }
+            $this->applyResult($sendFailure);
+            return;
+        }
+
+        // No mysqli on this build, so the query blocks and nothing can be done
+        // about it. Cover it with the inline busy notice — painted and flushed
+        // before query() runs, then cleared after — exactly as sqli did before
+        // the async path existed.
+        $result = $this->withBusy(
+            'Running query …',
+            fn () => $this->database->query($sql),
+        );
+        $this->applyResult($result);
+    }
+
+    /**
+     * The second half of {@see execute()}: take a finished statement's result
+     * and make it the screen.
+     *
+     * Split out because on the cancellable path these two halves are separated
+     * by an unbounded number of frames. Everything below reads
+     * {@see $queryContext} rather than parameters for the same reason — the
+     * caller that started the statement returned long ago.
+     */
+    private function applyResult(QueryResult $result, bool $cancelled = false): void
+    {
+        $sql      = (string) $this->queryContext['sql'];
+        $first    = (string) $this->queryContext['first'];
+        $original = (string) $this->queryContext['original'];
+        $vertical = (bool) $this->queryContext['vertical'];
+        $capped   = (bool) ($this->queryContext['capped'] ?? false);
+        $confirmed = (bool) ($this->queryContext['confirmed'] ?? false);
+        $resent    = (bool) ($this->queryContext['resent'] ?? false);
+        /** @var list<string> $notes */
+        $notes = $this->queryContext['notes'];
+
+        // What is to be done about a dead connection is settled *here*, before
+        // the result becomes the screen, because for one of the three answers
+        // the screen must not change at all (§2).
+        //
+        // The statement is about to go back out and land in a few hundred
+        // milliseconds. Applying this result first would blank the grid, drop
+        // the sort, the hidden columns and the column layout, clear the marks
+        // and reset the scroll — and then do the whole lot again when the rows
+        // arrive. A loss handled for the user that costs them their place in the
+        // data is not a loss handled for the user.
+        $loss = (!$cancelled && $result->hasError() && $this->database->isLost())
+            ? $this->scheduleResend($original, $first, $vertical, $confirmed)
+            : '';
+        if ($loss === self::RESEND_AUTO) {
+            // Everything on screen stays as it was: the previous rows, the
+            // previous status line, the previous everything. The red `!db` on
+            // the header — armed by the frame loop the moment the link went bad
+            // — is the only thing that changes, and the answer that arrives in a
+            // moment carries RESENT_NOTE behind its row count.
+            //
+            // The CLI is still cleared and the text still pushed to history, on
+            // the same terms as any other statement: the user pressed Enter and
+            // their statement is on its way, which is exactly what the input
+            // clearing means. The *executed*-SQL history is deliberately not
+            // written here — one Enter, one entry, and the re-send writes it.
+            if ($this->batchTotal <= 1) {
+                $this->pushHistory($this->submitTyped ?? $original);
+            }
+            $this->input->clear();
+            $this->resetHistoryNav();
+            return;
+        }
+
         $this->state->result = $result;
         // A new result reshapes the whole grid (row count, gutter width, column
         // set). Force a full repaint so nothing from the previous result can
@@ -4329,7 +8558,6 @@ final class App
         // A fresh result clears transient overlays and sort, and sets the
         // output mode (\G → vertical, §5).
         $this->state->detail = false;
-        $this->state->columnPopup = false;
         $this->state->layoutPopup = false;
         $this->state->sortCol = null;
         $this->state->sortDir = 'asc';
@@ -4350,20 +8578,17 @@ final class App
         $this->state->moveMode = false;
         $this->moveSavedOrder = null;
         $this->state->pending = [];
+        // Marks address raw row indices *into the result being replaced*, so they
+        // cannot survive it - including the reload a delete itself triggers (§22).
+        $this->state->deleteMarks = [];
+        $this->state->markMode = false;
 
-        // Restore saved per-table layout (widths, hidden columns) for this query.
-        $this->state->currentTable = $this->extractTableFromSql($sql);
-        $db = $this->database->currentDatabase();
-        if ($this->state->currentTable !== '' && $db !== '') {
-            $this->state->colWidthOverride = $this->settings->getColWidths($db, $this->state->currentTable);
-            $this->state->hiddenCols = $this->settings->getHiddenCols($db, $this->state->currentTable);
-            $this->state->colOrder = $this->settings->getColOrder($db, $this->state->currentTable);
-        } else {
-            $this->state->colWidthOverride = [];
-            $this->state->hiddenCols = [];
-            $this->state->colOrder = [];
-        }
+        // Restore the saved per-table layout for this query (§6).
+        $this->applySavedLayout($sql);
+        $this->applyDdFormats();
         $this->state->applySort();
+        // This view now has something in it, so its tab stops reading as empty (§20).
+        $this->refreshTabLabel();
 
         // Track USE so the connection label reflects the active database.
         if ($first === 'USE' && !$result->hasError()
@@ -4375,22 +8600,84 @@ final class App
             // DD is per-database too (§11); drop the old one and let it lazy-load
             // for the new db the next time a DD feature is opened.
             $this->dictionary = null;
+            $this->ddLoadAttempted = false; // let the new db attempt its own lazy load
             $this->ddDiffCache = [];
         }
 
-        if ($result->hasError()) {
+        // The cap only counts as applied if the result actually came back holding
+        // it (§5). Appending `LIMIT 1000` to a query that returns four rows
+        // changed nothing worth telling the user, and announcing it there cost
+        // them the one number they asked for — the row count. Zero means the
+        // status line shows the plain row/col/time stats, which already say how
+        // many rows came back; non-zero adds "auto-limited" as a qualifier on
+        // that count rather than in place of it.
+        $this->state->autoLimitedAt =
+            ($capped && !$result->hasError() && $result->rowCount() >= self::AUTO_LIMIT)
+                ? self::AUTO_LIMIT
+                : 0;
+        // A rewrite note owns the status line, and the count is exactly what it
+        // used to displace (§5). So the note is a *prefix* to the stats rather
+        // than a replacement for them — the line still says what the rewrite did,
+        // and still ends with how many rows came back. Same string the renderer
+        // draws when nothing claims the line, cap marker included.
+        if (($notes !== [] || $resent) && !$result->hasError() && $result->isSelect) {
+            $notes[] = Renderer::resultStats($result, $this->state->autoLimitedAt);
+        }
+        // Behind the count, never in front of it. `$resent` is enough on its own
+        // to claim the line above, because a marker that displaced the row count
+        // would be the second time this project traded the one number the user
+        // asked for against a note about how it got here (§5).
+        if ($resent && !$result->hasError()) {
+            $notes[] = self::RESENT_NOTE;
+        }
+
+        if ($cancelled && str_starts_with((string) $result->error, '[' . self::INTERRUPTED . ']')) {
+            // The user asked for this, so it is not an error and is not coloured
+            // like one. Matched on the code rather than the text because the
+            // message is the server's and is localised on some builds; anything
+            // *else* that failed while a cancel was in flight is a real error and
+            // falls through to say so.
+            $this->state->statusLine = 'Cancelled after ' . number_format($result->elapsed, 1) . 's';
+            $this->state->statusIsError = false;
+        } elseif ($result->hasError()) {
             $this->state->statusLine = 'Error: ' . (string) $result->error;
             $this->state->statusIsError = true;
+            // The two losses that reach this line are the two that need a
+            // decision from the user: a write the server may already have run,
+            // and a server that is not answering at all. Neither can be reduced
+            // to a marker on the header — an UPDATE that may or may not have
+            // committed is not something to find out about later — so these keep
+            // every word they had. The silent third answer returned above (§2).
+            if ($loss !== '') {
+                $this->state->statusLine .= ' · ' . self::lossNotice($loss);
+            }
         } else {
+            // A result that came back is a connection that works: the next loss
+            // gets its own automatic attempt.
+            $this->resendUsed = false;
             // Surface the normalization note(s) when a rewrite happened (§5);
             // otherwise leave it blank so the row/col/time stats show.
             $this->state->statusLine = implode(' · ', $notes);
             $this->state->statusIsError = false;
         }
 
-        $this->pushHistory($original);
+        // A delete re-runs the SELECT behind the grid, and the reload's own status
+        // line would otherwise be the last word on screen - so the count the user
+        // actually asked about leads, and is consumed on the way out (§22).
+        if ($this->deleteNote !== '') {
+            $this->state->statusLine = $this->deleteNote
+                . ($this->state->statusIsError ? ' · ' . $this->state->statusLine : ' — view refreshed');
+            $this->deleteNote = '';
+        }
+
+        // A multi-statement submit pushed the whole typed text once, up front;
+        // pushing each piece here as well would bury it. The executed-SQL history
+        // still records every statement — that is the one that should be granular.
+        if ($this->batchTotal <= 1) {
+            $this->pushHistory($this->submitTyped ?? $original);
+        }
         $this->pushExecHistory($sql);
-        $this->input->clearAll();
+        $this->input->clear();
         $this->resetHistoryNav();
     }
 
@@ -4420,7 +8707,7 @@ final class App
 
     private function pushHistory(string $sql): void
     {
-        $first = strtoupper(preg_split('/\s+/', $sql, 2)[0] ?? '');
+        $first = Splitter::commandKeyword($sql);
         $entry = in_array($first, self::MODIFYING, true) ? '{safety} ' . $sql : $sql;
 
         $h = $this->state->history;
@@ -4438,11 +8725,11 @@ final class App
             return;
         }
         if ($this->historyIdx === count($this->state->history)) {
-            $this->historySaved = $this->input->combinedText();
+            $this->historySaved = $this->cliText();
         }
         if ($this->historyIdx > 0) {
             $this->historyIdx--;
-            $this->input->setSingle($this->state->history[$this->historyIdx]);
+            $this->input->setText($this->state->history[$this->historyIdx]);
         }
     }
 
@@ -4453,9 +8740,9 @@ final class App
         }
         $this->historyIdx++;
         if ($this->historyIdx === count($this->state->history)) {
-            $this->input->setSingle($this->historySaved);
+            $this->input->setText($this->historySaved);
         } else {
-            $this->input->setSingle($this->state->history[$this->historyIdx]);
+            $this->input->setText($this->state->history[$this->historyIdx]);
         }
     }
 
@@ -4490,11 +8777,11 @@ final class App
             return;
         }
         if ($this->execHistoryIdx === count($this->state->execHistory)) {
-            $this->execHistorySaved = $this->input->combinedText();
+            $this->execHistorySaved = $this->cliText();
         }
         if ($this->execHistoryIdx > 0) {
             $this->execHistoryIdx--;
-            $this->input->setSingle($this->state->execHistory[$this->execHistoryIdx]);
+            $this->input->setText($this->state->execHistory[$this->execHistoryIdx]);
         }
     }
 
@@ -4505,9 +8792,9 @@ final class App
         }
         $this->execHistoryIdx++;
         if ($this->execHistoryIdx === count($this->state->execHistory)) {
-            $this->input->setSingle($this->execHistorySaved);
+            $this->input->setText($this->execHistorySaved);
         } else {
-            $this->input->setSingle($this->state->execHistory[$this->execHistoryIdx]);
+            $this->input->setText($this->state->execHistory[$this->execHistoryIdx]);
         }
     }
 }

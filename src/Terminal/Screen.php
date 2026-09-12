@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Sqli2\Terminal;
+namespace Sqli\Terminal;
 
 /**
  * Double-buffered character grid with differential flushing.
@@ -27,11 +27,26 @@ final class Screen
     /** @var Cell[][] indexed [y][x] — being drawn for the next frame */
     private array $back = [];
 
+    /**
+     * Style painted into every blank cell by {@see clear()}. Defaults to the
+     * terminal default; the renderer sets it to the theme's background (Base16
+     * base00) so unwritten areas carry the scheme's ground instead of the
+     * terminal's — essential for light themes on a dark terminal, and vice-versa.
+     */
+    private Style $background;
+
     public function __construct(
         private int $width,
         private int $height,
     ) {
+        $this->background = Style::default();
         $this->allocate();
+    }
+
+    /** Set the fill style for blank cells (see {@see $background}). */
+    public function setBackground(Style $style): void
+    {
+        $this->background = $style;
     }
 
     public function width(): int
@@ -59,7 +74,7 @@ final class Screen
     {
         for ($y = 0; $y < $this->height; $y++) {
             for ($x = 0; $x < $this->width; $x++) {
-                $this->back[$y][$x]->reset();
+                $this->back[$y][$x]->set(' ', $this->background);
             }
         }
     }

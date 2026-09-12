@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Sqli2\Terminal;
+namespace Sqli\Terminal;
 
 use includes\my;
 
@@ -16,6 +16,21 @@ use includes\my;
  */
 final class Terminal
 {
+    /**
+     * How long to keep retrying a refused write before giving up on the rest of
+     * the buffer. A *time* budget rather than an attempt count on purpose:
+     * usleep() only guarantees a lower bound, and on Windows it routinely
+     * overshoots by 10ms+, so "100 attempts 1ms apart" measured 1.5 seconds — a
+     * visible freeze per dropped frame. A deadline costs the same 50ms whatever
+     * the scheduler does.
+     *
+     * 50ms is chosen to outlast ordinary congestion while keeping a wedged
+     * terminal at roughly 20 frames a second instead of stopped. Dropping a frame
+     * is cheap because the next one repaints in full (see App::draw()).
+     */
+    private const WRITE_STALL_BUDGET_S = 0.05;
+    private const WRITE_STALL_SLEEP_US = 200;
+
     /** @var resource */
     private $stdout;
     /** @var resource */
@@ -23,9 +38,26 @@ final class Terminal
 
     private InputReader $input;
     private ?WindowsConsole $win = null;
+    private ?PosixTty $posix = null;
     private ?string $sttyOriginal = null;
     private bool $open = false;
     private bool $lastMeasureFromReport = false;
+    /** True once open() has confirmed stdin really went non-blocking. */
+    private bool $stdinNonBlocking = false;
+    /** A DSR report has been asked for and not yet collected. */
+    private bool $dsrOutstanding = false;
+    /** Lifetime count of DSR size requests written. Diagnostics only. */
+    private int $dsrRequests = 0;
+    /**
+     * Last size a platform API returned. Kept so one failed call cannot change
+     * which sizing strategy the app is using.
+     * @var array{0:int,1:int}|null
+     */
+    private ?array $lastPlatformSize = null;
+    /** How many times a platform call returned nothing after one had worked. */
+    private int $platformMisses = 0;
+    /** Writes that gave up with bytes unsent. Never silently zero — see write(). */
+    private int $writeDrops = 0;
 
     public function __construct()
     {
@@ -39,6 +71,15 @@ final class Terminal
             } catch (\Throwable $e) {
                 my::lineout('FILE:FILE', 'WindowsConsole init failed', $e->getMessage());
                 $this->win = null;
+            }
+        }
+
+        if (PosixTty::isSupported()) {
+            try {
+                $this->posix = new PosixTty();
+            } catch (\Throwable $e) {
+                my::lineout('FILE:FILE', 'PosixTty init failed', $e->getMessage());
+                $this->posix = null;
             }
         }
 
@@ -60,6 +101,24 @@ final class Terminal
             // Drains non-character records (resize/focus/key-up) and reports
             // whether real key/mouse bytes are waiting, so the read never wedges.
             $this->input->setReadableProbe(static fn (): ?bool => $win->readableForBytes());
+        } elseif (PHP_OS_FAMILY !== 'Windows') {
+            // POSIX gets a probe too, and for a stronger reason than efficiency:
+            // it makes it *impossible* to enter a read with nothing to read. The
+            // loop must never depend on input arriving to turn — a frame has a
+            // query to collect, a resize to apply and a clock to advance whether
+            // or not anyone is typing. `stream_set_blocking(false)` is supposed to
+            // guarantee that on its own, and measured on a pty it does; this costs
+            // ~0.04ms a frame to stop the guarantee being load-bearing.
+            $stdin = $this->stdin;
+            $this->input->setReadableProbe(static function () use ($stdin): ?bool {
+                $read = [$stdin];
+                $write = null;
+                $except = null;
+                $ready = @stream_select($read, $write, $except, 0, 0);
+                // false = select itself failed: say "don't know" and let the
+                // reader do what it did before.
+                return $ready === false ? null : $ready > 0;
+            });
         }
     }
 
@@ -69,13 +128,52 @@ final class Terminal
     }
 
     /**
-     * True when a window-resize event arrived since the last call (Windows console
-     * only). Lets the loop repaint the instant the window changes rather than
-     * waiting for the periodic size poll. Always false without an FFI console.
+     * True when a window-resize event arrived since the last call — a console
+     * record on Windows, a SIGWINCH on POSIX. Lets the loop repaint the instant
+     * the window changes rather than waiting for the periodic size poll. Always
+     * false where neither is available.
      */
     public function takeResizeSignal(): bool
     {
-        return $this->win?->takeResizePending() ?? false;
+        $win = $this->win?->takeResizePending() ?? false;
+        $posix = $this->posix?->takeResizeSignal() ?? false;
+        return $win || $posix;
+    }
+
+    /**
+     * True when stdin is genuinely non-blocking, so a read that finds no bytes
+     * returns instead of parking. This is what decides whether the DSR resize
+     * path may be throttled: where the read can block, the DSR reply is the only
+     * thing that wakes an idle loop and the request must not be suppressed.
+     * False until open() has actually tried it.
+     */
+    public function stdinIsNonBlocking(): bool
+    {
+        return $this->stdinNonBlocking;
+    }
+
+    /**
+     * One line describing how this process is sizing itself, for the debug log:
+     * which API answers, what it currently says, whether stdin really went
+     * non-blocking, and how many DSR requests have gone out since start. Read
+     * together with the frame rate it is logged beside, this separates "the loop
+     * stopped" from "the loop is fine but the size is wrong".
+     */
+    public function diagnostics(): string
+    {
+        $platform = $this->platformSize();
+        // The tty name is what lets two windows be told apart in one shared log.
+        $tty = function_exists('posix_ttyname') ? @posix_ttyname($this->stdout) : false;
+        return sprintf(
+            'tty=%s api=%s platform=%s nonblock=%s dsrSent=%d misses=%d drops=%d',
+            is_string($tty) ? $tty : '?',
+            $this->win !== null ? 'wincon' : ($this->posix !== null ? 'ioctl' : 'none'),
+            $platform === null ? 'none' : $platform[0] . 'x' . $platform[1],
+            $this->stdinNonBlocking ? 'yes' : 'no',
+            $this->dsrRequests,
+            $this->platformMisses,
+            $this->writeDrops,
+        );
     }
 
     /** Diagnostic: pending console input records, or null when unavailable. */
@@ -91,11 +189,13 @@ final class Terminal
             return;
         }
         $this->enableRawMode();
-        stream_set_blocking($this->stdin, false);
+        // Windows consoles and pipes refuse non-blocking mode; POSIX ttys accept
+        // it. The answer decides the resize strategy, so keep it.
+        $this->stdinNonBlocking = @stream_set_blocking($this->stdin, false);
         // Keep stdout blocking so write() can rely on fwrite making progress
         // (no busy-spin) when it loops to defeat short writes.
         stream_set_blocking($this->stdout, true);
-        $this->write(Ansi::ALT_SCREEN_ON . Ansi::AUTOWRAP_OFF . Ansi::CURSOR_HIDE . Ansi::MOUSE_ON . Ansi::CLEAR_SCREEN);
+        $this->write(Ansi::ALT_SCREEN_ON . Ansi::AUTOWRAP_OFF . Ansi::CURSOR_HIDE . Ansi::MOUSE_ON . Ansi::BRACKETED_PASTE_ON . Ansi::CLEAR_SCREEN);
         $this->open = true;
     }
 
@@ -110,8 +210,9 @@ final class Terminal
         // its `\e[row;colR` reply, if it lands after the terminal is restored,
         // echoes onto the bare command line as stray "...R" characters.
         $this->drainPendingInput();
-        $this->write(Ansi::MOUSE_OFF . Ansi::CURSOR_SHOW . Ansi::AUTOWRAP_ON . Ansi::ALT_SCREEN_OFF . Ansi::RESET);
+        $this->write(Ansi::BRACKETED_PASTE_OFF . Ansi::MOUSE_OFF . Ansi::CURSOR_SHOW . Ansi::AUTOWRAP_ON . Ansi::ALT_SCREEN_OFF . Ansi::RESET);
         $this->disableRawMode();
+        $this->posix?->restore();
         $this->open = false;
     }
 
@@ -124,23 +225,26 @@ final class Terminal
      */
     private function drainPendingInput(): void
     {
-        if ($this->win !== null) {
+        // Nothing was solicited, so nothing can be in flight — and on the ioctl
+        // path that is the normal case. Waiting here would just add 0.12s to
+        // every exit.
+        if ($this->win !== null || !$this->dsrOutstanding) {
             return;
         }
         $deadline = microtime(true) + 0.12;
         while (microtime(true) < $deadline) {
             $this->input->poll(); // ingest + decode (events discarded on exit)
-            if ($this->input->takeSizeReport() !== null) {
+            if ($this->takeSizeReport() !== null) {
                 return; // the outstanding DSR reply is now consumed
             }
             usleep(4000);
         }
     }
 
-    public function write(string $bytes): void
+    public function write(string $bytes): bool
     {
         if ($bytes === '') {
-            return;
+            return true;
         }
         // fwrite can write fewer bytes than requested (a "short write") on a
         // large buffer — common writing to a PTY, and guaranteed if stdout is
@@ -148,19 +252,45 @@ final class Terminal
         // because Screen::flush() emits top-to-bottom that tail is the *bottom*
         // rows (input line + status). A big full repaint (e.g. a large result
         // after a query) therefore left the CLI/status stale until the next full
-        // repaint. Loop until everything is on the wire.
+        // repaint. So the loop below keeps pushing until everything is on the wire.
+        //
+        // **But the loop must be able to give up.** It used to `continue` forever
+        // on a false/0 return, on the assumption that such a return always meant
+        // "would block". It does not: a PTY write can fail hard, and under WSL a
+        // congested one returns **EIO**. The old loop then spun on a write that
+        // could never succeed — and because `log_errors` is on, every failed
+        // attempt wrote a PHP notice to `php_errors.log`, which on a Windows drive
+        // seen from WSL costs milliseconds *per notice*. `php_errors.log` recorded
+        // 111 of them inside one second. That spin is the frozen app, the slow
+        // query and the half-painted screen, all three.
         $len = strlen($bytes);
         $written = 0;
+        $deadline = null;
         while ($written < $len) {
-            $n = fwrite($this->stdout, substr($bytes, $written));
+            // Suppressed: a retryable stall is normal and must not be able to
+            // storm the error log. A give-up is reported once, below, instead.
+            $n = @fwrite($this->stdout, substr($bytes, $written));
             if ($n === false || $n === 0) {
-                // Pipe full / would block: drain it and retry rather than drop.
-                fflush($this->stdout);
+                // The clock starts at the first refusal, so a write that never
+                // stalls never reads it.
+                $deadline ??= microtime(true) + self::WRITE_STALL_BUDGET_S;
+                if (microtime(true) > $deadline) {
+                    $this->writeDrops++;
+                    my::lineout('FILE:FILE', 'terminal write dropped bytes',
+                        (string) ($len - $written), 'of', (string) $len);
+                    return false;
+                }
+                // Give the terminal time to drain instead of hammering it. A hot
+                // retry loop is itself back-pressure on the thing we are waiting
+                // for.
+                usleep(self::WRITE_STALL_SLEEP_US);
                 continue;
             }
+            $deadline = null;
             $written += $n;
         }
-        fflush($this->stdout);
+        @fflush($this->stdout);
+        return true;
     }
 
     /**
@@ -172,6 +302,24 @@ final class Terminal
     public function requestSizeReport(): void
     {
         $this->write(Ansi::moveToExtreme() . Ansi::REPORT_CURSOR);
+        $this->dsrOutstanding = true;
+        $this->dsrRequests++;
+    }
+
+    /**
+     * Collect a DSR reply, if one has been decoded. Goes through the Terminal
+     * rather than the reader directly so the in-flight bookkeeping stays honest
+     * — close() uses it to decide whether a reply is still owed.
+     *
+     * @return array{0:int,1:int}|null
+     */
+    public function takeSizeReport(): ?array
+    {
+        $report = $this->input->takeSizeReport();
+        if ($report !== null) {
+            $this->dsrOutstanding = false;
+        }
+        return $report;
     }
 
     /**
@@ -190,7 +338,7 @@ final class Terminal
         $deadline = microtime(true) + 0.15;
         while (microtime(true) < $deadline) {
             $this->input->poll(); // ingest bytes so the reader can decode the reply
-            $r = $this->input->takeSizeReport();
+            $r = $this->takeSizeReport();
             if ($r !== null) {
                 $this->lastMeasureFromReport = true;
                 return $r;
@@ -207,15 +355,47 @@ final class Terminal
     }
 
     /**
-     * True when a platform API (Windows FFI srWindow) can report the visible
-     * window size directly. When this holds, the FFI size is authoritative for
-     * both grow and shrink and should be preferred over the DSR cursor-clamp,
-     * which under-reports height right after the window grows (the alt-screen
-     * buffer lags the window, stranding the CLI at the old bottom row).
+     * True when a platform API can report the visible window size directly:
+     * the Windows FFI srWindow, or ioctl(TIOCGWINSZ) on POSIX. When this holds
+     * the platform size is authoritative for both grow and shrink and should be
+     * preferred over the DSR cursor-clamp, which under-reports height right
+     * after the window grows (the alt-screen buffer lags the window, stranding
+     * the CLI at the old bottom row).
+     *
+     * It also costs nothing on the wire, which is the other half of the point:
+     * the DSR alternative spends a terminal round-trip every frame for as long
+     * as sqli is open.
      */
     public function hasPlatformSize(): bool
     {
-        return $this->win !== null && $this->win->size() !== null;
+        return $this->platformSize() !== null;
+    }
+
+    /**
+     * The platform's own answer for the viewport, or null when neither API is
+     * available (a pipe, or a POSIX build without FFI).
+     *
+     * @return array{0:int,1:int}|null [width, height] in cells.
+     */
+    private function platformSize(): ?array
+    {
+        $size = $this->win?->size() ?? $this->posix?->size();
+        if ($size !== null) {
+            $this->lastPlatformSize = $size;
+            return $size;
+        }
+
+        // A platform API that has answered before and now does not (an ioctl
+        // interrupted by a signal, say) must NOT be read as "this build has no
+        // platform size". That would drop the caller into the DSR path for a
+        // frame, and the two disagree about height on the alternate screen — so
+        // the app would alternate between two sizes, paying a full invalidate and
+        // a RESIZE_SETTLE window on every flip. Keeping the last good answer makes
+        // a missed call a no-op instead of a strategy change.
+        if ($this->lastPlatformSize !== null) {
+            $this->platformMisses++;
+        }
+        return $this->lastPlatformSize;
     }
 
     /**
@@ -223,11 +403,11 @@ final class Terminal
      */
     public function size(): array
     {
-        if ($this->win !== null) {
-            $size = $this->win->size();
-            if ($size !== null) {
-                return $size;
-            }
+        // The platform APIs come first: both read the live window, so neither
+        // can go stale the way an inherited $COLUMNS does.
+        $size = $this->platformSize();
+        if ($size !== null) {
+            return $size;
         }
 
         $cols = (int) getenv('COLUMNS');

@@ -1,0 +1,30 @@
+{
+    "_comment": "Example sqli per-column display settings. The live file is .sqli/sqli_formatting.json (written by the app, safe to hand-edit; gitignore it). Shape: databases > <host:port/db> > tables > <table> > { hidden:[cols], order:[cols], widths:{col:width}, formats:{col:formatId} }. The key is the whole connection, not just the database name — 'devel' on two servers are two different databases and keep separate entries. A socket connection keys as <socket-path/db>. Delete any key to reset it. Validate with `php sqli.php --lint`.",
+    "databases": {
+        "10.0.0.5:3306/devel": {
+            "tables": {
+                "users": {
+                    "widths": {
+                        "id": 5,
+                        "username": 29,
+                        "email": 29
+                    },
+                    "order": ["id", "username", "email", "enabled"],
+                    "hidden": ["saml_uid"],
+                    "formats": {
+                        "lastactivity": "epoch"
+                    }
+                }
+            }
+        },
+        "/tmp/mysql.sock/devel": {
+            "tables": {
+                "users": {
+                    "widths": {
+                        "id": 4
+                    }
+                }
+            }
+        }
+    }
+}

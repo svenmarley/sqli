@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Sqli2\Sql;
+namespace Sqli\Sql;
 
 /**
  * Rewrites sqli's input conveniences into standard SQL before execution (§5).
@@ -81,7 +81,7 @@ final class Normalizer
         if (preg_match('/^\s*SELECT\s+(.*?)\s+FROM\s+(.*)$/is', $sql, $m) !== 1) {
             return new NormalizeResult($sql);
         }
-        $fields = $this->splitTopLevel($m[1]);
+        $fields = self::splitTopLevel($m[1]);
         $afterFrom = $m[2];
 
         $starIdx = [];
@@ -141,12 +141,51 @@ final class Normalizer
     }
 
     /**
+     * True when a SELECT names its own field list — anything after `SELECT`
+     * other than a lone `*` (or a lone `t.*`).
+     *
+     * The point of the question is the data view's saved per-table layout (§6).
+     * A user who types `SELECT name, id FROM users` has *already* answered
+     * "which columns, in what order" — the server hands them back exactly as
+     * listed — so restoring a stored column order over that would reorder the
+     * answer they just asked for, and a stored hidden set would drop a column
+     * they named explicitly. `SELECT *` asks no such question and keeps the
+     * saved arrangement.
+     *
+     * Anything that is not a SELECT with a FROM (SHOW, DESCRIBE, a bare
+     * `SELECT 1`) is false: there is no field list to honour.
+     */
+    public static function namesColumns(string $sql): bool
+    {
+        $stripped = Splitter::stripComments($sql);
+        // Lazy up to the first FROM: a field list containing a subquery stops
+        // early and yields a partial list, which is harmless here — the answer
+        // is "more than one field", and it already was.
+        if (preg_match('/^\s*SELECT\s+(?:(?:ALL|DISTINCTROW|DISTINCT|SQL_NO_CACHE|SQL_CALC_FOUND_ROWS|HIGH_PRIORITY|STRAIGHT_JOIN)\s+)*(.*?)\s*\bFROM\b/is', $stripped, $m) !== 1) {
+            return false;
+        }
+        $fields = [];
+        foreach (self::splitTopLevel($m[1]) as $f) {
+            $f = trim($f);
+            if ($f !== '') {
+                $fields[] = $f;
+            }
+        }
+        if ($fields === []) {
+            return false;
+        }
+        // `*` and `users.*` are the two spellings of "whatever the table has".
+        return count($fields) > 1
+            || preg_match('/^(?:`?[A-Za-z0-9_$]+`?\.)?\*$/', $fields[0]) !== 1;
+    }
+
+    /**
      * Split a comma list at top level only (ignoring commas inside parentheses
      * or quotes). Byte-wise is safe: the delimiters are all ASCII.
      *
      * @return list<string>
      */
-    private function splitTopLevel(string $list): array
+    private static function splitTopLevel(string $list): array
     {
         $parts = [];
         $buf = '';

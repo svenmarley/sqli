@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Sqli2\Db;
+namespace Sqli\Db;
 
 /**
  * Lazy, cached view of the live schema (table names and per-table columns).
@@ -20,6 +20,10 @@ final class Schema
     private array $describe = [];
     /** @var array<string,array<string,array{table:string,column:string}>> table => col => FK ref */
     private array $foreignKeys = [];
+    /** @var list<string>|null database names on this server */
+    private ?array $databases = null;
+    /** @var list<string>|null stored routine names in the current database */
+    private ?array $procedures = null;
 
     public function __construct(
         private readonly Database $database,
@@ -199,6 +203,60 @@ final class Schema
         return $out;
     }
 
+    /**
+     * Database names on this server, for the completion contexts whose next
+     * identifier is a database rather than a table (`USE`, `DROP DATABASE`,
+     * `SHOW TABLES FROM`). Cached like the table list; errors degrade to an
+     * empty list, which simply offers nothing.
+     *
+     * @return list<string>
+     */
+    public function databases(): array
+    {
+        if ($this->databases !== null) {
+            return $this->databases;
+        }
+        $this->databases = [];
+        $res = $this->database->query('SHOW DATABASES');
+        if (!$res->hasError()) {
+            foreach ($res->rows as $row) {
+                $val = reset($row); // one column; its name varies by server
+                if ($val !== false && $val !== null) {
+                    $this->databases[] = (string) $val;
+                }
+            }
+        }
+        return $this->databases;
+    }
+
+    /**
+     * Stored procedure and function names in the current database, for `CALL`
+     * and `DROP PROCEDURE`. Scoped with `DATABASE()` rather than listing the
+     * whole server: an unqualified CALL can only reach the current database.
+     *
+     * @return list<string>
+     */
+    public function procedures(): array
+    {
+        if ($this->procedures !== null) {
+            return $this->procedures;
+        }
+        $this->procedures = [];
+        foreach (['PROCEDURE', 'FUNCTION'] as $kind) {
+            $res = $this->database->query('SHOW ' . $kind . ' STATUS WHERE Db = DATABASE()');
+            if ($res->hasError()) {
+                continue;
+            }
+            foreach ($res->rows as $row) {
+                $name = $row['Name'] ?? null;
+                if ($name !== null && $name !== '') {
+                    $this->procedures[] = (string) $name;
+                }
+            }
+        }
+        return $this->procedures;
+    }
+
     /** @return list<array<string,mixed>> cached SHOW COLUMNS rows */
     private function describe(string $table): array
     {
@@ -221,5 +279,19 @@ final class Schema
         $this->tables = null;
         $this->describe = [];
         $this->foreignKeys = [];
+        // Routines are per-database, so a USE invalidates them. The database
+        // list is server-wide, but a reconnect may be to a different server.
+        $this->procedures = null;
+        $this->databases = null;
+    }
+
+    /**
+     * Drop the cached describe/FK data for a single table so the next access
+     * re-queries MySQL. Used by DD sync (Ctrl+U, §11), which must diff against a
+     * freshly-fetched live schema rather than a stale cache.
+     */
+    public function forget(string $table): void
+    {
+        unset($this->describe[$table], $this->foreignKeys[$table]);
     }
 }
