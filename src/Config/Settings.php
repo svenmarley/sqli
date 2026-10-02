@@ -218,17 +218,23 @@ final class Settings
         $this->setFmt($scope, $table, 'widths', $widths === [] ? null : $widths);
     }
 
-    /** @return list<string> column names in saved display order ([] = natural) */
-    public function getColOrder(string $scope, string $table): array
+    /**
+     * Column order and hidden columns belong to one field list, not the whole
+     * table (§6): what was arranged over `SELECT *` is stored under `*`, and
+     * what was arranged over `SELECT name, id` under `name, id`, and neither
+     * is applied to the other. Widths and formats stay per table.
+     *
+     * @return list<string> column names in saved display order ([] = natural)
+     */
+    public function getColOrder(string $scope, string $table, string $fields = '*'): array
     {
-        $o = $this->formatting['databases'][$scope]['tables'][$table]['order'] ?? [];
-        return is_array($o) ? array_values(array_map('strval', $o)) : [];
+        return $this->getListAttr($scope, $table, $fields, 'order');
     }
 
     /** @param list<string> $order */
-    public function setColOrder(string $scope, string $table, array $order): void
+    public function setColOrder(string $scope, string $table, array $order, string $fields = '*'): void
     {
-        $this->setFmt($scope, $table, 'order', $order === [] ? null : array_values($order));
+        $this->setListAttr($scope, $table, $fields, 'order', $order);
     }
 
     /** @return array<string,string> column name => display format id (§6) */
@@ -244,17 +250,46 @@ final class Settings
         $this->setFmt($scope, $table, 'formats', $formats === [] ? null : $formats);
     }
 
-    /** @return list<string> hidden field names */
-    public function getHiddenCols(string $scope, string $table): array
+    /** @return list<string> hidden field names, for one field list ({@see getColOrder()}) */
+    public function getHiddenCols(string $scope, string $table, string $fields = '*'): array
     {
-        $h = $this->formatting['databases'][$scope]['tables'][$table]['hidden'] ?? [];
-        return is_array($h) ? array_values(array_map('strval', $h)) : [];
+        return $this->getListAttr($scope, $table, $fields, 'hidden');
     }
 
-    /** @param list<string> $fields */
-    public function setHiddenCols(string $scope, string $table, array $fields): void
+    /** @param list<string> $hidden */
+    public function setHiddenCols(string $scope, string $table, array $hidden, string $fields = '*'): void
     {
-        $this->setFmt($scope, $table, 'hidden', $fields === [] ? null : array_values($fields));
+        $this->setListAttr($scope, $table, $fields, 'hidden', $hidden);
+    }
+
+    /** @return list<string> */
+    private function getListAttr(string $scope, string $table, string $fields, string $attr): array
+    {
+        $v = $this->formatting['databases'][$scope]['tables'][$table]['lists'][$fields][$attr] ?? [];
+        return is_array($v) ? array_values(array_map('strval', $v)) : [];
+    }
+
+    /**
+     * Store (or, when empty, clear) `order` or `hidden` for one field list,
+     * pruning the list's node and the `lists` node when they empty out.
+     *
+     * @param list<string> $names
+     */
+    private function setListAttr(string $scope, string $table, string $fields, string $attr, array $names): void
+    {
+        $lists = $this->formatting['databases'][$scope]['tables'][$table]['lists'] ?? [];
+        if (!is_array($lists)) {
+            $lists = [];
+        }
+        if ($names === []) {
+            unset($lists[$fields][$attr]);
+            if (($lists[$fields] ?? null) === []) {
+                unset($lists[$fields]);
+            }
+        } else {
+            $lists[$fields][$attr] = array_values($names);
+        }
+        $this->setFmt($scope, $table, 'lists', $lists === [] ? null : $lists);
     }
 
     /**

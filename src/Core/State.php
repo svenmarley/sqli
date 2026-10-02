@@ -22,17 +22,18 @@ final class State
 
     /**
      * Number of output data views (§20). One connection, one CLI, nine grids:
-     * Alt+1…Alt+9 switch between them and `\1`…`\9` terminates a submission into
-     * one. Only ever one is on screen, which is why this costs a tab strip and a
-     * property swap rather than the pane/clipping machinery a split view needs.
+     * Alt+1…Alt+9 switch between them and `]1`…`]9` (or `[N`, `\N`) terminates a
+     * submission into one. Only ever one is on screen, which is why this costs a
+     * tab strip and a property swap rather than the pane/clipping machinery a
+     * split view needs.
      *
-     * **Nine is the ceiling this constant can safely hold.** Three call sites
-     * interpolate it into a single-character context — the two `[1-N]` regex
-     * classes in {@see App::cliEnter()} and {@see App::stripTerminator()}, and
-     * the `char <= (string) TAB_COUNT` guard in {@see App::handleKey()}. At 10
-     * the class `[1-10]` silently means "1 or 0" and the `\2`…`\9` suffixes stop
-     * terminating at all. Going past nine means replacing those three with an
-     * explicit digit map, not just editing this number.
+     * **Nine is the ceiling this constant can safely hold.** Two call sites
+     * interpolate it into a single-character context — the `[1-N]` regex class in
+     * {@see App::terminatorPattern()}, and the `char <= (string) TAB_COUNT`
+     * guard in {@see App::handleKey()}. At 10 the class `[1-10]` silently means
+     * "1 or 0" and the `\2`…`\9` suffixes stop terminating at all. Going past
+     * nine means replacing those with an explicit digit map, not just editing
+     * this number.
      */
     public const TAB_COUNT = 9;
 
@@ -53,11 +54,11 @@ final class State
      */
     public const VIEW_PROPS = [
         // The result itself and what produced it
-        'result', 'lastSql', 'currentTable',
+        'result', 'lastSql', 'lastTyped', 'currentTable',
         // Selection and scroll
         'selectedRow', 'selectedCol', 'rowOffset', 'colOffset',
         // Layout customization (§6)
-        'hiddenCols', 'colWidthOverride', 'colOrder', 'colFormats', 'ddColFormats',
+        'hiddenCols', 'colWidthOverride', 'colOrder', 'layoutFields', 'colAlpha', 'colFormats', 'ddColFormats',
         'sortCol', 'sortDir', 'sortedOrder',
         // Output mode (§5/§8)
         'vertical', 'verticalScroll', 'detail', 'detailFieldIdx', 'detailVisibleFields',
@@ -152,6 +153,13 @@ final class State
 
     public ?QueryResult $result = null;
     public string $lastSql = '';
+    /**
+     * What the user typed to paint this view, as typed: the `?macro`, the
+     * `SELECT FROM t …` form, no auto-LIMIT, terminator stripped, and a whole
+     * multi-statement submission when it came from one. F5 puts it back on the
+     * CLI. {@see $lastSql} is what the server was sent.
+     */
+    public string $lastTyped = '';
     public string $currentTable = '';
 
     // Result grid selection / scroll. selectedRow indexes the *display* order
@@ -166,8 +174,30 @@ final class State
     public array $hiddenCols = [];
     /** @var array<string,int> column name => override width */
     public array $colWidthOverride = [];
-    /** @var list<string> full display order of columns; [] = natural order */
+    /**
+     * The columns the user has placed, in display order — a **prefix** of the
+     * display, persisted per db+table. Every column not named here is
+     * "unmoved" and follows it in result order (or A–Z, {@see $colAlpha}).
+     * [] = nothing placed. A move saves everything up to the moved column, so
+     * whatever order stood before it (A–Z included) comes back next time.
+     *
+     * @var list<string>
+     */
     public array $colOrder = [];
+
+    /**
+     * Which saved order and hidden set this view reads and writes (§6): `*`
+     * for a query that names no columns, otherwise the columns the query
+     * named, in its order. Widths and formats are per table and ignore it.
+     */
+    public string $layoutFields = '*';
+
+    /**
+     * Ctrl+Alt+S (§6): show the unmoved columns — the ones after
+     * {@see $colOrder} — A–Z instead of in result order. Session-only, never
+     * persisted; a move is what saves an order.
+     */
+    public bool $colAlpha = false;
     /**
      * Manual per-column format overrides (from the column popup, saved as Layout
      * Config). A value of '' means the user explicitly turned a DD-suggested
@@ -197,6 +227,12 @@ final class State
     public int $detailFieldIdx = 0;
     /** Visible field rows the detail view drew last frame, for full-page paging. */
     public int $detailVisibleFields = 0;
+    /**
+     * `S` in the detail view: list the fields A–Z instead of in result order.
+     * A preference, not part of a view, so it is deliberately absent from
+     * VIEW_PROPS and holds across tabs and re-opens for the session.
+     */
+    public bool $detailSorted = false;
 
     // Vertical output mode (\G, §5): line-scrolled, no edit/JSON/detail.
     public bool $vertical = false;
@@ -226,6 +262,34 @@ final class State
      * @var list<array{label:string,action:string,enabled:bool}>
      */
     public array $systemMenuView = [];
+
+    /**
+     * The quick keys of a keyboard menu (§6, §12): `1`–`9` for the first nine
+     * items, then `a`–`z`. Separators (null label) get none and are not
+     * counted, so the numbers run on across a rule. One function for the
+     * renderer's `2) ` prefixes and App's key handling, so the label and the
+     * key can never disagree.
+     *
+     * @param  list<array{label:?string,...}> $items
+     * @return array<int,string> item index => key
+     */
+    public static function menuQuickKeys(array $items): array
+    {
+        $keys = [];
+        $n = 0;
+        foreach ($items as $i => $item) {
+            if (($item['label'] ?? null) === null) {
+                continue;
+            }
+            $keys[$i] = match (true) {
+                $n < 9  => (string) ($n + 1),
+                $n < 35 => chr(ord('a') + $n - 9),
+                default => '',
+            };
+            $n++;
+        }
+        return array_filter($keys, static fn (string $k): bool => $k !== '');
+    }
 
     // Theme editor (§13), opened from the system menu. A modal panel over the
     // live UI: every keystroke rebuilds the Theme from $themeColors and hands it
@@ -466,7 +530,12 @@ final class State
     public int $cellEditH = 0;      // body rows
     /** @var array{0:int,1:int,2:int,3:int}|null whole-box rect [x,y,w,h] for hit-testing */
     public ?array $editorFrameRect = null;
-    /** @var array<int,array<string,string>> rawRowIdx => (colName => newValue) */
+    /**
+     * rawRowIdx => (colName => newValue). A null value is a staged SQL NULL
+     * (Ctrl+N, §9), so test with array_key_exists(), not `??`.
+     *
+     * @var array<int,array<string,?string>>
+     */
     public array $pending = [];
 
     // Row deletion (§22). Rows marked for deletion, as a set of *raw* row indices
@@ -590,6 +659,13 @@ final class State
     public int $autoLimitedAt = 0;
 
     public bool $readOnly = false;
+
+    /**
+     * The env in force that nobody typed — `devel (default)` or `devel
+     * ($SQLI_ENV)` — or ''. Drawn in the header beside `[RO]` so the settings it
+     * brought along are never an invisible union with the command line.
+     */
+    public string $envUntyped = '';
 
     /**
      * Whether the connection is alive, gone, or being reopened (§2).
@@ -760,14 +836,15 @@ final class State
 
     /**
      * @return list<string> all result columns in display order (colOrder applied;
-     * any columns not named in colOrder are appended in result order)
+     * any columns not named in colOrder are appended in result order, or A–Z
+     * when {@see $colAlpha} is on)
      */
     public function orderedColumnNames(): array
     {
         if ($this->result === null) {
             return [];
         }
-        if ($this->colOrder === []) {
+        if ($this->colOrder === [] && !$this->colAlpha) {
             return $this->result->columns;
         }
         $known = array_flip($this->result->columns);
@@ -779,12 +856,17 @@ final class State
                 $seen[$name] = true;
             }
         }
+        $tail = [];
         foreach ($this->result->columns as $name) {
             if (!isset($seen[$name])) {
-                $out[] = $name;
+                $tail[] = $name;
+                $seen[$name] = true;
             }
         }
-        return $out;
+        if ($this->colAlpha) {
+            usort($tail, 'strnatcasecmp');
+        }
+        return array_merge($out, $tail);
     }
 
     /** @return list<string> display-ordered columns minus the hidden ones */
@@ -815,6 +897,22 @@ final class State
     public function ddSuggestedFormat(string $col): ?string
     {
         return $this->ddColFormats[$col] ?? null;
+    }
+
+    /**
+     * The fields the detail view lists, in the order it lists them (§8):
+     * result order, or A–Z (case-insensitive, natural) when $detailSorted.
+     * `detailFieldIdx` indexes *this* list, so every reader goes through here.
+     *
+     * @return list<string>
+     */
+    public function detailColumns(): array
+    {
+        $cols = $this->result?->columns ?? [];
+        if ($this->detailSorted) {
+            usort($cols, static fn (string $a, string $b): int => strnatcasecmp($a, $b));
+        }
+        return $cols;
     }
 
     /** @return list<int> raw row indices in display order (sort applied) */

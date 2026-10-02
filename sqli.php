@@ -6,7 +6,8 @@ declare(strict_types=1);
  * sqli entry point.
  *
  * Parses CLI args, handles --help/--version, builds the Database and App, and
- * runs the TUI. Display errors are silenced so a stray warning can never
+ * runs the TUI — or, with -e or SQL piped on stdin, runs the SQL headless and
+ * prints CSV (scripting mode). Display errors are silenced so a stray warning can never
  * corrupt the alternate-screen rendering; errors go to the log instead.
  */
 
@@ -34,16 +35,19 @@ spl_autoload_register(static function (string $class): void {
 use includes\my;
 use Sqli\Config\Config;
 use Sqli\Config\ConfigLint;
+use Sqli\Config\RuntimeCheck;
 use Sqli\Config\Settings;
 use Sqli\Core\App;
 use Sqli\Db\ConnectionOptions;
 use Sqli\Db\Database;
 use Sqli\Db\TlsOptions;
+use Sqli\Export\CsvExport;
+use Sqli\Terminal\MsysPty;
 use Sqli\Terminal\PasswordPrompt;
 
 // Version scheme: major.<ISO week number>.<counter>. The middle digit tracks the
 // week we're working in; the trailing counter just keeps climbing per change.
-const SQLI_VERSION = '2.37.7';
+const SQLI_VERSION = '2.40.1';
 
 // Route my::lineout('FILE:FILE', …) to a log file that actually exists. The
 // library default (/data/tmp/error_logs/debug.log) is never created in FILE
@@ -90,15 +94,79 @@ if ($configErrors !== []) {
 
 my::lineout('FILE:FILE', 'sqli start', SQLI_VERSION);
 
-echo 'Starting sqli ' . SQLI_VERSION . ' …' . PHP_EOL;
+// Scripting mode (backlog #6): `-e SQL`, or SQL piped on stdin. No TUI, the
+// result goes out as CSV, and the exit code says how it went.
+//
+// Git Bash (MSYSTEM set) needs one more question. With ConPTY on, mintty gives
+// php a real console and isatty answers correctly. With it off (older Git for
+// Windows, MSYS=disable_pcon) the terminal is a pair of named pipes, so a
+// person typing looks exactly like `echo … | sqli` to isatty — MsysPty tells
+// them apart by the pipe's name. When it can't ask (no FFI), Git Bash keeps
+// the TUI, as it always did, and `-e` still works.
+$execute = $config->get('execute');
+$stdinIsTerminal = PasswordPrompt::isInteractive();
+$stdoutIsTerminal = function_exists('stream_isatty') && @stream_isatty(STDOUT);
+if (!$stdinIsTerminal && getenv('MSYSTEM') !== false) {
+    $stdinIsTerminal = MsysPty::check(MsysPty::STDIN) ?? true;
+    $stdoutIsTerminal = $stdoutIsTerminal || (MsysPty::check(MsysPty::STDOUT) ?? true);
+}
+$script = $execute !== null || !$stdinIsTerminal;
+$verbose = $config->isFlag('verbose');
+if (!$script) {
+    if ($config->getString('out') !== '') {
+        fwrite(STDERR, 'sqli: --out only applies with -e or SQL piped on stdin' . PHP_EOL);
+        exit(1);
+    }
+    // A person at the keyboard with stdout redirected would get the TUI's
+    // escape codes in the file and nothing on the screen.
+    if ($stdinIsTerminal && !$stdoutIsTerminal) {
+        fwrite(STDERR, 'sqli: stdout is not a terminal — give the SQL with -e, or pipe it on stdin' . PHP_EOL);
+        exit(1);
+    }
+} elseif ($execute === null && $config->wantsPasswordPrompt()) {
+    // The prompt would read the password off stdin, which is carrying the SQL.
+    fwrite(STDERR, 'sqli: -p would read the password from stdin, which is carrying the SQL — '
+        . 'use -e, or keep the password in sqli_credentials.json' . PHP_EOL);
+    exit(1);
+}
+$sqlIn = $execute ?? '';
+if ($script && $execute === null) {
+    $sqlIn = (string) stream_get_contents(STDIN);
+}
+
+// What goes on the plain terminal before the TUI takes over. In scripting mode
+// stdout is the CSV, so notes and warnings go to stderr, and the chatter only
+// under --verbose.
+$chatter = $script ? ($verbose ? STDERR : null) : STDOUT;
+$warn = $script ? STDERR : STDOUT;
+
+if ($chatter !== null) {
+    fwrite($chatter, 'Starting sqli ' . SQLI_VERSION . ' …' . PHP_EOL);
+}
 
 // An env nobody typed gets one line on the plain terminal. A default `env` in a
 // config file is the one source of a selected env that leaves no trace on the
 // command line, and the header only mentions it if that env also sets a
 // `comment` — so this is the one place it is guaranteed to be said.
-if ($config->envSource() === 'config') {
-    echo 'Using env ' . $config->envName() . ' (set in '
-        . ($config->defaultEnvFile() ?? 'the config') . ')' . PHP_EOL;
+if ($config->envSource() === 'config' && $chatter !== null) {
+    fwrite($chatter, 'Using env ' . $config->envName() . ' (set in '
+        . ($config->defaultEnvFile() ?? 'the config') . ')' . PHP_EOL);
+}
+
+// The selected env's connection settings disagree between config files — a
+// project's `prod` naming a different host than the global `prod`. Closest wins,
+// as always; this only makes sure it is not a surprise.
+foreach ($config->envConflicts($config->envChain()) as $conflict) {
+    fwrite($warn, 'sqli: warning: ' . $conflict . PHP_EOL);
+}
+
+// Optional extensions whose absence takes a feature away (Esc-cancel, fast
+// resize). sqli works without them; this is only so nobody has to discover it.
+// Neither feature exists without the TUI.
+if (!$script) {
+    foreach (RuntimeCheck::missing($config->getString('driver', ConnectionOptions::DRIVER_AUTO)) as $missing) {
+        echo 'sqli: note: ' . $missing . PHP_EOL;
+    }
 }
 
 // State lives in the closest project `.sqli/`, else the global one; when
@@ -183,32 +251,12 @@ $askForPassword = $config->wantsPasswordPrompt()
     || ($config->passwordIsMissing() && PasswordPrompt::isInteractive());
 if ($askForPassword) {
     $masked = null;
-    $raw = null;
-    $password = PasswordPrompt::read('Password', $masked, $raw);
+    $password = PasswordPrompt::read('Password', $masked);
     if ($masked === false && PasswordPrompt::isInteractive()) {
         my::lineout('FILE:FILE', 'password prompt could not disable echo');
     }
-    // --debug only: the password is the one input nobody can see themselves
-    // type, so when a pasted one is rejected there is otherwise no evidence at
-    // all. Bytes, not just the value — invisible characters are the usual
-    // culprit. Printed to stderr, and never without --debug.
-    if ($config->isFlag('debug')) {
-        fwrite(STDERR, sprintf(
-            'sqli: [debug] password captured: value=[%s] length=%d bytes=[%s]%s',
-            $password,
-            strlen($password),
-            PasswordPrompt::describeBytes((string) $raw),
-            PHP_EOL,
-        ));
-        my::lineout('FILE:FILE', 'password captured', strlen($password) . ' chars');
-        // The TUI takes the screen a few lines below this, so a line printed and
-        // left behind is a line never read. Hold until the user has looked —
-        // they asked to see it *before* connecting, and only --debug pays for it.
-        if (PasswordPrompt::isInteractive()) {
-            fwrite(STDERR, 'sqli: [debug] press Enter to connect…');
-            fgets(STDIN);
-        }
-    }
+    // The password is never printed or logged, not even its length — under
+    // --debug or otherwise.
 }
 
 // The password is readonly on Database, so a retry builds a fresh one rather
@@ -223,6 +271,7 @@ $makeDatabase = static fn (string $pw): Database => new Database(
     debug: $config->isFlag('debug'),
     tls: $tls,
     options: $connection,
+    label: $config->getString('host_label'),
 );
 
 /**
@@ -246,7 +295,9 @@ $mayRetry = !$config->isFlag('no-password') && PasswordPrompt::isInteractive();
 $database = $makeDatabase($password);
 
 for ($attempt = 1; ; $attempt++) {
-    echo 'Connecting to ' . $database->target() . ' …' . PHP_EOL;
+    if ($chatter !== null) {
+        fwrite($chatter, 'Connecting to ' . $database->target() . ' …' . PHP_EOL);
+    }
     try {
         $database->connect();
         break;
@@ -274,4 +325,30 @@ for ($attempt = 1; ; $attempt++) {
 }
 
 $app = new App($database, $config, $settings, SQLI_VERSION);
-exit($app->run());
+
+if (!$script) {
+    exit($app->run());
+}
+
+$header = !$config->isFlag('skip-column-names');
+$outPath = $config->getString('out');
+if ($outPath === '') {
+    exit($app->runScript($sqlIn, STDOUT, STDERR, $header, $verbose));
+}
+
+// --out: the same temp-and-rename the grid's export uses, so a run that fails
+// part-way leaves no half a file behind to be mistaken for the whole one.
+$code = 1;
+$reason = CsvExport::writeWith($outPath, static function ($h) use ($app, $sqlIn, $header, $verbose, &$code): bool {
+    $code = $app->runScript($sqlIn, $h, STDERR, $header, $verbose);
+    return $code === 0;
+});
+if ($code !== 0) {
+    fwrite(STDERR, 'sqli: ' . $outPath . ' was not written' . PHP_EOL);
+    exit($code);
+}
+if ($reason !== null) {
+    fwrite(STDERR, 'sqli: could not write ' . $outPath . ': ' . $reason . PHP_EOL);
+    exit(1);
+}
+exit(0);

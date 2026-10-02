@@ -78,6 +78,11 @@ final class Theme
         'header_comment'      => ['accent2', 'b'],
         'header_conn'         => ['fg_muted'],
         'header_db'           => ['chip_info'],
+        // The table the selected column came from, on a joined result's chip
+        // (§3). A warm chip against `header_db`'s cool one: the two sit side by
+        // side in one list and the eye has to find the live one without reading
+        // it. Same pair as the CLI/DATA tag, for the same reason.
+        'header_db_active'    => ['chip_warn', 'b'],
         'header_flash'        => ['chip_ok'],
         // The connection is not healthy (§2) — the header's `!db` marker. A red
         // chip rather than a coloured word: five characters have to read as an

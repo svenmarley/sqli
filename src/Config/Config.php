@@ -28,7 +28,7 @@ namespace Sqli\Config;
  * CLI parsing supports `-pVALUE`, `--key=value`, and space-separated forms, plus
  * boolean flags via `--flag` or `--flag=true/false/1/0/yes/on`.
  *
- * Which env is selected is layered the same way: `-e NAME`, else `$SQLI_ENV`,
+ * Which env is selected is layered the same way: `-E NAME`, else `$SQLI_ENV`,
  * else the `env` key in the base of the closest config layer that sets one
  * (`defaults{}` by preference, or the flat root) — so a project directory can say
  * which server it means and a bare `sqli` typed inside it means that server.
@@ -68,13 +68,18 @@ final class Config
         'ignore-space'       => [null, 'ignore-space', true, false, 'Allow a space between a function name and its ( — makes function names reserved'],
         'local-infile'       => [null, 'local-infile', true, false, 'Allow LOAD DATA LOCAL INFILE — the server can then ask this client for any file it can read (refused with --read-only)'],
         'comment'            => [null, 'comment', false, null, 'Short note shown in the header beside the CLI/DATA tag (e.g. PROD)'],
+        'host_label'         => [null, 'host-label', false, null, 'Name shown in the header instead of user@host:port/db — hides the address, must be unique across the config'],
         'theme'              => [null, 'theme', false, 'default', 'Color theme name'],
         'truecolor'          => [null, 'truecolor', false, 'auto', 'Truecolor output: auto|on|off'],
         'dictionary'         => [null, 'dictionary', false, null, 'Data Dictionary CSV path'],
         'read-only'          => [null, 'read-only', true, false, 'Block data-modifying queries'],
-        'env'                => ['e', 'env', false, null, 'Named environment from the config `envs` section (also $SQLI_ENV)'],
+        'env'                => ['E', 'env', false, null, 'Named environment from the config `envs` section (also $SQLI_ENV)'],
         'no-env'             => [null, 'no-env', true, false, 'Ignore $SQLI_ENV and the config\'s default `env`; run with no named environment'],
         'lint'               => [null, 'lint', true, false, 'Validate the config/formatting JSON files and exit'],
+        'execute'            => ['e', 'execute', false, null, 'Run the SQL, print the result as CSV and exit — no TUI (SQL piped on stdin does the same)'],
+        'skip-column-names'  => ['N', 'skip-column-names', true, false, 'With -e / piped SQL: no header row in the CSV'],
+        'out'                => [null, 'out', false, null, 'With -e / piped SQL: write the CSV to this file instead of stdout'],
+        'verbose'            => ['v', 'verbose', true, false, 'With -e / piped SQL: row counts and timings on stderr'],
         'config'             => ['c', 'config', false, null, 'Load options from a JSON config file (or $SQLI_CONFIG)'],
         'user-config'        => [null, 'user-config', false, null, 'User JSON config overriding --config (or $SQLI_USER_CONFIG)'],
         'help'               => ['h', 'help', true, false, 'Print help and exit'],
@@ -83,7 +88,7 @@ final class Config
     ];
 
     /** Options that only make sense on the CLI/env, never inside a config file. */
-    private const FILE_EXCLUDED = ['no-env', 'config', 'user-config', 'help', 'version', 'lint'];
+    private const FILE_EXCLUDED = ['no-env', 'config', 'user-config', 'help', 'version', 'lint', 'execute', 'out'];
 
     /**
      * Options a config file may set only in its **base** — its flat root keys or
@@ -94,6 +99,13 @@ final class Config
      * which is why {@see applyMap()} skips it everywhere.
      */
     private const BASE_ONLY = ['env'];
+
+    /**
+     * The keys that say *which* server and account an env means. When two config
+     * files define the same env name with different values for one of these,
+     * {@see envConflicts()} reports it — closest still wins.
+     */
+    private const IDENTITY_KEYS = ['host', 'port', 'socket', 'user', 'database'];
 
     /** Filenames sqli looks for inside a `.sqli/` directory. */
     private const CONFIG_FILE = 'sqli_config.json';
@@ -123,7 +135,7 @@ final class Config
     /** Seed contents written by {@see scaffoldAt()} when the files are absent. */
     private const DEFAULT_CONFIG_JSON = <<<'JSON'
         {
-          "_comment": "sqli config. Full format: see .sqli/sqli_config.example.json shipped with sqli. Put shared settings in defaults{}, and one block per server/database in envs{} (pick with -e NAME, or put \"env\": \"NAME\" in defaults{} to get one with no -e). Envs may `extends` another. Passwords go in sqli_credentials.json, not here.",
+          "_comment": "sqli config. Full format: see .sqli/sqli_config.example.json shipped with sqli. Put shared settings in defaults{}, and one block per server/database in envs{} (pick with -E NAME, or put \"env\": \"NAME\" in defaults{} to get one with no -E). Envs may `extends` another. Passwords go in sqli_credentials.json, not here.",
           "defaults": {
           },
           "envs": {
@@ -167,7 +179,7 @@ final class Config
     /** @var list<string> informational lines: migrations performed, registry updates */
     private array $notices = [];
 
-    /** Selected environment name (from -e/--env, e=NAME, or $SQLI_ENV), or null. */
+    /** Selected environment name (from -E/--env, or $SQLI_ENV), or null. */
     private ?string $envName = null;
 
     /** True once some config file actually defined the selected env. */
@@ -187,18 +199,35 @@ final class Config
      * The default `env` from the base of the closest config layer that set one —
      * null when no layer did, or when a closer one cancelled it with an empty
      * value. Separate from `$envName` because it stands whether it was used or
-     * not: `-e` and `$SQLI_ENV` override it without erasing what the files said.
+     * not: `-E` and `$SQLI_ENV` override it without erasing what the files said.
      */
     private ?string $defaultEnv = null;
 
     /** The config file the standing {@see $defaultEnv} came from, for messages. */
     private ?string $defaultEnvFrom = null;
 
-    /** How {@see $envName} was chosen: `-e`, `$SQLI_ENV`, `config`, or null. */
+    /** How {@see $envName} was chosen: `-E`, `$SQLI_ENV`, `config`, or null. */
     private ?string $envSource = null;
+
+    /**
+     * Which layer last set each option — a config file's path, `env NAME`, or
+     * `command line`; absent for a built-in default. Kept so a setting nobody
+     * typed (a default env's `read-only`) can say where it came from.
+     *
+     * @var array<string,string>
+     */
+    private array $origins = [];
 
     /** True when the CLI carried a bare `-p` / `--password` (i.e. "ask me"). */
     private bool $passwordPromptCli = false;
+
+    /**
+     * Every file's own value for each {@see IDENTITY_KEYS} key of each env, in
+     * layer order (lowest first, so the last entry is the one that wins).
+     *
+     * @var array<string,array<string,list<array{0:string,1:string}>>>
+     */
+    private array $envDefinitions = [];
 
     /**
      * @param list<string> $argv
@@ -231,16 +260,16 @@ final class Config
         // given" are the same empty string.
         $this->passwordPromptCli = ($provided['password'] ?? false) && ($cli['password'] ?? null) === '';
 
-        // Selected environment (config `envs` section). `-e` beats $SQLI_ENV, and
+        // Selected environment (config `envs` section). `-E` beats $SQLI_ENV, and
         // both beat a file's default `env`, which is applied further down once the
         // files have been read. `--no-env` cancels the two nobody typed on this
         // command line — an exported $SQLI_ENV and the project's default — and
-        // leaves an explicit `-e` standing, so a named env is never discarded.
+        // leaves an explicit `-E` standing, so a named env is never discarded.
         $noEnv   = ($cli['no-env'] ?? false) === true;
         $fromCli = self::nonEmpty(($provided['env'] ?? false) ? (string) $cli['env'] : null);
         $fromVar = $noEnv ? null : self::nonEmpty($env['SQLI_ENV'] ?? null);
         $this->envName   = $fromCli ?? $fromVar;
-        $this->envSource = $fromCli !== null ? '-e' : ($fromVar !== null ? '$SQLI_ENV' : null);
+        $this->envSource = $fromCli !== null ? '-E' : ($fromVar !== null ? '$SQLI_ENV' : null);
 
         // Root for the global config: $SQLI_HOME if set, else the user's home dir.
         $this->home = self::homeDir($env);
@@ -317,7 +346,7 @@ final class Config
             if ($resolved !== null) {
                 $this->envMatched = true;
                 $this->envChain = self::flattenChain(self::chainOf($mergedEnvs, $this->envName, []));
-                $this->applyMap($resolved);
+                $this->applyMap($resolved, origin: 'env ' . $this->envName);
             }
         }
 
@@ -342,6 +371,7 @@ final class Config
         foreach ($provided as $key => $given) {
             if ($given) {
                 $this->values[$key] = $cli[$key];
+                $this->origins[$key] = 'command line';
             }
         }
 
@@ -354,6 +384,44 @@ final class Config
         $this->values['env'] = $this->envName;
     }
 
+    /**
+     * One sentence per env and connection key that two or more config files set
+     * differently — the global `prod` on one host and a project's `prod` on
+     * another. Nothing is refused and the closest file still wins; the point is
+     * that nobody ends up on a different server than they thought without being
+     * told. Only files that define the env themselves count: a value inherited
+     * through `extends` is not a second definition.
+     *
+     * @param list<string>|null $envs the envs to check (the selected chain, at
+     *        startup); null checks every env, which is what `--lint` wants
+     * @return list<string>
+     */
+    public function envConflicts(?array $envs = null): array
+    {
+        $out = [];
+        foreach ($this->envDefinitions as $env => $keys) {
+            if ($envs !== null && !in_array($env, $envs, true)) {
+                continue;
+            }
+            foreach ($keys as $key => $defs) {
+                $values = array_unique(array_column($defs, 1));
+                if (count($values) < 2) {
+                    continue;
+                }
+                [$winPath, $winValue] = $defs[count($defs) - 1];
+                $others = [];
+                foreach (array_slice($defs, 0, -1) as [$path, $value]) {
+                    if ($value !== $winValue) {
+                        $others[] = "'$value' in $path";
+                    }
+                }
+                $out[] = "env '$env' sets $key differently in more than one config file — "
+                    . "using '$winValue' from $winPath (also " . implode(', ', $others) . ')';
+            }
+        }
+        return $out;
+    }
+
     /** Selected environment name, or null when none was requested. */
     public function envName(): ?string
     {
@@ -364,7 +432,7 @@ final class Config
      * Every environment name the `envs{}` sections define, across all layers.
      *
      * Pooled the same way {@see envName()}'s target is resolved, so a name here
-     * is one `-e` would accept. `--lint` uses it to tell an `[env:staging]`
+     * is one `-E` would accept. `--lint` uses it to tell an `[env:staging]`
      * macro section that no config file has a staging (§23) — the one way a
      * scoped macro can be lost without anyone typing anything wrong.
      *
@@ -395,7 +463,7 @@ final class Config
 
     /**
      * The default `env` the config layers settled on, whether it was used or not:
-     * `-e` and `$SQLI_ENV` override it and `--no-env` refuses it, and anything
+     * `-E` and `$SQLI_ENV` override it and `--no-env` refuses it, and anything
      * reporting on the configuration (`--lint`) needs to see it either way.
      */
     public function defaultEnvName(): ?string
@@ -410,13 +478,23 @@ final class Config
     }
 
     /**
-     * Where {@see envName()} came from — `-e`, `$SQLI_ENV`, or `config` for a
+     * Where {@see envName()} came from — `-E`, `$SQLI_ENV`, or `config` for a
      * default `env` — and null when no env was selected. The point of asking is
      * the third answer: an env the user did not type is worth saying out loud.
      */
     public function envSource(): ?string
     {
         return $this->envSource;
+    }
+
+    /**
+     * Where an option's value came from: a config file's path, `env NAME`, or
+     * `command line` — null when it is still the built-in default.
+     */
+    public function originOf(string $key): ?string
+    {
+        $o = $this->origins[$key] ?? '';
+        return $o === '' ? null : $o;
     }
 
     /** The resolved global config root ($SQLI_HOME or the home directory). */
@@ -459,7 +537,7 @@ final class Config
      * Two ways to say yes: a bare `-p` on the command line (the mysql client's
      * long-standing meaning), or `password-prompt: true` in any config layer —
      * which is how an environment declares "this server's password is never
-     * written down", so `sqli -e prod` asks every time.
+     * written down", so `sqli -E prod` asks every time.
      *
      * A `-p VALUE` **wins over the flag**: the explicit value is the more
      * specific intent, and prompting anyway would be ignoring what was typed.
@@ -704,6 +782,15 @@ final class Config
                 continue;
             }
 
+            // `-e SQL` / `--execute SQL` takes the next token whatever it looks
+            // like, as mysql does: SQL can start with a dash (`-- note` + newline,
+            // `-1 AS n`), and reading that as "no value, here is another flag"
+            // would run nothing and then choke on the SQL as an option.
+            if ($arg === '-e' || $arg === '--execute') {
+                $this->assign($cli, $provided, 'execute', $argv !== [] ? array_shift($argv) : '');
+                continue;
+            }
+
             // --key=value
             if ($isLong && str_contains($arg, '=')) {
                 [$name, $value] = explode('=', substr($arg, 2), 2);
@@ -711,14 +798,14 @@ final class Config
                 continue;
             }
 
-            // Short option with attached value: -pVALUE or -e=VALUE.
+            // Short option with attached value: -pVALUE or -E=VALUE.
             if ($isShort && strlen($arg) > 2) {
                 $short = $arg[1];
                 $key = $this->keyForName($short);
                 if ($key !== null && !self::OPTIONS[$key][2]) {
                     $rest = substr($arg, 2);
                     if ($rest !== '' && $rest[0] === '=') {
-                        $rest = substr($rest, 1); // -e=prod → prod
+                        $rest = substr($rest, 1); // -E=prod → prod
                     }
                     $this->assign($cli, $provided, $key, $rest);
                     continue;
@@ -804,12 +891,12 @@ final class Config
         }
 
         // Base: flat root-level options, then an explicit defaults{} section.
-        $this->applyMap($data, rootOnly: true);
+        $this->applyMap($data, rootOnly: true, origin: $path);
         if (isset($data['defaults']) && is_array($data['defaults'])) {
-            $this->applyMap($data['defaults']);
+            $this->applyMap($data['defaults'], origin: $path);
         }
 
-        // The default `env`: which env to use when neither `-e` nor $SQLI_ENV
+        // The default `env`: which env to use when neither `-E` nor $SQLI_ENV
         // names one. Read from this file's base the way every other option is —
         // flat root first, `defaults{}` over it — and the closest layer wins, with
         // an empty value meaning "no default here", so a project can cancel the
@@ -841,6 +928,11 @@ final class Config
                 $mergedEnvs[$key] = isset($mergedEnvs[$key])
                     ? array_merge($mergedEnvs[$key], $def)
                     : $def;
+                foreach (self::IDENTITY_KEYS as $identity) {
+                    if (array_key_exists($identity, $def) && is_scalar($def[$identity])) {
+                        $this->envDefinitions[$key][$identity][] = [$path, (string) $def[$identity]];
+                    }
+                }
             }
         }
     }
@@ -855,7 +947,7 @@ final class Config
      *
      * @param array<string,mixed> $map
      */
-    private function applyMap(array $map, bool $rootOnly = false): void
+    private function applyMap(array $map, bool $rootOnly = false, string $origin = ''): void
     {
         foreach ($map as $name => $value) {
             if ($rootOnly && in_array((string) $name, self::RESERVED_SECTIONS, true)) {
@@ -869,6 +961,7 @@ final class Config
                 continue;
             }
             $this->values[$key] = self::OPTIONS[$key][2] ? self::truthy($value) : $value;
+            $this->origins[$key] = $origin;
         }
     }
 
@@ -974,7 +1067,7 @@ final class Config
         if (!is_array($data) || !isset($data[$this->envName]) || !is_array($data[$this->envName])) {
             return;
         }
-        $this->applyMap($data[$this->envName]);
+        $this->applyMap($data[$this->envName], origin: $path);
     }
 
     /** Expand `${SQLI_HOME}`/`$SQLI_HOME` and a leading `~` in resolved strings. */
@@ -982,8 +1075,9 @@ final class Config
     {
         foreach ($this->values as $key => $value) {
             // The password is an opaque secret, never a path — a literal `~` or
-            // `$SQLI_HOME` inside it must survive verbatim.
-            if ($key === 'password' || !is_string($value) || $value === '') {
+            // `$SQLI_HOME` inside it must survive verbatim. The same goes for the
+            // SQL given to -e, which is not a path either.
+            if ($key === 'password' || $key === 'execute' || !is_string($value) || $value === '') {
                 continue;
             }
             $v = str_replace(['${SQLI_HOME}', '$SQLI_HOME'], $this->sqliHome, $value);
@@ -1240,11 +1334,17 @@ final class Config
         $lines[] = '';
         $lines[] = 'Each file: flat option keys and/or a `defaults{}` base, plus an `envs{}`';
         $lines[] = 'section of named environments (support `extends`). Pick one with';
-        $lines[] = '  -e NAME / -e=NAME / --env NAME / $SQLI_ENV';
+        $lines[] = '  -E NAME / -E=NAME / --env NAME / $SQLI_ENV';
         $lines[] = 'or let the files pick: `"env": "NAME"` in a file\'s defaults{} is used when';
         $lines[] = 'neither is given (closest layer wins, "" cancels a farther one), and';
-        $lines[] = '--no-env ignores $SQLI_ENV and that default (an explicit -e still wins).';
+        $lines[] = '--no-env ignores $SQLI_ENV and that default (an explicit -E still wins).';
         $lines[] = 'Paths may use ${SQLI_HOME} and a leading ~.  Validate files with --lint.';
+        $lines[] = '';
+        $lines[] = 'Scripting: -e "SQL" (or SQL piped on stdin) runs without the TUI and prints';
+        $lines[] = 'each result set as CSV (NULL as a bare NULL), header row unless -N.';
+        $lines[] = 'Anything the TUI would ask you to confirm is refused (exit 2) and nothing';
+        $lines[] = 'runs; a PK-scoped UPDATE/DELETE asks nothing, so it runs. Not read-only.';
+        $lines[] = 'No 1000-row cap. Exit 0 = OK, 1 = error, 2 = refused.';
         return implode(PHP_EOL, $lines) . PHP_EOL;
     }
 }

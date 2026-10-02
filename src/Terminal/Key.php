@@ -28,6 +28,7 @@ enum Key: string
 
     case F1 = 'f1';
     case F2 = 'f2';
+    case F5 = 'f5';
 
     case Char = 'char';
 }

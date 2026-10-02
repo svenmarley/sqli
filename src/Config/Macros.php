@@ -91,7 +91,7 @@ namespace Sqli\Config;
  * key wins over an earlier one in the same file.
  *
  * A section head spelled **`[env:NAME]` is the exception**: what is under it
- * loads only when that environment is the selected one (§16, `-e NAME`). The
+ * loads only when that environment is the selected one (§16, `-E NAME`). The
  * same macro can then mean one thing against dev and another against prod —
  * `agency-id` is a different number on each server, and a name that quietly
  * kept the wrong one is the failure this exists to prevent. Anything after the
@@ -112,10 +112,10 @@ namespace Sqli\Config;
  * session that never said which server it is on cannot be handed prod's id
  * because prod happened to be last in the file. A reference to a name that only
  * exists under another env is refused by name — {@see hidden()} — rather than
- * reported as a typo, because the fix is `-e`, not the spelling.
+ * reported as a typo, because the fix is `-E`, not the spelling.
  *
  * An env that **`extends` another** in `sqli_config.json` (§16) extends it here
- * too: `-e prod` with `"prod": {"extends": "base"}` loads `[env:base]` and then
+ * too: `-E prod` with `"prod": {"extends": "base"}` loads `[env:base]` and then
  * `[env:prod]` over it, so the two files answer "what is prod" the same way and
  * a macro shared by every server is written once, under the parent. The chain
  * arrives from {@see Config::envChain()} least specific first; {@see scopeOf()}
@@ -457,7 +457,7 @@ final class Macros
 
             // Everything is validated, including what this session's env does
             // not load. The fault is in the file being edited, and hearing about
-            // a broken `[env:prod]` value only after `-e prod` is hearing about
+            // a broken `[env:prod]` value only after `-E prod` is hearing about
             // it in front of the prod server.
             foreach ($plain as $name => $value) {
                 $problem = self::validate($name, $value);
@@ -859,7 +859,7 @@ final class Macros
      * The names this session cannot reach: each with the envs that define it.
      *
      * A macro defined *only* under other envs is not a macro that is missing —
-     * it is one behind a `-e`, and the two mistakes have different fixes. The
+     * it is one behind a `-E`, and the two mistakes have different fixes. The
      * viewer says how many there are, `--lint` names them, and {@see scan()}
      * refuses a reference to one with a sentence about the env rather than
      * about the spelling. A name also defined outside a section is not here:
@@ -1138,7 +1138,7 @@ final class Macros
             $value = $this->macros[$name] ?? null;
             if ($value === null) {
                 // Defined, but under an env this session did not select: a
-                // different mistake from a typo, and one whose fix is `-e`
+                // different mistake from a typo, and one whose fix is `-E`
                 // rather than the spelling. Kept apart here so the refusal can
                 // say which.
                 if (isset($this->elsewhere[$name])) {
@@ -1423,7 +1423,7 @@ final class Macros
         ;
         ; [section] headers are dividers and are yours to use — with one
         ; exception. A head spelled [env:NAME] scopes what is under it to that
-        ; environment (-e NAME), so one name can be a different id per server:
+        ; environment (-E NAME), so one name can be a different id per server:
         ;
         ;   agency-id = 22          ; no section: every env, and every session
         ;
@@ -1433,7 +1433,7 @@ final class Macros
         ;   [env:prod]
         ;   agency-id = 1174
         ;
-        ; With no -e, no [env:…] section loads at all, and ?agency-id then says
+        ; With no -E, no [env:…] section loads at all, and ?agency-id then says
         ; which envs define it rather than quietly using the last one written.
 
         INI;

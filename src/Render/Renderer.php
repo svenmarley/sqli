@@ -333,6 +333,100 @@ final class Renderer
         return $spinner;
     }
 
+    /**
+     * What the header tile says the grid is showing, in two widths.
+     *
+     * Single table — the ordinary case — is unchanged: `db.table`, with the
+     * database droppable because the connection label on the right already ends
+     * in `/db`.
+     *
+     * A join is the case this was rewritten for. Its columns come from several
+     * tables, the clashing ones are renamed `1.id` / `2.id` ({@see
+     * \Sqli\Db\ResultColumns}), and those numbers have to be legible somewhere:
+     * here, as `prod.templates(1), template_items(2)`. The database is shown on
+     * the first entry only, and again on any later one that came from a
+     * different database, because a cross-database join is the one time the
+     * repetition carries information.
+     *
+     * The alias is appended only where two sources share a real table name — a
+     * self-join, `prod.widgets w(1), widgets w2(2)`, where the numbers would
+     * otherwise be the only thing distinguishing two identical labels. On an
+     * ordinary join nobody needs to be told that `templates` was called `t`.
+     *
+     * **The selected column's table is highlighted** as the user walks the grid
+     * sideways, so `1.id` does not have to be decoded against the list by
+     * counting — the entry it refers to lights up. Every column gets this, not
+     * only the qualified ones: a column whose name needed no number still came
+     * from one of these tables and the chip still says which. When the selected
+     * column came from no table at all (an expression), nothing is highlighted
+     * rather than something being highlighted wrongly.
+     *
+     * @return array{full:string,short:string,fullSpan:?array{0:int,1:int},shortSpan:?array{0:int,1:int}}
+     *         The full label and the narrower one to fall back to (`''` when
+     *         there is none), plus the offset and length, within each, of the
+     *         entry to highlight (null for none).
+     */
+    private static function headerWhere(State $state): array
+    {
+        $sources = $state->result?->sources ?? [];
+        if (count($sources) < 2) {
+            $parts = array_values(array_filter(
+                [$state->currentDatabase, $state->currentTable],
+                static fn (string $s): bool => $s !== '',
+            ));
+            return [
+                'full' => implode('.', $parts),
+                'short' => count($parts) === 2 ? $parts[1] : '',
+                'fullSpan' => null,
+                'shortSpan' => null,
+            ];
+        }
+
+        $names = [];
+        foreach ($sources as $source) {
+            $names[] = $source->name();
+        }
+        $repeated = array_count_values($names);
+
+        // Which entry the grid is standing on, as a 1-based source number.
+        // Only while the grid has focus: at the CLI there is no "current column"
+        // the user is looking at, so a lit table would point at nothing.
+        $selected = $state->focus === State::FOCUS_DATA
+            ? ($state->visibleColumnNames()[$state->selectedCol] ?? null)
+            : null;
+        $active = $selected === null ? 0 : ($state->result?->sourceOf($selected) ?? 0);
+
+        $full = [];
+        $short = [];
+        $fullSpan = null;
+        $shortSpan = null;
+        $firstDb = $sources[0]->database;
+        foreach ($sources as $i => $source) {
+            $alias = ($repeated[$source->name()] ?? 0) > 1;
+            $tail = '(' . ($i + 1) . ')';
+            $showDb = $source->database !== '' && ($i === 0 || $source->database !== $firstDb);
+            $one = $source->label($alias, $showDb) . $tail;
+            $two = $source->label($alias, $i > 0 && $source->database !== $firstDb) . $tail;
+            if ($i + 1 === $active) {
+                // Measured before this entry is appended, so the offset is the
+                // width of everything already in the list plus its separators.
+                // The span skips any `db.` prefix: the highlight names the
+                // table, and the database is shared context, not the answer.
+                $bare = mb_strlen($source->label($alias) . $tail);
+                $fullSpan  = [mb_strlen(implode(', ', $full)) + ($full === [] ? 0 : 2) + mb_strlen($one) - $bare, $bare];
+                $shortSpan = [mb_strlen(implode(', ', $short)) + ($short === [] ? 0 : 2) + mb_strlen($two) - $bare, $bare];
+            }
+            $full[]  = $one;
+            $short[] = $two;
+        }
+        return [
+            'full' => implode(', ', $full),
+            'short' => implode(', ', $short),
+            'fullSpan' => $fullSpan,
+            'shortSpan' => $shortSpan,
+        ];
+    }
+
     private function drawHeader(Screen $screen, State $state, int $w): void
     {
         $left = ' sqli ' . ($state->version !== '' ? 'v' . $state->version : '');
@@ -377,6 +471,12 @@ final class Renderer
         // must never be readable as a plaintext session.
         $leftEnd = $tagX + mb_strlen($tag);
         $ro = $state->readOnly ? [['[RO] ', 'header_conn']] : [];
+        // An env nobody typed (a config file's default, or $SQLI_ENV) — named,
+        // because its settings sit under everything the command line said and
+        // `[RO]` alone cannot say which of the two turned it on. It outlasts the
+        // driver and the security marker; only a terminal too narrow for it and
+        // the host together sheds it, and the `[RO]` message still names it.
+        $env = $state->envUntyped !== '' ? [['env ' . $state->envUntyped . ' ', 'header_comment']] : [];
         $driver = $state->driverName !== '' ? [['(' . $state->driverName . ') ', 'header_conn']] : [];
         $sec = $state->connectionLabel === ''
             ? []   // nothing is open; "no TLS" would be a claim about no session
@@ -385,11 +485,12 @@ final class Renderer
 
         // Dropped in order of what a narrow terminal can least afford to lose.
         // The driver goes first: it never changes during a session. The security
-        // marker goes next. `[RO]` and the host never go — one changes what the
+        // marker goes next, then an untyped env. `[RO]` and the host never go — one changes what the
         // next statement will do, the other says which server it will do it to.
         $candidates = [
-            array_merge($driver, $ro, $sec, $hostSeg),
-            array_merge($ro, $sec, $hostSeg),
+            array_merge($driver, $env, $ro, $sec, $hostSeg),
+            array_merge($env, $ro, $sec, $hostSeg),
+            array_merge($env, $ro, $hostSeg),
             array_merge($ro, $hostSeg),
         ];
         foreach ($candidates as $segments) {
@@ -437,10 +538,9 @@ final class Renderer
         $link = $linkUp ? null : ' !db ';
 
         $flashActive = $state->flashMessage !== '' && microtime(true) < $state->flashUntil;
-        $where = array_values(array_filter(
-            [$state->currentDatabase, $state->currentTable],
-            static fn (string $s): bool => $s !== '',
-        ));
+        $where = self::headerWhere($state);
+        $whereFull = $where['full'];
+        $whereShort = $where['short'];
         // The gap left between the app tag and the connection label. Everything
         // below fits the tile into *this*, rather than centering on the whole
         // row and giving up when the result overlaps something.
@@ -491,18 +591,20 @@ final class Renderer
             $avail = $gapEnd - $gapStart;
         }
 
-        if ($where !== [] && !$flashActive && $avail >= self::HEADER_DB_MIN) {
+        if ($whereFull !== '' && !$flashActive && $avail >= self::HEADER_DB_MIN) {
             // Was: centered, and simply not drawn when the centered position
             // collided with the connection label. That made the tile vanish on
             // running a query — `devel` fit, `devel.sa_learning` did not — which
             // read as a bug precisely because the tile is how you know what the
             // grid is showing. It now degrades instead of disappearing.
-            $label = implode('.', $where);
-            if (mb_strlen($label) + 2 > $avail && count($where) === 2) {
+            $label = $whereFull;
+            $span = $where['fullSpan'];
+            if (mb_strlen($label) + 2 > $avail && $whereShort !== '') {
                 // Drop the database before the table: the connection label on the
                 // right already ends in `/db`, so it is the redundant half, while
                 // the table is the part that just changed.
-                $label = $where[1];
+                $label = $whereShort;
+                $span = $where['shortSpan'];
             }
             $label = ' ' . $this->truncate($label, $avail - 2) . ' ';
             // Centered when the gap allows, otherwise slid along it — never
@@ -510,6 +612,23 @@ final class Renderer
             $dbX = intdiv($w - mb_strlen($label), 2);
             $dbX = max($gapStart, min($dbX, $gapEnd - mb_strlen($label)));
             $screen->put($dbX, 0, $label, $this->theme->style('header_db'));
+            // The selected column's table, repainted over the chip in its own
+            // colour (§3). Offsets are into the label before the leading space,
+            // hence the +1; a truncated label can cut the entry short or lose it
+            // entirely, and a highlight that would start past the end is simply
+            // not drawn — half a highlighted word says less than none.
+            if ($span !== null) {
+                $room = mb_strlen($label) - 1 - ($span[0] + 1);
+                $len = min($span[1], $room);
+                if ($len > 0) {
+                    $screen->put(
+                        $dbX + $span[0] + 1,
+                        0,
+                        mb_substr($label, $span[0] + 1, $len),
+                        $this->theme->style('header_db_active'),
+                    );
+                }
+            }
         }
 
         // Transient clipboard/notice flash, centered on the top line so it's
@@ -769,9 +888,9 @@ final class Renderer
 
             foreach ($visible as [$colIdx, $colW, $colX]) {
                 $name = $colNames[$colIdx];
-                $pendingVal = $state->pending[$rawIdx][$name] ?? null;
-                $isPending = $pendingVal !== null;
-                $raw = $isPending ? $pendingVal : ($rows[$rawIdx][$name] ?? null);
+                // array_key_exists: a staged NULL (Ctrl+N) is a pending null.
+                $isPending = array_key_exists($name, $state->pending[$rawIdx] ?? []);
+                $raw = $isPending ? $state->pending[$rawIdx][$name] : ($rows[$rawIdx][$name] ?? null);
                 $isNull = $raw === null;
                 if ($isNull) {
                     $disp = 'NULL';
@@ -827,7 +946,7 @@ final class Renderer
         $order = $state->displayOrder();
         $rawIdx = $order[$state->selectedRow] ?? ($order[0] ?? 0);
         $row = $result->rows[$rawIdx] ?? [];
-        $cols = $result->columns;
+        $cols = $state->detailColumns();
         $total = count($cols);
 
         $nameW = 1;
@@ -836,7 +955,13 @@ final class Renderer
         }
         $nameW = min($nameW, max(8, intdiv($w, 3)));
 
-        $title = sprintf('Row %d of %d  ·  Esc/Enter to close', $state->selectedRow + 1, count($order));
+        // The field order is named up top, with the key that flips it.
+        $title = sprintf(
+            'Row %d of %d  ·  [S] %s  ·  Esc/Enter to close',
+            $state->selectedRow + 1,
+            count($order),
+            $state->detailSorted ? 'Fields A–Z' : 'Result order',
+        );
         $screen->put($x + 1, $y, $this->truncate($title, $w - 2), $this->theme->style('detail_title'));
 
         $listTop = $y + 1;
@@ -1153,7 +1278,7 @@ final class Renderer
         } elseif ($state->moveMode) {
             $left = 'Move column · [←/→] move · [Home/End] first/last · [Enter] done · [Esc] cancel';
         } elseif ($state->widthAdjust) {
-            $left = 'Change width · [↑/→] wider · [↓/←] narrower · [Enter] done';
+            $left = 'Change width · [→/←] ±1 · [↑/↓] ±5 · [Enter] done';
         }
         // While a cell edit is in flight its UPDATE sits on the CLI; remind the
         // user how to resolve it (§9) — takes precedence over the row/col stats.
@@ -1394,7 +1519,7 @@ final class Renderer
         $title = $name === ''
             ? ' Data View Configuration '
             : ' Data View Configuration — ' . $name . ' ';
-        $labels = array_map(static fn (array $it): ?string => $it['label'], $items);
+        $labels = self::quickKeyLabels($items);
         $disabled = array_map(static fn (array $it): bool => !$it['enabled'], $items);
         $state->modalRect = $this->drawMenu($screen, $w, $h, $title, $labels, $state->layoutItem, $disabled);
     }
@@ -1405,9 +1530,27 @@ final class Renderer
         if ($items === []) {
             return;
         }
-        $labels = array_map(static fn (array $it): string => $it['label'], $items);
+        $labels = self::quickKeyLabels($items);
         $disabled = array_map(static fn (array $it): bool => !$it['enabled'], $items);
         $state->modalRect = $this->drawMenu($screen, $w, $h, ' System ', $labels, $state->systemMenuItem, $disabled);
+    }
+
+    /**
+     * Menu labels with their quick key in front — `2) Sort DESC` — from
+     * {@see State::menuQuickKeys()}. Separators stay null.
+     *
+     * @param  list<array{label:?string,...}> $items
+     * @return list<?string>
+     */
+    private static function quickKeyLabels(array $items): array
+    {
+        $keys = State::menuQuickKeys($items);
+        $labels = [];
+        foreach ($items as $i => $it) {
+            $label = $it['label'];
+            $labels[] = $label === null ? null : (isset($keys[$i]) ? $keys[$i] . ') ' : '   ') . $label;
+        }
+        return $labels;
     }
 
     /**
@@ -1885,13 +2028,29 @@ final class Renderer
 
         // Wrap every node to the inner width, tagging each visual line with its
         // node index so the selected node highlights across all its wrapped lines.
+        // An expanded container's row opens with `{`/`[`; its closing brace gets a
+        // line of its own after its last descendant. Closers are display only:
+        // nodeIdx null, so they are never selected or highlighted.
         $vis = [];
+        $open = []; // stack of [depth, closing brace] for expanded containers
+        $closeTo = function (int $depth) use (&$open, &$vis, $bg, $iw): void {
+            while ($open !== [] && end($open)[0] >= $depth) {
+                [$d, $brace] = array_pop($open);
+                $runs = [[str_repeat(' ', max(0, min($d * 2, $iw - 1))), $bg], [$brace, $this->jsonValueStyle('object')]];
+                $vis[] = ['nodeIdx' => null, 'segs' => $runs];
+            }
+        };
         foreach ($state->jsonNodes as $idx => $node) {
+            $closeTo($node['depth']);
             $hang = max(0, min($node['depth'] * 2 + 2, $iw - 8));
             foreach ($this->jsonWrapRuns($this->jsonNodeRuns($node, $bg), $iw, $hang, $bg) as $segs) {
                 $vis[] = ['nodeIdx' => $idx, 'segs' => $segs];
             }
+            if ($node['container'] && $node['expanded']) {
+                $open[] = [$node['depth'], $node['value'] === '[' ? ']' : '}'];
+            }
         }
+        $closeTo(0);
         $total = count($vis);
 
         $maxBoxH = $h - 2;
@@ -2248,6 +2407,21 @@ final class Renderer
         }
         $screen->put($x, $top + $boxH - 1, '└' . str_repeat('─', $boxW - 2) . '┘', $border);
 
+        // More items than rows: a scrollbar on the right border, the same
+        // glyphs as the editor's, so a ten-row list of forty says so (§4).
+        if ($n > $maxVisible && $maxVisible >= 2) {
+            [$thumb, $pos] = $this->scrollThumb($maxVisible, $maxVisible, $n, $off);
+            for ($i = 0; $i < $maxVisible; $i++) {
+                $on = $i >= $pos && $i < $pos + $thumb;
+                $screen->put(
+                    $x + $boxW - 1,
+                    $top + 1 + $i,
+                    $on ? '█' : '░',
+                    $this->theme->style($on ? 'scrollbar_thumb' : 'scrollbar'),
+                );
+            }
+        }
+
         $state->modalRect = [$x, $top, $boxW, $boxH];
     }
 
@@ -2324,6 +2498,7 @@ final class Renderer
                 'Home/End    First / last row',
                 'Up on row 0 Select the header row',
                 'Enter       Edit cell → UPDATE goes to the CLI to run/cancel',
+                'Ctrl+N      Set the cell to NULL (same UPDATE → CLI)',
                 'Del         Delete the selected row (count + confirm first)',
                 'Ctrl+Del    Mark mode: checkbox column for deleting several',
                 'Enter/Space Tick the row under the cursor (mark mode)',
@@ -2333,9 +2508,11 @@ final class Renderer
                 'Ctrl+C      Copy cell to clipboard',
                 'Ctrl+Alt+C  Copy row to clipboard',
                 'Ctrl+Alt+O  Export the view to a CSV in the current dir',
+                'Ctrl+Alt+S  Unmoved columns A–Z / result order (not saved)',
                 'Ctrl+L      Data View Configuration (this column + the table)',
                 'Alt+1…9     Switch data view',
                 'Ctrl+Pg↑/↓  Previous / next data view (wraps at 1 and 9)',
+                'F5          Re-run this view\'s query, exactly as typed',
                 '/           System menu',
                 'Ctrl+D      Toggle DATA / CLI focus',
                 'Esc         Back to the CLI (closes any popup first)',
@@ -2343,9 +2520,10 @@ final class Renderer
         } else {
             $title = ' CLI shortcuts ';
             $lines = [
-                'Enter       Run (; \\G, or a ?macro ending the line), else new line',
+                'Enter       Run (; ]G, or a ?macro ending the line), else new line',
                 'Alt+Enter   Additional line always, even after a `;`',
-                '\\1 … \\9     Run into data view 1-9 and switch to it',
+                ']1 … ]9     Run into data view 1-9 and switch to it',
+                '            ]G vertical · [ and \\ work too · a trailing ; is fine',
                 'Alt+1…9     Switch data view',
                 'Ctrl+Pg↑/↓  Previous / next data view (wraps at 1 and 9)',
                 'Tab         Autocomplete tables/fields · ? then Tab for macros',
@@ -2354,10 +2532,11 @@ final class Renderer
                 '            (a ?name inside quotes is literal — nothing expands)',
                 '↑ / ↓       History (typed) · move between lines',
                 'Alt+↑ ↓     History (executed SQL)',
+                'F5          Re-run this view\'s query, exactly as typed',
                 'Shift+move  Select text (←→ Home End Ctrl+←→ ↑↓)',
                 'Ctrl+A      Select all · drag with the mouse to select',
                 'Ctrl+C / V  Copy selection · paste (replaces selection)',
-                '/           System menu  (// for a literal /)',
+                '/           System menu  (// for a literal /; 1-9 pick items)',
                 'word?       Data dictionary hint',
                 'clear/cls   Clear the data view',
                 'exit/quit   Quit the app',
@@ -2373,6 +2552,10 @@ final class Renderer
         // query, so Esc would do nothing and listing it would be a lie.
         if ($state->canCancel) {
             $lines[] = 'Esc         Cancel a running query';
+        } else {
+            // Said rather than silently left out: the one place someone looks
+            // for the key is here, and "not listed" doesn't tell them why.
+            $lines[] = '(Esc-cancel needs the mysqli driver — see php sqli.php --lint)';
         }
         $lines[] = 'Ctrl+Alt+Z/X Quit  (or type exit/quit)';
         $lines[] = 'F1 / Esc    Close this help';
@@ -2482,7 +2665,9 @@ final class Renderer
         $rawIdx = $order[$rowPos] ?? null;
         $raw = $rawIdx === null
             ? null
-            : ($state->pending[$rawIdx][$col] ?? ($result->rows[$rawIdx][$col] ?? null));
+            : (array_key_exists($col, $state->pending[$rawIdx] ?? [])
+                ? $state->pending[$rawIdx][$col]
+                : ($result->rows[$rawIdx][$col] ?? null));
         $value = $rawIdx === null ? '(no rows)' : ($raw === null ? 'NULL' : (string) $raw);
         // Show the formatted value (e.g. epoch → local datetime) like the grid (§6).
         $fmt = ColumnFormats::get($state->formatOf($col));

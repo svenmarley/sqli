@@ -12,6 +12,7 @@ use Sqli\Db\Database;
 use Sqli\Db\DataDictionary;
 use Sqli\Db\FieldValidator;
 use Sqli\Db\QueryResult;
+use Sqli\Db\ResultColumns;
 use Sqli\Db\Schema;
 use Sqli\Db\SchemaDiff;
 use Sqli\Export\CsvExport;
@@ -297,6 +298,14 @@ final class App
     private ?string $submitTyped = null;
 
     /**
+     * The whole CLI submission exactly as typed, for {@see State::$lastTyped}
+     * (F5). Unlike {@see $submitTyped} it is always set, and it spans every
+     * statement of a batch. Null outside a typed submission, so a statement
+     * sqli runs on its own (the PK re-run) leaves the view's text alone.
+     */
+    private ?string $submissionTyped = null;
+
+    /**
      * The submission suspended on a `?{name}` question, or null (§23).
      *
      * Holds the expanded SQL and everything {@see runSubmission()} will need
@@ -342,6 +351,9 @@ final class App
      * {@see execute()}, which hands it to {@see $queryContext}.
      */
     private bool $resentStatement = false;
+
+    /** Set by {@see runScript()}: no terminal, so nothing may try to draw. */
+    private bool $headless = false;
 
     /**
      * The whole of what a silently re-sent statement says about itself (§2).
@@ -497,6 +509,7 @@ final class App
     {
         $this->state->version = $this->version;
         $this->state->readOnly = $this->config->isFlag('read-only');
+        $this->state->envUntyped = $this->untypedEnv();
         // `--comment PROD`, or a `comment` key on the env in the config file, so
         // a server that deserves a warning carries one without anyone having to
         // remember to type it (§7).
@@ -555,6 +568,18 @@ final class App
         if ($notices !== []) {
             $this->state->statusLine = (string) end($notices);
             $this->state->statusIsError = false;
+        }
+        // The selected env is defined differently by two config files (§2). sqli.php
+        // said so on the plain terminal, which the alternate screen has just
+        // covered, so it is said again where it will be read.
+        $conflicts = $this->config->envConflicts($this->config->envChain());
+        foreach ($conflicts as $c) {
+            my::lineout('FILE:FILE', 'env conflict', $c);
+        }
+        if ($conflicts !== []) {
+            $this->state->statusLine = 'warning: ' . $conflicts[0]
+                . (count($conflicts) > 1 ? sprintf(' (+%d more — see --lint)', count($conflicts) - 1) : '');
+            $this->state->statusIsError = true;
         }
 
         // Only load a Data Dictionary at startup when one is explicitly passed via
@@ -718,6 +743,10 @@ final class App
      */
     private function withBusy(string $message, callable $fn, bool $modal = false): mixed
     {
+        // Scripting mode (-e) has no screen to paint the notice on.
+        if ($this->headless) {
+            return $fn();
+        }
         $this->state->busyMessage = $message;
         $this->state->busyModal = $modal;
         $this->flushFrame();
@@ -1187,6 +1216,14 @@ final class App
         // F1 opens the context-sensitive help overlay (§15).
         if ($e->key === Key::F1) {
             $this->state->help = true;
+            return;
+        }
+
+        // F5 re-runs the SQL behind the visible data view, from either focus.
+        // Below every modal guard, like F1, so it cannot replace the CLI — or
+        // fire a statement — out from under an open popup.
+        if ($e->key === Key::F5) {
+            $this->recallViewSql();
             return;
         }
 
@@ -1736,9 +1773,15 @@ final class App
                 } elseif ($e->ctrl && $e->alt && strtolower($e->char) === 'o') {
                     // Ctrl+Alt+O → export the arranged grid to a CSV in the cwd (§19).
                     $this->exportCsv();
+                } elseif ($e->ctrl && $e->alt && strtolower($e->char) === 's') {
+                    // Ctrl+Alt+S → unmoved columns A–Z / back to result order (§6).
+                    $this->toggleColAlpha();
                 } elseif ($e->ctrl && !$e->alt && strtolower($e->char) === 'c') {
                     // Ctrl+C → copy the selected cell value to the clipboard (§19).
                     $this->copyCell();
+                } elseif ($e->ctrl && !$e->alt && strtolower($e->char) === 'n') {
+                    // Ctrl+N → set the selected cell to SQL NULL (§9).
+                    $this->setCellNull();
                 } elseif (!$e->ctrl && !$e->alt && strtolower($e->char) === 'i') {
                     // i → toggle the detail view for the selected row (§8). Not
                     // available in vertical (\G) output. Replaces the old
@@ -1879,8 +1922,8 @@ final class App
     }
 
     /**
-     * "Change width" mode (§6): Up/Right widen, Down/Left narrow (the horizontal
-     * arrows are aliased to the vertical ones), Enter/Esc exit.
+     * "Change width" mode (§6): Right/Left widen/narrow by 1, Up/Down by 5 (the horizontal
+     * arrows fine-tune, the vertical ones move fast), Enter/Esc exit.
      */
     private function handleWidthAdjustKey(KeyEvent $e): void
     {
@@ -1888,14 +1931,15 @@ final class App
         switch ($e->key) {
             case Key::Up:
             case Key::Right:
+                // Right/Left fine-tune by 1; Up/Down move fast by 5.
                 if ($name !== null) {
-                    $this->adjustWidth($name, 1);
+                    $this->adjustWidth($name, $e->key === Key::Right ? 1 : 5);
                 }
                 break;
             case Key::Down:
             case Key::Left:
                 if ($name !== null) {
-                    $this->adjustWidth($name, -1);
+                    $this->adjustWidth($name, $e->key === Key::Left ? -1 : -5);
                 }
                 break;
             case Key::Enter:
@@ -2435,6 +2479,13 @@ final class App
                 // field, layered over the detail view (§10).
                 if (!$e->ctrl && !$e->alt && strtolower($e->char) === 'i') {
                     $this->state->detail = false;
+                } elseif (!$e->ctrl && !$e->alt && strtolower($e->char) === 's') {
+                    // `S` toggles A–Z field order; the selection stays on the
+                    // same field rather than on the same line number.
+                    $name = $this->state->detailColumns()[$this->state->detailFieldIdx] ?? null;
+                    $this->state->detailSorted = !$this->state->detailSorted;
+                    $idx = $name === null ? false : array_search($name, $this->state->detailColumns(), true);
+                    $this->state->detailFieldIdx = is_int($idx) ? $idx : 0;
                 } elseif (!$e->ctrl && !$e->alt && strtolower($e->char) === 'j') {
                     $this->openJsonFromDetail();
                 }
@@ -3056,11 +3107,7 @@ final class App
                 $this->state->systemMenu = false;
                 break;
             case Key::Enter:
-                $sel = $items[$this->state->systemMenuItem] ?? null;
-                if ($sel !== null && $sel['enabled']) {
-                    $this->state->systemMenu = false;
-                    $this->applySystemMenuAction($sel['action']);
-                }
+                $this->activateSystemMenuItem($items);
                 break;
             case Key::Char:
                 // A second `/` right after the one that opened the menu means the
@@ -3072,11 +3119,51 @@ final class App
                         $this->input->insert('/');
                         $this->resetHistoryNav();
                     }
+                    break;
+                }
+                // Every other key belongs to the menu. `/` is no longer a suffix
+                // sigil (2.39.15: `]3`, `[3`, `\3`), so nothing typed after it
+                // is handed back to the line; a digit picks the item numbered
+                // with it.
+                $idx = $this->quickKeyIndex($items, $e);
+                if ($idx !== null) {
+                    $this->state->systemMenuItem = $idx;
+                    $this->activateSystemMenuItem($items);
                 }
                 break;
             default:
                 break;
         }
+    }
+
+    /**
+     * Run the selected System menu item, if it is enabled; a disabled one only
+     * keeps the cursor.
+     *
+     * @param list<array{label:string,action:string,enabled:bool}> $items
+     */
+    private function activateSystemMenuItem(array $items): void
+    {
+        $sel = $items[$this->state->systemMenuItem] ?? null;
+        if ($sel !== null && $sel['enabled']) {
+            $this->state->systemMenu = false;
+            $this->applySystemMenuAction($sel['action']);
+        }
+    }
+
+    /**
+     * The item a plain keypress names by its quick key ({@see State::menuQuickKeys()}),
+     * or null. Letters match either case, since the label shows lower case.
+     *
+     * @param list<array{label:?string,...}> $items
+     */
+    private function quickKeyIndex(array $items, KeyEvent $e): ?int
+    {
+        if ($e->key !== Key::Char || $e->ctrl || $e->alt || $e->char === '') {
+            return null;
+        }
+        $idx = array_search(strtolower($e->char), State::menuQuickKeys($items), true);
+        return $idx === false ? null : $idx;
     }
 
     /**
@@ -3186,7 +3273,7 @@ final class App
             $this->state->macrosScope = '';
         } else {
             $env = $this->macros->env();
-            $parts = [$env === null ? 'no env selected — start sqli with -e NAME' : 'env ' . $env];
+            $parts = [$env === null ? 'no env selected — start sqli with -E NAME' : 'env ' . $env];
             // Counted per section rather than in one lump, because more than one
             // can load: an env that `extends` another (§16) inherits its macros,
             // and crediting a parent's definitions to the selected env would name
@@ -3359,6 +3446,7 @@ final class App
     private function cancelPrompt(): void
     {
         $this->pendingPrompt = null;
+        $this->submissionTyped = null;
         $this->closePrompt();
         $this->state->statusLine = 'Cancelled — nothing was run';
         $this->state->statusIsError = false;
@@ -5027,33 +5115,51 @@ final class App
                 $this->state->layoutPopup = false;
                 break;
             case Key::Enter:
-                $sel = $items[$this->state->layoutItem] ?? null;
-                if ($sel === null || !$sel['enabled'] || $sel['action'] === null) {
-                    break;
-                }
-                $action = $sel['action'];
-                // Unhiding a single column keeps the popup open so several can be
-                // unhidden in a row; everything else closes it.
-                $keepOpen = str_starts_with($action, 'unhide:');
-                // The per-column half and the table-wide half share one menu, so
-                // the dispatch asks which half the chosen action belongs to. The
-                // column actions need $popupCol, which openLayoutPopup() set.
-                if (in_array($action, self::COLUMN_ACTIONS, true)) {
-                    $this->applyColumnAction($action);
-                } else {
-                    $this->applyLayoutActionStr($action);
-                }
-                if ($keepOpen) {
-                    $this->state->layoutItem = $this->clampMenuIndex(
-                        $this->layoutPopupItems(),
-                        $this->state->layoutItem,
-                    );
-                } else {
-                    $this->state->layoutPopup = false;
+                $this->activateLayoutItem($items);
+                break;
+            case Key::Char:
+                $idx = $this->quickKeyIndex($items, $e);
+                if ($idx !== null) {
+                    $this->state->layoutItem = $idx;
+                    $this->activateLayoutItem($items);
                 }
                 break;
             default:
                 break;
+        }
+    }
+
+    /**
+     * Run the selected Data View Configuration item, if it is enabled; a
+     * disabled one only keeps the cursor.
+     *
+     * @param list<array{label:?string,action:?string,enabled:bool}> $items
+     */
+    private function activateLayoutItem(array $items): void
+    {
+        $sel = $items[$this->state->layoutItem] ?? null;
+        if ($sel === null || !$sel['enabled'] || $sel['action'] === null) {
+            return;
+        }
+        $action = $sel['action'];
+        // Unhiding a single column keeps the popup open so several can be
+        // unhidden in a row; everything else closes it.
+        $keepOpen = str_starts_with($action, 'unhide:');
+        // The per-column half and the table-wide half share one menu, so
+        // the dispatch asks which half the chosen action belongs to. The
+        // column actions need $popupCol, which openLayoutPopup() set.
+        if (in_array($action, self::COLUMN_ACTIONS, true)) {
+            $this->applyColumnAction($action);
+        } else {
+            $this->applyLayoutActionStr($action);
+        }
+        if ($keepOpen) {
+            $this->state->layoutItem = $this->clampMenuIndex(
+                $this->layoutPopupItems(),
+                $this->state->layoutItem,
+            );
+        } else {
+            $this->state->layoutPopup = false;
         }
     }
 
@@ -5299,6 +5405,7 @@ final class App
                 break;
             case 'reset_order':
                 $this->state->colOrder = [];
+                $this->state->colAlpha = false;
                 $this->persistColOrder();
                 break;
             case 'clear_sort':
@@ -5309,6 +5416,7 @@ final class App
                 $this->state->hiddenCols = [];
                 $this->state->colWidthOverride = [];
                 $this->state->colOrder = [];
+                $this->state->colAlpha = false;
                 $this->state->colFormats = [];
                 $this->state->sortCol = null;
                 $this->state->applySort();
@@ -5342,7 +5450,11 @@ final class App
 
     private function adjustWidth(string $name, int $delta): void
     {
-        $current = $this->state->colWidthOverride[$name] ?? $this->naturalWidth($name);
+        // Start from the width actually on screen, not naturalWidth(): the grid
+        // caps an un-overridden column (MAX_COL_WIDTH), so a long text column
+        // drawn at 40 would otherwise jump to its full data width on the first
+        // press. naturalWidth() is only the fallback before a frame exists.
+        $current = $this->state->colWidthOverride[$name] ?? $this->shownWidth() ?? $this->naturalWidth($name);
         $this->state->colWidthOverride[$name] = max(1, min(200, $current + $delta));
         $this->persistWidths();
     }
@@ -5376,12 +5488,57 @@ final class App
         array_splice($vis, $i, 1);
         array_splice($vis, $newI, 0, [$name]);
 
-        // Hidden columns aren't shown; park them after the visible order. When a
-        // column is later unhidden it reappears at the end — predictable enough.
-        $full = array_merge($vis, $this->state->hiddenCols);
-        $this->state->colOrder = $full === $this->state->result->columns ? [] : $full;
+        // What is saved is a prefix of the display: every column up to the last
+        // one the user has placed — this one, or one placed earlier that now
+        // sits further right. Everything after it stays "unmoved" and keeps
+        // following result order (or A–Z, which is never saved on its own). So
+        // moving a column while the view is A–Z saves the A–Z columns before it,
+        // and that is what brings its position back next time.
+        // In move mode "placed" is judged against the order on entry, not the
+        // one the previous step left: each Left/Right saves, and a column merely
+        // stepped over would otherwise join the prefix and stop being unmoved.
+        $base = $this->state->moveMode ? ($this->moveSavedOrder ?? []) : $this->state->colOrder;
+        $placed = array_flip(array_merge($base, [$name]));
+        $last = $newI;
+        foreach ($vis as $pos => $col) {
+            if (isset($placed[$col])) {
+                $last = max($last, $pos);
+            }
+        }
+        $prefix = array_slice($vis, 0, $last + 1);
+        // Kept even when it matches the result's own order. Moving `name`,
+        // `description` and `id` back to `id, name, description` is still a
+        // placement — those columns must hold under A–Z. It used to be saved as
+        // [] ("nothing to say"), and Ctrl+Alt+S then sorted them with the rest.
+        // Reset column order is what clears it.
+        $this->state->colOrder = $prefix;
         $this->state->selectedCol = $newI;
         $this->persistColOrder();
+    }
+
+    /**
+     * Ctrl+Alt+S (§6): the unmoved columns — those after the saved prefix — A–Z,
+     * or back to result order. Nothing is persisted; moving a column is what
+     * saves an order. The selection stays on the same column.
+     */
+    private function toggleColAlpha(): void
+    {
+        if (!$this->state->hasResult() || $this->state->vertical) {
+            return;
+        }
+        $name = $this->state->visibleColumnNames()[$this->state->selectedCol] ?? null;
+        $this->state->colAlpha = !$this->state->colAlpha;
+        if ($name !== null) {
+            $idx = array_search($name, $this->state->visibleColumnNames(), true);
+            $this->state->selectedCol = $idx === false ? 0 : $idx;
+        }
+        $placed = count($this->state->colOrder);
+        $this->state->statusLine = $this->state->colAlpha
+            ? ($placed > 0 ? 'Unmoved columns A–Z' : 'Columns A–Z') . ' (not saved — move a column to keep an order)'
+            : ($placed > 0
+                ? 'Columns back to your layout (' . $placed . ' placed) + result order'
+                : 'Columns back in result order');
+        $this->state->statusIsError = false;
     }
 
     private function hideColumn(string $name): void
@@ -5391,6 +5548,17 @@ final class App
             $this->persistHidden();
         }
         $this->clampSelectedCol();
+    }
+
+    /** The selected column's width as last drawn, or null when it wasn't on screen. */
+    private function shownWidth(): ?int
+    {
+        foreach ($this->state->gridLayout?->columns ?? [] as $c) {
+            if ($c['idx'] === $this->state->selectedCol) {
+                return $c['w'];
+            }
+        }
+        return null;
     }
 
     /** Widest header/content length for a column, used by "Fit to content". */
@@ -5448,13 +5616,76 @@ final class App
         }
     }
 
+    /**
+     * The display name → stored name map for the current result's columns.
+     *
+     * Saved column state — widths, hidden columns, order, formats — is keyed by
+     * column name, and on a joined result the grid's name is `1.id`. That is the
+     * wrong key to write to disk twice over: it means nothing without the header
+     * chip beside it, and it is **positional**, so swapping the two tables in the
+     * FROM clause silently repoints it at the other column and a saved width
+     * lands on the wrong one. The file gets `templates.id` instead — the same
+     * spelling an export uses, for the same reason (§6).
+     *
+     * @return array<string,string> Empty when nothing needs translating, which
+     *         is every single-table result.
+     */
+    private function storageNames(): array
+    {
+        $result = $this->state->result;
+        if ($result === null || $result->sources === []) {
+            return [];
+        }
+        $stored = ResultColumns::qualified($result->columns, $result->sources);
+        $map = [];
+        foreach ($result->columns as $i => $col) {
+            if (($stored[$i] ?? $col) !== $col) {
+                $map[$col] = $stored[$i];
+            }
+        }
+        return $map;
+    }
+
+    /**
+     * Rewrite a name-keyed map for storage, or back again with $map flipped.
+     *
+     * @param  array<string,mixed>  $byName
+     * @param  array<string,string> $map
+     * @return array<string,mixed>
+     */
+    private static function rekey(array $byName, array $map): array
+    {
+        if ($map === []) {
+            return $byName;
+        }
+        $out = [];
+        foreach ($byName as $name => $value) {
+            $out[$map[$name] ?? $name] = $value;
+        }
+        return $out;
+    }
+
+    /**
+     * @param  list<string>         $names
+     * @param  array<string,string> $map
+     * @return list<string>
+     */
+    private static function rename(array $names, array $map): array
+    {
+        if ($map === []) {
+            return $names;
+        }
+        return array_values(array_map(static fn (string $n): string => $map[$n] ?? $n, $names));
+    }
+
     private function persistWidths(): void
     {
         $scope = $this->database->stateKey();
         if ($scope === '' || $this->state->currentTable === '') {
             return;
         }
-        $this->settings->setColWidths($scope, $this->state->currentTable, $this->state->colWidthOverride);
+        $this->settings->setColWidths($scope, $this->state->currentTable,
+            self::rekey($this->state->colWidthOverride, $this->storageNames()));
     }
 
     private function persistHidden(): void
@@ -5463,7 +5694,9 @@ final class App
         if ($scope === '' || $this->state->currentTable === '') {
             return;
         }
-        $this->settings->setHiddenCols($scope, $this->state->currentTable, array_values($this->state->hiddenCols));
+        $this->settings->setHiddenCols($scope, $this->state->currentTable,
+            self::rename(array_values($this->state->hiddenCols), $this->storageNames()),
+            $this->state->layoutFields);
     }
 
     private function persistColOrder(): void
@@ -5472,7 +5705,9 @@ final class App
         if ($scope === '' || $this->state->currentTable === '') {
             return;
         }
-        $this->settings->setColOrder($scope, $this->state->currentTable, array_values($this->state->colOrder));
+        $this->settings->setColOrder($scope, $this->state->currentTable,
+            self::rename(array_values($this->state->colOrder), $this->storageNames()),
+            $this->state->layoutFields);
     }
 
     private function persistColFormats(): void
@@ -5481,7 +5716,8 @@ final class App
         if ($scope === '' || $this->state->currentTable === '') {
             return;
         }
-        $this->settings->setColFormats($scope, $this->state->currentTable, $this->state->colFormats);
+        $this->settings->setColFormats($scope, $this->state->currentTable,
+            self::rekey($this->state->colFormats, $this->storageNames()));
     }
 
     /**
@@ -5551,24 +5787,31 @@ final class App
      * display formats — for the statement that just ran (§6), and set
      * {@see State::$currentTable} from it.
      *
-     * Two of the four are withheld when the SQL names its own field list. A user
-     * who types `SELECT name, id FROM users` has already said which columns and
-     * in what order; the server returns exactly that, and it is the answer they
-     * asked for. Restoring a stored `colOrder` over it put the columns back in
-     * the arrangement saved from some earlier `SELECT *`, and a stored hidden set
-     * dropped a column that had just been named by hand — the view disagreeing
-     * with the query that made it.
+     * Order and hidden columns are saved per field list ({@see layoutFieldsKey()}):
+     * an arrangement made over `SELECT *` comes back for `SELECT *`, one made
+     * over `SELECT name, id` comes back only for a query naming exactly `name,
+     * id` in that order, and neither leaks into the other. Before 2.39.12 a
+     * named list got no saved order at all, because the only one on file was
+     * the `SELECT *` one, and restoring it put a hand-written list back in some
+     * other query's arrangement.
      *
      * Widths and formats are keyed by column name and neither reorder nor remove
-     * anything, so they always apply: a column shown as date/time last time is
-     * still date/time here. `SELECT *` names nothing and keeps the whole saved
-     * arrangement, which is the case the saved arrangement was built for.
+     * anything, so they apply to every query on the table: a column shown as
+     * date/time last time is still date/time here.
      */
     private function applySavedLayout(string $sql): void
     {
+        $previous = $this->state->currentTable;
         $this->state->currentTable = $this->extractTableFromSql($sql);
+        // A–Z (Ctrl+Alt+S) is a look at this table's columns, not a setting:
+        // it lasts while the view keeps showing the same table (F5, a new WHERE)
+        // and goes when it shows another.
+        if ($this->state->currentTable !== $previous) {
+            $this->state->colAlpha = false;
+        }
         $scope = $this->database->stateKey();
         $table = $this->state->currentTable;
+        $this->state->layoutFields = $this->layoutFieldsKey($sql);
         if ($table === '' || $scope === '') {
             $this->state->colWidthOverride = [];
             $this->state->hiddenCols = [];
@@ -5576,11 +5819,36 @@ final class App
             $this->state->colFormats = [];
             return;
         }
-        $named = Normalizer::namesColumns($sql);
-        $this->state->colWidthOverride = $this->settings->getColWidths($scope, $table);
-        $this->state->hiddenCols = $named ? [] : $this->settings->getHiddenCols($scope, $table);
-        $this->state->colOrder   = $named ? [] : $this->settings->getColOrder($scope, $table);
-        $this->state->colFormats = $this->settings->getColFormats($scope, $table);
+        $fields = $this->state->layoutFields;
+        // What is on disk is spelled `templates.id`; what the grid works in is
+        // `1.id`. Flipping the map turns the stored names back into this
+        // result's, and leaves alone anything it does not recognise — a saved
+        // entry for a column this query did not return simply never matches.
+        $back = array_flip($this->storageNames());
+        $this->state->colWidthOverride = self::rekey($this->settings->getColWidths($scope, $table), $back);
+        $this->state->hiddenCols = self::rename($this->settings->getHiddenCols($scope, $table, $fields), $back);
+        $this->state->colOrder   = self::rename($this->settings->getColOrder($scope, $table, $fields), $back);
+        $this->state->colFormats = self::rekey($this->settings->getColFormats($scope, $table), $back);
+    }
+
+    /**
+     * The key a query's saved order and hidden set are filed under (§6): `*`
+     * when it names no columns, otherwise the columns it returned, in the
+     * order it returned them, in their stored spelling (`templates.id` on a
+     * join, {@see storageNames()}).
+     *
+     * The result's own names rather than the SQL text, so spacing, backticks
+     * and `t.` prefixes don't make two identical lists look different, and an
+     * alias is the name the user sees. `name, id` and `id, name` are different
+     * lists: the order was part of what the query asked for.
+     */
+    private function layoutFieldsKey(string $sql): string
+    {
+        $result = $this->state->result;
+        if (!Normalizer::namesColumns($sql) || $result === null) {
+            return '*';
+        }
+        return implode(', ', self::rename($result->columns, $this->storageNames()));
     }
 
     /**
@@ -5774,10 +6042,57 @@ final class App
 
     // --- cell editing & pending changes (§9) ------------------------------
 
+    /**
+     * Ctrl+N: set the selected cell to SQL NULL (§9). It is an edit like any
+     * other — the one-cell UPDATE goes to the CLI to run or cancel — only the
+     * value is a real NULL rather than text, which typing cannot say reliably
+     * (`NULL` typed into the editor also means NULL, so the literal string
+     * cannot be stored that way, and an empty edit is the empty string).
+     *
+     * Refused where the database would refuse it or the edit makes no sense: a
+     * NOT NULL column, the primary key, a joined grid, read-only mode, and a
+     * cell that is already NULL.
+     */
+    private function setCellNull(): void
+    {
+        if ($this->state->readOnly) {
+            $this->state->statusLine = '[RO] Read-only mode — editing is blocked' . $this->readOnlyWhy();
+            $this->state->statusIsError = true;
+            return;
+        }
+        if (!$this->state->hasResult() || $this->state->selectedRow < 0 || $this->state->markMode) {
+            return;
+        }
+        $col = $this->state->visibleColumnNames()[$this->state->selectedCol] ?? null;
+        $rawIdx = $this->state->displayOrder()[$this->state->selectedRow] ?? null;
+        if ($col === null || $rawIdx === null) {
+            return;
+        }
+        if ($this->blockIfMultiSource('edit') || $this->blockIfPrimaryKey($col)) {
+            return;
+        }
+        if ($this->cellIsNull($rawIdx, $col)) {
+            $this->state->statusLine = '`' . $col . '` is already NULL';
+            $this->state->statusIsError = false;
+            return;
+        }
+        $table = $this->state->currentTable;
+        $describe = $table === '' ? null : $this->schema->describeColumn($table, $col);
+        if ($describe !== null && strtoupper((string) ($describe['Null'] ?? '')) === 'NO') {
+            $this->state->statusLine = '`' . $col . '` is NOT NULL — it cannot be set to NULL';
+            $this->state->statusIsError = true;
+            return;
+        }
+        $this->stageEdit($rawIdx, $col, null);
+        if ($this->autoUpdate !== null) {
+            $this->warnIfForeignKey($col);
+        }
+    }
+
     private function openCellEdit(): void
     {
         if ($this->state->readOnly) {
-            $this->state->statusLine = '[RO] Read-only mode — editing is blocked';
+            $this->state->statusLine = '[RO] Read-only mode — editing is blocked' . $this->readOnlyWhy();
             $this->state->statusIsError = true;
             return;
         }
@@ -5789,13 +6104,11 @@ final class App
         if ($col === null || $rawIdx === null) {
             return;
         }
-        if ($this->blockIfPrimaryKey($col)) {
+        if ($this->blockIfMultiSource('edit') || $this->blockIfPrimaryKey($col)) {
             return;
         }
         $this->warnIfForeignKey($col);
-        $current = $this->state->pending[$rawIdx][$col]
-            ?? $this->state->result->rows[$rawIdx][$col]
-            ?? null;
+        $current = $this->cellIsNull($rawIdx, $col) ? null : $this->cellValueAt($rawIdx, $col);
         // A formatted column edits in its displayed form (e.g. a datetime); the
         // edit is converted back to the raw value on commit (§6).
         $value = $this->formatDisplay($col, $current === null ? '' : (string) $current);
@@ -5863,12 +6176,11 @@ final class App
         if ($col === '' || $rawIdx === null) {
             return;
         }
-        if ($this->blockIfPrimaryKey($col)) {
+        if ($this->blockIfReadOnly() || $this->blockIfMultiSource('edit') || $this->blockIfPrimaryKey($col)) {
             return;
         }
         $this->warnIfForeignKey($col);
-        $current = $this->state->pending[$rawIdx][$col]
-            ?? ($this->state->result->rows[$rawIdx][$col] ?? null);
+        $current = $this->cellIsNull($rawIdx, $col) ? null : $this->cellValueAt($rawIdx, $col);
         $editor = new LineEditor();
         // Edit in the column's displayed form; converted back on commit (§6).
         $editor->setText($this->formatDisplay($col, $current === null ? '' : (string) $current));
@@ -5878,6 +6190,30 @@ final class App
         $this->state->cellEditFromView = true;
         $this->state->cellMoveMode = false;
         $this->state->cellEdit = true;
+    }
+
+    /**
+     * Refuse to start an edit in read-only mode, saying why. stageEdit() blocks
+     * the UPDATE itself; this stops an editor opening that could never save.
+     */
+    private function blockIfReadOnly(): bool
+    {
+        if (!$this->state->readOnly) {
+            return false;
+        }
+        $this->state->statusLine = '[RO] Read-only mode — editing is blocked' . $this->readOnlyWhy();
+        $this->state->statusIsError = true;
+        return true;
+    }
+
+    /** JSON viewer form of {@see blockIfReadOnly()}: the refusal goes on its notice row. */
+    private function blockJsonIfReadOnly(): bool
+    {
+        if (!$this->state->readOnly) {
+            return false;
+        }
+        $this->state->jsonNotice = '[RO] Read-only mode — editing is blocked';
+        return true;
     }
 
     /** Arrow keys reposition the inspector while move mode is active (§9). */
@@ -6059,6 +6395,37 @@ final class App
         return $row === null ? null : FieldValidator::validate($row, $value);
     }
 
+    /**
+     * True (and sets a status error) when the result was joined from more than
+     * one table, which makes it unsafe to write to.
+     *
+     * Every generated statement takes its table from {@see State::$currentTable},
+     * which is the *first* table the SQL mentions — so on a join of `templates`
+     * and `template_items` a cell edit would build `UPDATE templates`, and a row
+     * delete `DELETE FROM templates WHERE id IN (…)`, whichever table the column
+     * or the key actually came from. Both are valid SQL aimed at the wrong rows.
+     *
+     * There is no safe guess to make here — the fix is a per-column table map
+     * and a WHERE built from the right one, which is a feature, not a patch. In
+     * the meantime the grid refuses and says why, because a wrong `DELETE` is
+     * the worst outcome in the program.
+     */
+    private function blockIfMultiSource(string $verb): bool
+    {
+        $result = $this->state->result;
+        if ($result === null || !$result->isMultiSource()) {
+            return false;
+        }
+        $names = [];
+        foreach ($result->sources as $source) {
+            $names[] = $source->name();
+        }
+        $this->state->statusLine = 'Cannot ' . $verb . ': this result joins '
+            . implode(' + ', $names) . ' — query one table to edit it';
+        $this->state->statusIsError = true;
+        return true;
+    }
+
     /** True (and sets a status error) when $col is a primary key and can't be edited. */
     private function blockIfPrimaryKey(string $col): bool
     {
@@ -6096,12 +6463,12 @@ final class App
      * UPDATE and drop it on the CLI to run or cancel. Focus moves to the CLI so
      * the user can review + submit. A missing PK aborts (PK popup / error).
      */
-    private function stageEdit(int $rawIdx, string $col, string $newValue): void
+    private function stageEdit(int $rawIdx, string $col, ?string $newValue): void
     {
         // The in-flight UPDATE runs directly (bypassing execute's guards), so the
         // read-only block has to be enforced here (§17).
         if ($this->state->readOnly) {
-            $this->state->statusLine = '[RO] Read-only mode — editing is blocked';
+            $this->state->statusLine = '[RO] Read-only mode — editing is blocked' . $this->readOnlyWhy();
             $this->state->statusIsError = true;
             return;
         }
@@ -6179,7 +6546,7 @@ final class App
         if ($au === null) {
             return;
         }
-        $val = $this->state->pending[$au['rawIdx']][$au['col']] ?? null;
+        $val = $this->state->pending[$au['rawIdx']][$au['col']] ?? null; // null = a staged NULL
         $res = $this->database->query(rtrim($au['sql'], ';'));
         if ($res->hasError()) {
             $this->revertPendingCell($au['rawIdx'], $au['col']);
@@ -6187,9 +6554,7 @@ final class App
         } else {
             // Commit the value into the (readonly) result by rebuilding it, then
             // drop the transient staged value — the grid now shows the saved data.
-            if ($val !== null) {
-                $this->foldResultCell($au['rawIdx'], $au['col'], $val);
-            }
+            $this->foldResultCell($au['rawIdx'], $au['col'], $val);
             $this->revertPendingCell($au['rawIdx'], $au['col']);
             $this->state->statusLine = 'Row updated ('
                 . $res->affectedRows . ' row' . ($res->affectedRows === 1 ? '' : 's') . ')';
@@ -6201,7 +6566,7 @@ final class App
     }
 
     /** Rebuild the readonly result with one cell replaced (fold a saved edit). */
-    private function foldResultCell(int $rawIdx, string $col, string $val): void
+    private function foldResultCell(int $rawIdx, string $col, ?string $val): void
     {
         $r = $this->state->result;
         if ($r === null || !isset($r->rows[$rawIdx])) {
@@ -6216,6 +6581,8 @@ final class App
             $r->elapsed,
             $r->error,
             $r->isSelect,
+            $r->sources,
+            $r->columnSources,
         );
     }
 
@@ -6235,7 +6602,7 @@ final class App
             return;
         }
         if ($this->state->readOnly) {
-            $this->setError('[RO] Read-only mode - deleting is blocked');
+            $this->setError('[RO] Read-only mode — deleting is blocked' . $this->readOnlyWhy());
             return;
         }
         if ($this->state->markMode) {
@@ -6294,7 +6661,7 @@ final class App
             return;
         }
         if ($this->state->readOnly) {
-            $this->setError('[RO] Read-only mode - deleting is blocked');
+            $this->setError('[RO] Read-only mode — deleting is blocked' . $this->readOnlyWhy());
             return;
         }
         if ($this->state->markMode) {
@@ -6359,6 +6726,9 @@ final class App
      */
     private function buildDelete(array $rawIdxs): ?array
     {
+        if ($this->blockIfMultiSource('delete')) {
+            return null;
+        }
         $table = $this->state->currentTable;
         if ($table === '') {
             $this->setError('Cannot build DELETE: table is unknown');
@@ -6589,7 +6959,7 @@ final class App
         if ($result === null) {
             return;
         }
-        $col = $result->columns()[$this->state->detailFieldIdx] ?? null;
+        $col = $this->state->detailColumns()[$this->state->detailFieldIdx] ?? null;
         $rawIdx = $this->currentViewRawIdx();
         if ($col === null || $rawIdx === null) {
             return;
@@ -6946,7 +7316,7 @@ final class App
     private function openJsonNodeEdit(): void
     {
         $row = $this->jsonRows[$this->state->jsonSel] ?? null;
-        if ($row === null || $row['container']) {
+        if ($row === null || $row['container'] || $this->blockJsonIfReadOnly()) {
             return;
         }
         $editor = new LineEditor();
@@ -6971,7 +7341,7 @@ final class App
     /** `d`/Delete: remove the selected node and everything under it (§10). */
     private function jsonDeleteSelected(): void
     {
-        if ($this->jsonTree === null) {
+        if ($this->jsonTree === null || $this->blockJsonIfReadOnly()) {
             return;
         }
         $node = $this->selectedJsonNode();
@@ -6988,7 +7358,7 @@ final class App
      */
     private function jsonAdd(bool $child): void
     {
-        if ($this->jsonTree === null) {
+        if ($this->jsonTree === null || $this->blockJsonIfReadOnly()) {
             return;
         }
         $sel = $this->selectedJsonNode();
@@ -7132,6 +7502,9 @@ final class App
         if ($changes === [] || $row === null) {
             return null;
         }
+        if ($this->blockIfMultiSource('build an UPDATE')) {
+            return null;
+        }
         if ($table === '') {
             $this->setError('Cannot build UPDATE: table is unknown');
             return null;
@@ -7158,7 +7531,7 @@ final class App
 
         $set = [];
         foreach ($changes as $col => $val) {
-            $set[] = '`' . $col . '` = ' . $this->sqlQuote($val);
+            $set[] = '`' . $col . '` = ' . ($val === null ? 'NULL' : $this->sqlQuote($val));
         }
         $where = [];
         foreach ($pk as $k) {
@@ -7342,6 +7715,7 @@ final class App
     {
         $this->state->result = null;
         $this->state->lastSql = '';
+        $this->state->lastTyped = '';
         $this->state->currentTable = '';
         $this->state->detail = false;
         $this->state->vertical = false;
@@ -7378,9 +7752,23 @@ final class App
     /** The value shown for a cell (pending edit if any, else the DB value). */
     private function cellValueAt(int $rawIdx, string $col): string
     {
-        $v = $this->state->pending[$rawIdx][$col]
-            ?? ($this->state->result->rows[$rawIdx][$col] ?? null);
+        $v = array_key_exists($col, $this->state->pending[$rawIdx] ?? [])
+            ? $this->state->pending[$rawIdx][$col]
+            : ($this->state->result->rows[$rawIdx][$col] ?? null);
         return $v === null ? '' : (string) $v;
+    }
+
+    /**
+     * Whether the cell is SQL NULL, reading an in-flight edit first exactly as
+     * {@see cellValueAt()} does — an edit that set a value is not NULL any more.
+     */
+    private function cellIsNull(int $rawIdx, string $col): bool
+    {
+        $pending = $this->state->pending[$rawIdx] ?? [];
+        if (array_key_exists($col, $pending)) {
+            return $pending[$col] === null;
+        }
+        return ($this->state->result->rows[$rawIdx][$col] ?? null) === null;
     }
 
     /**
@@ -7480,16 +7868,22 @@ final class App
         foreach ($s->displayOrder() as $rawIdx) {
             $row = [];
             foreach ($cols as $col) {
-                $row[] = $this->displayValueAt($rawIdx, $col);
+                // A real NULL goes to the writer as null, so it lands as a bare
+                // NULL rather than as the empty string `cellValueAt()` folds it
+                // to — which made it indistinguishable from `''` in the file.
+                $row[] = $this->cellIsNull($rawIdx, $col) ? null : $this->displayValueAt($rawIdx, $col);
             }
             $rows[] = $row;
         }
 
         $path = rtrim($dir, '/\\') . DIRECTORY_SEPARATOR
             . CsvExport::fileName($s->currentDatabase, $s->currentTable);
+        // The file gets the real table names — `templates.id`, not `1.id`. The
+        // numbers only mean anything beside the header chip that defines them.
+        $header = ResultColumns::qualified($cols, $s->result?->sources ?? []);
         // A wide grid can take a moment to render and write; say so first.
         $reason = $this->withBusy('Exporting ' . count($rows) . ' rows to CSV …',
-            static fn (): ?string => CsvExport::write($path, $cols, $rows));
+            static fn (): ?string => CsvExport::write($path, $header, $rows));
 
         if ($reason !== null) {
             $this->notifyTop('Export failed: ' . $reason, true);
@@ -7660,6 +8054,14 @@ final class App
             case Key::PageDown:
                 $this->state->completionIdx = min(max(0, $n - 1), $this->state->completionIdx + 8);
                 return true;
+            // While the list is up, Home/End jump to its first and last item
+            // instead of moving the CLI caret.
+            case Key::Home:
+                $this->state->completionIdx = 0;
+                return true;
+            case Key::End:
+                $this->state->completionIdx = max(0, $n - 1);
+                return true;
             case Key::Escape:
                 $this->state->completion = false;
                 return true;
@@ -7744,13 +8146,26 @@ final class App
         // pressed in the *middle* of one, `?na▏me`, to swap the name: the rest
         // of the old name is taken with it, or it would strand itself on the end
         // of the new one as `?newme`.
-        if ($this->state->completionTitle === Completion::MACROS
-            && preg_match('/^[A-Za-z0-9_.\-]+/u', $tail, $m) === 1
-        ) {
+        $isMacro = $this->state->completionTitle === Completion::MACROS;
+        if ($isMacro && preg_match('/^[A-Za-z0-9_.\-]+/u', $tail, $m) === 1) {
             $tail = mb_substr($tail, mb_strlen($m[0]));
         }
-        $new = mb_substr($text, 0, $start) . $item . $tail;
-        $editor->setText($new, $start + mb_strlen($item));
+        // A completed macro name is followed by a space, cursor after it, so
+        // the arguments (or whatever comes next) are typed straight away:
+        // `?ga` Tab → `?ganl ▏`. A macro with no arguments is unharmed — the
+        // name still ends at the space. When the line already has whitespace
+        // there, the cursor steps over it rather than doubling it.
+        $gap = '';
+        $step = 0;
+        if ($isMacro) {
+            if (preg_match('/^\s/u', $tail) === 1) {
+                $step = 1;
+            } else {
+                $gap = ' ';
+            }
+        }
+        $new = mb_substr($text, 0, $start) . $item . $gap . $tail;
+        $editor->setText($new, $start + mb_strlen($item) + mb_strlen($gap) + $step);
         $this->resetHistoryNav();
     }
 
@@ -7802,21 +8217,29 @@ final class App
             }
         }
 
-        // A `;`, `\G`, `\1`…`\9`, or a complete macro call (§23) on the active
-        // line terminates and submits.
+        // A `;`, a `\G` / `\N` suffix in any of its sigils, or a complete macro call
+        // (§23) on the active line terminates and submits.
         // `\G` selects vertical output mode; `\N` sends the output to data view N
         // and switches to it (§20). The digits are terminators in their own right
         // for the same reason `\G` is — `select * from t \3` is a complete thought,
-        // and having to add a `;` after the routing suffix would be noise.
+        // and having to add a `;` after the routing suffix would be noise. One is
+        // accepted anyway, and stripped along with the suffix, because the muscle
+        // memory that ends every statement with `;` is not worth fighting.
+        //
+        // The suffix arm runs **before** the plain `;`, or `… \G;` would strip
+        // only the semicolon and send a literal `\G` on to the server.
         $terminator = null;
         $targetTab = null;
-        if (str_ends_with($active, ';')) {
+        $vertical = false;
+        if (preg_match(self::terminatorPattern(), $active, $m)) {
+            $terminator = $m[0];
+            if ($m[1] === 'G' || $m[1] === 'g') {
+                $vertical = true;
+            } else {
+                $targetTab = (int) $m[1] - 1;
+            }
+        } elseif (str_ends_with($active, ';')) {
             $terminator = ';';
-        } elseif (preg_match('/\\\\[Gg]$/', $active)) {
-            $terminator = '\\G';
-        } elseif (preg_match('/\\\\([1-' . State::TAB_COUNT . '])$/', $active, $m)) {
-            $terminator = '\\' . $m[1];
-            $targetTab = (int) $m[1] - 1;
         } elseif ($this->macros->endsWithCall($active)) {
             // A macro call is a terminator in its own right (§23). `?who` is a
             // complete thought: the statement it stands for carries its own `;`
@@ -7839,7 +8262,7 @@ final class App
             // Build the SQL without mutating the buffer, so Cancel can keep it.
             $sql = $this->stripTerminator($this->cliText(), $terminator);
             if ($sql !== '') {
-                $this->submit($sql, $terminator === '\\G', $targetTab);
+                $this->submit($sql, $vertical, $targetTab);
             }
             return;
         }
@@ -7855,9 +8278,218 @@ final class App
         if ($terminator === ';') {
             return rtrim(substr($s, 0, -1));
         }
-        // `\G` and the `\1`…`\9` view suffixes (§20) are both a backslash plus one
-        // character, so one pattern strips either.
-        return rtrim((string) preg_replace('/\\\\[Gg1-' . State::TAB_COUNT . ']$/', '', $s));
+        // Every other terminator is a `\G` / `\N` suffix in one of its sigils,
+        // with or without its trailing `;`, so the pattern that recognised it
+        // strips it too.
+        return rtrim((string) preg_replace(self::terminatorPattern(), '', $s));
+    }
+
+    /**
+     * The `\G` and `\1`…`\9` suffixes (§5, §20), with the sigil `\`, `]` or `[`
+     * and an optional trailing `;` — so `\G` `]G` `[G` `\G;` and `\3` `]3` `[3`
+     * `]3;` all terminate. Capture group 1 is the letter or the digit.
+     *
+     * The sigils are the three characters MySQL gives no meaning outside a
+     * quoted string, so none of them needs a rule about what may stand before
+     * it: `SELECT * FROM t]3` routes as surely as `t\G` does, and no query can
+     * end that way by accident. `]` and `[` are the unshifted, menu-free keys
+     * (2.39.15). `/` was a sigil until then, but it is also division
+     * (`SELECT 100 /2` read as routing) and it opens the system menu, so typing
+     * `/3` meant `//3` and a missed keystroke ran menu item 3.
+     *
+     * This is one of the places `TAB_COUNT` is interpolated into a
+     * single-character context; see {@see State::TAB_COUNT} before raising it.
+     */
+    private static function terminatorPattern(): string
+    {
+        return '/[\\\\\][]([Gg1-' . State::TAB_COUNT . ']);?$/';
+    }
+
+    // --- scripting mode: -e and piped SQL (backlog #6) ------------------------
+
+    /** Exit code for a statement the guard would have asked about (§5). */
+    public const EXIT_REFUSED = 2;
+
+    /**
+     * Run $sql with no TUI and write every result set to $out as CSV. Returns
+     * the process exit code: 0, 1 for an error (server, macro, output), or
+     * {@see EXIT_REFUSED} when the guard stopped it.
+     *
+     * The path is the TUI's, minus the person. Macros expand before the split,
+     * the splitter decides the statements, the normalizer rewrites them, and
+     * read-only and {@see dangerCheck()} judge each one exactly as they would at
+     * the CLI — including strict mode for multi-statement input. What changes is
+     * the answer to a confirm: there is nobody to give it, so **anything that
+     * would ask is refused**, and no flag overrides that. A PK-scoped
+     * DELETE/UPDATE asks nothing in the TUI and so runs here too — `-e` is not
+     * read-only.
+     *
+     * Every statement is judged **before any of them runs**. The TUI can stop a
+     * batch half-way because the person is there to see where it stopped; a
+     * script finding out from an exit code that statements 1 and 2 committed
+     * before 3 was refused is the worst version of this.
+     *
+     * No auto-LIMIT: the 1000-row cap is there so the grid does not paint a
+     * million rows, and a script asking for a million rows means it.
+     *
+     * @param resource $out where the CSV goes
+     * @param resource $err where refusals, errors and --verbose notes go
+     */
+    /**
+     * The env in force when nobody typed `-E` — `devel (default)` for a config
+     * file's default env, `devel ($SQLI_ENV)` for the variable — or '' when the
+     * env was typed or there is none. The header shows it: an env nobody typed
+     * lays its settings under whatever the command line said, and that union was
+     * invisible (a `-H prod --comment "PROD r/w"` run came up read-only because
+     * the directory's default env was a read-only one).
+     */
+    private function untypedEnv(): string
+    {
+        $env = $this->config->envName();
+        return match ($this->config->envSource()) {
+            'config'    => $env . ' (default)',
+            '$SQLI_ENV' => $env . ' ($SQLI_ENV)',
+            default     => '',
+        };
+    }
+
+    /**
+     * Where read-only mode came from, as a suffix for the message that refuses
+     * something — ` (from env devel, the config's default env)`, ` (from
+     * …/sqli_config.json)`, ` (from --read-only)`. Empty when it is not on.
+     */
+    private function readOnlyWhy(): string
+    {
+        $origin = $this->config->originOf('read-only');
+        if (!$this->state->readOnly || $origin === null) {
+            return '';
+        }
+        if ($origin === 'command line') {
+            return ' (from --read-only)';
+        }
+        if (str_starts_with($origin, 'env ')) {
+            return ' (from ' . $origin . match ($this->config->envSource()) {
+                'config'    => ", the config's default env",
+                '$SQLI_ENV' => ', picked by $SQLI_ENV',
+                default     => '',
+            } . ')';
+        }
+        return ' (from ' . $origin . ')';
+    }
+
+    public function runScript(string $sql, $out, $err, bool $header = true, bool $verbose = false): int
+    {
+        $this->headless = true;
+        $this->state->readOnly = $this->config->isFlag('read-only');
+
+        $expansion = $this->macros->expand($sql);
+        $problem = $expansion->problem();
+        if ($problem !== null) {
+            fwrite($err, 'sqli: ' . $problem . PHP_EOL);
+            return 1;
+        }
+        $sql = $expansion->sql;
+        $asks = Macros::promptsIn($sql);
+        if ($asks !== []) {
+            fwrite($err, 'sqli: ' . implode(', ', array_map(static fn (string $n): string => '?{' . $n . '}', $asks))
+                . ' asks for a value, and there is nobody to answer — give it as a macro argument instead' . PHP_EOL);
+            return 1;
+        }
+
+        // Judge everything first (see above).
+        $statements = [];
+        foreach (Splitter::split($sql) as $stmt) {
+            // A `\G` / `\N` suffix means something to the grid and nothing to CSV.
+            $stmt = rtrim((string) preg_replace(self::terminatorPattern(), '', rtrim($stmt)));
+            if (in_array(strtolower(rtrim($stmt, "; \t")), self::QUIT_WORDS, true)) {
+                break; // `quit` at the end of a piped file, as mysql allows
+            }
+            if ($stmt !== '') {
+                $statements[] = $stmt;
+            }
+        }
+        $total = count($statements);
+        $prepared = [];
+        foreach ($statements as $i => $stmt) {
+            $where = $total > 1 ? 'statement ' . ($i + 1) . ' of ' . $total . ': ' : '';
+            $stmt = $this->normalizer->normalize($stmt)->sql;
+            $stmt = $this->normalizer->expandMixedStar($stmt, fn (string $t): array => $this->resolveColumns($t))->sql;
+            $first = Splitter::commandKeyword($stmt);
+            if (in_array($first, self::MODIFYING, true)) {
+                if ($this->state->readOnly) {
+                    fwrite($err, 'sqli: refused: ' . $where . 'read-only mode — ' . $first . ' is blocked' . $this->readOnlyWhy() . PHP_EOL);
+                    return self::EXIT_REFUSED;
+                }
+                $message = $this->dangerCheck($stmt, $first, $total > 1);
+                if ($message !== null) {
+                    fwrite($err, 'sqli: refused: ' . $where . self::withoutRunAnyway($message)
+                        . '. Nothing was run: this needs a confirmation, and only the TUI can give one.' . PHP_EOL);
+                    return self::EXIT_REFUSED;
+                }
+            }
+            $prepared[] = $stmt;
+        }
+
+        $blocks = 0;
+        foreach ($prepared as $i => $stmt) {
+            $result = $this->database->query($stmt);
+            if ($result->hasError()) {
+                $left = $total - $i - 1;
+                fwrite($err, 'sqli: ' . ($total > 1 ? 'statement ' . ($i + 1) . ' of ' . $total . ': ' : '')
+                    . 'ERROR ' . $result->error . ($left > 0 ? ' · ' . $left . ' not run' : '') . PHP_EOL);
+                return 1;
+            }
+            if ($result->isSelect) {
+                if (!self::writeResultCsv($out, $result, $header, $blocks === 0)) {
+                    fwrite($err, 'sqli: could not write the output' . PHP_EOL);
+                    return 1;
+                }
+                $blocks++;
+            }
+            if ($verbose) {
+                fwrite($err, ($result->isSelect
+                    ? $result->rowCount() . ' row(s) in set'
+                    : 'Query OK, ' . $result->affectedRows . ' row(s) affected')
+                    . sprintf(' (%.3f sec)', $result->elapsed) . PHP_EOL);
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * One result set as a CSV block, for {@see runScript()}. Raw server values,
+     * not display formats — a script wants the epoch, not the grid's rendering
+     * of it. A result set after the first is preceded by one blank line.
+     * Returns false when the stream refused a write.
+     *
+     * @param resource $out
+     */
+    public static function writeResultCsv($out, QueryResult $result, bool $header, bool $first): bool
+    {
+        $cols = $result->columns;
+        $rows = (static function () use ($result, $cols): \Generator {
+            foreach ($result->rows as $r) {
+                $line = [];
+                foreach ($cols as $c) {
+                    $line[] = $r[$c] ?? null;
+                }
+                yield $line;
+            }
+        })();
+        return ($first || @fwrite($out, "\n") !== false)
+            && CsvExport::stream(
+                $out,
+                // Real table names in the file, as for Ctrl+Alt+O: a script
+                // reading this CSV has no header chip to decode `1.id` against.
+                $header ? ResultColumns::qualified($cols, $result->sources) : null,
+                $rows,
+            );
+    }
+
+    /** A confirm message as a sentence: the question on the end is for a person. */
+    private static function withoutRunAnyway(string $message): string
+    {
+        return (string) preg_replace('/\.?\s*Run anyway\?$/', '', $message);
     }
 
     // --- data view tabs (§20) ----------------------------------------------
@@ -7970,6 +8602,8 @@ final class App
         // Up-arrow gives back a statement that re-reads the macro rather than
         // yesterday's value baked into it.
         $typed = $sql;
+        // For F5: the view this submission paints remembers it as typed.
+        $this->submissionTyped = $typed;
         $expansion = $this->macros->expand($sql);
         $problem = $expansion->problem();
         if ($problem !== null) {
@@ -8349,6 +8983,7 @@ final class App
 
     private function resetBatch(): void
     {
+        $this->submissionTyped = null;
         $this->batchQueue = [];
         $this->batchTotal = 0;
         $this->batchDone  = 0;
@@ -8388,7 +9023,7 @@ final class App
         // these guards (§5).
         $first = Splitter::commandKeyword($sql);
         if ($this->state->readOnly && in_array($first, self::MODIFYING, true)) {
-            $this->state->statusLine = '[RO] Read-only mode — ' . $first . ' is blocked';
+            $this->state->statusLine = '[RO] Read-only mode — ' . $first . ' is blocked' . $this->readOnlyWhy();
             $this->state->statusIsError = true;
             $this->batchStop = 'blocked';
             return;
@@ -8550,6 +9185,11 @@ final class App
         // survive as leftover characters under the differential renderer.
         $this->screen->invalidate();
         $this->state->lastSql = $sql;
+        // The refresh after a grid delete (§22) re-submits lastSql, the executed
+        // form; the view keeps what the user typed rather than taking that.
+        if ($this->submissionTyped !== null && $this->deleteNote === '') {
+            $this->state->lastTyped = $this->submissionTyped;
+        }
         $this->state->selectedRow = 0;
         $this->state->selectedCol = 0;
         $this->state->rowOffset = 0;
@@ -8701,6 +9341,69 @@ final class App
         }
         $applied = true;
         return rtrim($sql) . ' LIMIT ' . self::AUTO_LIMIT;
+    }
+
+    /**
+     * F5: take what was typed to paint the visible data view, put it back on the
+     * CLI, and run it — exactly as though the user had typed it and pressed
+     * Enter.
+     *
+     * Re-running is the point: what paints a data view is a query, so F5 is
+     * "refresh this". It goes through {@see submit()} rather than
+     * {@see execute()} so it is a typed statement in every way that matters —
+     * macros expand, `?{name}` still asks, the read-only and dangerous-query
+     * guards still apply, and the text lands in the typed history. The CLI
+     * therefore clears when the result arrives, and Up-arrow gets it back.
+     *
+     * Focus is left where it was: F5 from the grid refreshes the grid and stays
+     * there, F5 from the CLI stays on the CLI.
+     *
+     * Two shapes are **not** fired, and fall back to the old behaviour — text on
+     * the CLI, focus there, nothing run:
+     *
+     *  - a statement that modifies data. It can only reach `lastTyped` by being
+     *    typed at the CLI (a cell edit's UPDATE never goes through
+     *    {@see applyResult()}), but re-firing an UPDATE on a keypress is not
+     *    what F5 is for. It comes back with the `{safety}` prefix, as it does
+     *    through Up-arrow history.
+     *  - a multi-statement submission, which may hold a modifying statement
+     *    among the SELECTs. Same rule as {@see looksReloadable()} after a grid
+     *    delete: one statement, or nothing is replayed.
+     *
+     * Whatever is on the CLI is replaced either way. That includes an un-run
+     * cell edit's UPDATE or a grid DELETE, which are abandoned exactly as typing
+     * a new statement over them would abandon them ({@see submit()}).
+     */
+    private function recallViewSql(): void
+    {
+        $sql = $this->state->lastTyped;
+        if ($sql === '') {
+            $this->state->statusLine = 'F5: nothing to recall — this data view has not run anything yet';
+            $this->state->statusIsError = false;
+            return;
+        }
+        $this->revertInFlight();
+        $this->autoDelete = null;
+        $this->state->deleteMarks = [];
+
+        $first = Splitter::commandKeyword($sql);
+        $modifying = in_array($first, self::MODIFYING, true);
+        if ($modifying || count(Splitter::split($sql)) !== 1) {
+            $this->input->setText($modifying ? '{safety} ' . $sql : $sql);
+            $this->resetHistoryNav();
+            $this->state->focus = State::FOCUS_CLI;
+            $this->state->statusLine = 'Recalled this view\'s query — end it with ; (or ]G, ]1…]9) to run it';
+            $this->state->statusIsError = false;
+            return;
+        }
+
+        // Typed, then Enter. The text sits on the CLI while the statement is in
+        // flight — which on the cancellable path (§21) is every frame until the
+        // rows land — and applyResult() clears it, as it does for any submission.
+        // `vertical` comes from the view, so a `\G` result refreshes as a `\G`.
+        $this->input->setText($sql);
+        $this->resetHistoryNav();
+        $this->submit($sql, $this->state->vertical, null);
     }
 
     // --- history navigation ------------------------------------------------

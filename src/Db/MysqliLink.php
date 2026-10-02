@@ -73,6 +73,12 @@ final class MysqliLink
     /** @var list<string> */
     private array $streamColumns = [];
 
+    /** @var list<ResultSource> */
+    private array $streamSources = [];
+
+    /** @var list<int> */
+    private array $streamColumnSources = [];
+
     /** @var list<array<string,mixed>> */
     private array $streamRows = [];
 
@@ -198,6 +204,8 @@ final class MysqliLink
         $this->link          = null;
         $this->streaming     = null;
         $this->streamColumns = [];
+        $this->streamSources = [];
+        $this->streamColumnSources = [];
         $this->streamRows    = [];
         $this->inFlight      = false;
     }
@@ -280,6 +288,30 @@ final class MysqliLink
     }
 
     /**
+     * mysqli's field metadata in the shape {@see ResultColumns} reads.
+     *
+     * mysqli is the driver that knows the whole story: `table` is the alias the
+     * SQL used, `orgtable` the real table behind it, and `db` the database. The
+     * PDO path can only fill in the first of the three, which is why the header
+     * tile reads `prod.templates t(1)` here and `t(1)` there.
+     *
+     * @return list<array{name:string,alias:string,table:string,db:string}>
+     */
+    private static function describeFields(mysqli_result $res): array
+    {
+        $fields = [];
+        foreach ($res->fetch_fields() as $field) {
+            $fields[] = [
+                'name'  => (string) $field->name,
+                'alias' => (string) $field->table,
+                'table' => (string) ($field->orgtable !== '' ? $field->orgtable : $field->table),
+                'db'    => (string) $field->db,
+            ];
+        }
+        return $fields;
+    }
+
+    /**
      * Run a statement and wait for it — the synchronous path, used for the
      * metadata queries that were never cancellable anyway.
      *
@@ -294,14 +326,19 @@ final class MysqliLink
         $elapsed = microtime(true) - $start;
 
         if ($res instanceof mysqli_result) {
-            $columns = [];
-            foreach ($res->fetch_fields() as $i => $field) {
-                $columns[] = $field->name !== '' ? $field->name : ('col' . $i);
-            }
+            ['columns' => $columns, 'sources' => $sources, 'columnSources' => $colSources]
+                = ResultColumns::resolve(self::describeFields($res));
             // Buffered, unlike the async path: this one is only used for the
             // bounded metadata queries, which were never what froze the UI and
             // have no frame loop to hand back to.
-            $rows = $res->fetch_all(MYSQLI_ASSOC);
+            //
+            // Fetched positionally and keyed afterwards. `MYSQLI_ASSOC` keys the
+            // row itself, and a join with two columns called `id` loses one of
+            // them to the other before we ever see it (see {@see ResultColumns}).
+            $rows = [];
+            foreach ($res->fetch_all(MYSQLI_NUM) as $row) {
+                $rows[] = array_combine($columns, $row);
+            }
             $res->free();
             $this->drainRowsets();
             return new QueryResult(
@@ -309,6 +346,8 @@ final class MysqliLink
                 rows: $rows,
                 elapsed: $elapsed,
                 isSelect: true,
+                sources: $sources,
+                columnSources: $colSources,
             );
         }
 
@@ -344,6 +383,8 @@ final class MysqliLink
         }
         $this->streaming     = null;
         $this->streamColumns = [];
+        $this->streamSources = [];
+        $this->streamColumnSources = [];
         $this->streamRows    = [];
         $this->link->query($sql, MYSQLI_ASYNC | MYSQLI_USE_RESULT);
         $this->inFlight = true;
@@ -413,21 +454,24 @@ final class MysqliLink
                 );
             }
             $this->streaming = $res;
-            $this->streamColumns = [];
-            foreach ($res->fetch_fields() as $i => $field) {
-                $this->streamColumns[] = $field->name !== '' ? $field->name : ('col' . $i);
-            }
+            ['columns' => $this->streamColumns, 'sources' => $this->streamSources,
+             'columnSources' => $this->streamColumnSources]
+                = ResultColumns::resolve(self::describeFields($res));
         }
 
         $deadline = microtime(true) + self::FETCH_SECONDS;
         $taken = 0;
         while (true) {
-            $row = $this->streaming->fetch_assoc();
+            // Positional, then keyed — `fetch_assoc()` would drop one of a
+            // join's two same-named columns on the way in ({@see ResultColumns}).
+            $row = $this->streaming->fetch_row();
             if ($row === null) {
                 // End of the result set — and, for an unbuffered read, the
                 // moment the statement is actually over.
                 $columns = $this->streamColumns;
                 $rows    = $this->streamRows;
+                $sources = $this->streamSources;
+                $colSources = $this->streamColumnSources;
                 $this->streaming->free();
                 $this->finish();
                 return new QueryResult(
@@ -435,9 +479,11 @@ final class MysqliLink
                     rows: $rows,
                     elapsed: microtime(true) - $start,
                     isSelect: true,
+                    sources: $sources,
+                    columnSources: $colSources,
                 );
             }
-            $this->streamRows[] = $row;
+            $this->streamRows[] = array_combine($this->streamColumns, $row);
             if (++$taken >= self::FETCH_ROWS || microtime(true) >= $deadline) {
                 return null; // hand the frame back; the rest comes next time
             }
@@ -449,6 +495,8 @@ final class MysqliLink
     {
         $this->streaming     = null;
         $this->streamColumns = [];
+        $this->streamSources = [];
+        $this->streamColumnSources = [];
         $this->streamRows    = [];
         $this->inFlight      = false;
         $this->drainRowsets();

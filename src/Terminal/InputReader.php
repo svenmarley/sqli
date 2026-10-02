@@ -316,6 +316,7 @@ final class InputReader
             6       => Key::PageDown,
             11      => Key::F1,
             12      => Key::F2,
+            15      => Key::F5, // xterm, Windows Terminal, WSL; there is no SS3 form
             default => null,
         };
     }

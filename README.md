@@ -1,8 +1,3 @@
-todos:
-
-* cli "quit" "exit" "ctrl-alt-x"
-* dd isn't read only
-
 # sqli
 
 A fast, keyboard-driven **terminal MySQL client** for people who work in the terminal but want more than a `mysql>`
@@ -20,8 +15,9 @@ You already know SQL. These are the parts of `mysql>` you work around.
 
 - **Field/Table/Macro name completion assistance that reads the statement**, not a list of names. Aliases resolve, a
   join offers `u.id` and `o.id` separately, and every command that names a table gets it — not just
-  `SELECT`. → [Completion](#completion)
-- **A grid instead of a wall of pipes.** Sort, move, resize and hide columns; it remembers per table and exports as
+  `SELECT`. → [Completion](#completion)  Supports `SELECT from {table} {columns}` where {table} and {columns} are
+  auto-complete capable.
+- **A grid instead of a wall of pipes.** Sort, move, resize and hide columns; it remembers them and exports as
   arranged. → [The result grid](#the-result-grid)
 - **Edit a cell in place.** Checked against the live column type, and handed to you as one key-scoped `UPDATE` to run or
   cancel. JSON view/editing. → [Editing data](#editing-data)
@@ -30,7 +26,7 @@ You already know SQL. These are the parts of `mysql>` you work around.
 - **Macros.**`?name` for the query you retype ten times a day — with arguments, prompts, and optionally a different
   macro/id on prod than on dev. → [Macros](#macros)
 - **Hierarchical configs** - Set a .sqli config in the project/repo root, then `cd` anywhere into the repo directory.
-  Run `sqli -e prod`. Config looks up the directory tree; uses the -e {environment} you chose. Supports a password file
+  Run `sqli -E prod`. Config looks up the directory tree; uses the -E {environment} you chose. Supports a password file
   that you never commit. → [Configuration](#configuration)
 - **`Esc` stops a running query** and leaves the session intact — unlike a timeout, which drops the
   connection. → [Connection options](#connection-options)
@@ -38,8 +34,8 @@ You already know SQL. These are the parts of `mysql>` you work around.
   key. → [Editing data](#editing-data)
 - **Your team's data dictionary beside the live schema.** Including sync'ing to the database, notes about
   columns. → [The Data Dictionary](#the-data-dictionary)
-- **Base16 themes**, Uses Open Source themes project for color assignments. Allows switched and recoloured live from
-  inside the app. → [Themes](#themes)
+- **Base16 themes** — drop in any scheme from the open-source Base16 project for the colors, then switch or recolour it
+  live from inside the app. → [Themes](#themes)
 - **PHP 8.1+, zero dependencies, no build step.** Clone it and run it.
 
 ## Requirements
@@ -70,8 +66,14 @@ php sqli.php --host localhost --user myuser --database mydb
 
 `sqli.php` runs straight from source via a built-in autoloader.
 
+To quit, type `exit` or `quit` on the SQL line, or press `Ctrl+Alt+X` from anywhere.
+
+If an optional extension is missing, sqli says so in one line as it starts, naming the `php.ini` to edit —
+`sqli: note: Esc can't cancel a running query: enable extension=mysqli in C:\php\php.ini`. `php sqli.php --lint` lists
+the same notes.
+
 sqli asks for the password on the plain terminal before the full-screen UI opens, and only when it doesn't already have
-one — so a configured environment (`sqli -e prod`) starts straight up, and a mistyped password fails somewhere you can
+one — so a configured environment (`sqli -E prod`) starts straight up, and a mistyped password fails somewhere you can
 still read it.
 
 ### Connecting
@@ -94,8 +96,8 @@ Options can be passed as flags, or stored in a config file so you don't put cred
 | `--ssl-cert` / `--ssl-key` |       | Client certificate pair, for `REQUIRE X509` accounts                                                                      |             |
 | `--ssl-cipher`             |       | Permitted cipher list (TLS 1.2 and below)                                                                                 |             |
 | `--server-public-key`      |       | RSA public key file for sha2 auth on an unencrypted link                                                                  |             |
-| `--env`                    | `-e`  | Named environment from the config `envs` section (or `$SQLI_ENV`, or the config's default `env`)                          |             |
-| `--no-env`                 |       | Ignore `$SQLI_ENV` and the config's default `env`, and run with no environment. An explicit `-e` still wins               | off         |
+| `--env`                    | `-E`  | Named environment from the config `envs` section (or `$SQLI_ENV`, or the config's default `env`)                          |             |
+| `--no-env`                 |       | Ignore `$SQLI_ENV` and the config's default `env`, and run with no environment. An explicit `-E` still wins               | off         |
 | `--comment`                |       | Short note pinned to the header  e.g. `PROD R/O`                                                                          |             |
 | `--theme`                  |       | Base16 scheme name                                                                                                        | `default`   |
 | `--truecolor`              |       | 24-bit output: `auto`, `on`, `off`                                                                                        | `auto`      |
@@ -105,23 +107,22 @@ Options can be passed as flags, or stored in a config file so you don't put cred
 | `--config`                 | `-c`  | Load options from a JSON file (or `$SQLI_CONFIG`)                                                                         |             |
 | `--user-config`            |       | Personal overlay on `--config` (or `$SQLI_USER_CONFIG`)                                                                   |             |
 | `--lint`                   |       | Validate every config file sqli would read, then exit                                                                     |             |
-| `--debug`                  | `-d`  | Verbose diagnostics to `debug.log` beside `sqli.php`. Also echoes the password to stderr before connecting                | off         |
+| `--debug`                  | `-d`  | Verbose diagnostics to `debug.log` beside `sqli.php`                                                                      | off         |
 | `--help`                   | `-h`  | Print the full option list and exit                                                                                       |             |
 | `--version`                | `-V`  | Print the version and exit                                                                                                |             |
 
 Run `php sqli.php --help` for the full list.
 
 **`-d` answers "why won't it connect?"** It writes the DSN it built, the TLS and driver decisions it made, the
-connection options in force, every automatic reconnect and every query error code to `debug.log` beside `sqli.php`. It
-also prints the resolved password to stderr before the UI opens — the one input nobody can see themselves type is the
-one worth showing when a login is failing — so don't use it on a shared screen. Turn it on for a run, not in an
-environment:
-`debug.log` is never rotated or trimmed.
+connection options in force, every automatic reconnect and every query error code to `debug.log` beside `sqli.php`.
+Turn it on for a run, not in an environment: `debug.log` is never rotated or trimmed.
 
 ## Getting around
 
-`Ctrl+D` swaps focus between the SQL line and the result grid; **`F1` is the complete list of {keys} for whichever one
-you're in**, and the system menu is `/`.
+`Ctrl+D` swaps focus between the SQL line and the result grid; `F1` is the complete list of {keys} for whichever view 
+you're in, and the system menu is `/`. System menu and in Data View Configuration optinos are scrollable and using Enterhas a quick key
+executes that item.  Each option also have drawn in front of it (`1)` … `9)`, then `a)` … `z)`): press it and the item 
+runs, exactly as `Enter` on it would.
 
 The header row says which server you are on, which database and table the grid is showing, and — if you set one — **your
 own short comment beside the `CLI`/`DATA`
@@ -142,16 +143,20 @@ Type a statement on the CLI and press `Enter`. How you end the line decides wher
 | Ends with             | What happens                                          |
 |-----------------------|-------------------------------------------------------|
 | `;`                   | Runs and shows the result in the current data view    |
-| `\G`                  | Runs and shows it **vertically**, one column per line |
-| `\1` … `\9`           | Runs it in **that** data view and takes you there     |
+| `]G`                  | Runs and shows it **vertically**, one column per line |
+| `]1` … `]9`           | Runs it in **that** data view and takes you there     |
 | a complete macro call | Runs — no `;` needed (see [Macros](#macros))          |
 | {Enter}               | Adds another line to the query                        |
+
+`[` works the same as `]`, and so does `\` (`\G` is the `mysql` habit). A trailing `;` is welcome on any of them, so
+`]G` `[G` `\G` `]G;` and `]3` `[3` `\3` `]3;` all do what they look like. None of the three means anything in SQL outside
+quotes, so `SELECT * FROM t]3` works with or without a space.
 
 Several statements can be submitted at once. They run in order, and one that fails stops the rest rather than running on
 past it — the statements after it were written expecting the one that failed to have worked.
 
-**An unqualified `SELECT` is capped at 1000 rows.** The `LIMIT` is added to the SQL that is actually sent, never to what
-you typed, and only when the statement carries no `LIMIT` of its own — including one in a subquery. The cap is mentioned
+**An unqualified `SELECT` is capped at 1000 rows.** The `LIMIT` is added to the SQL that is actually sent, and only when 
+the statement carries no `LIMIT` of its own — including one in a subquery. The cap is mentioned
 only when it can have bitten: a result that comes back holding the whole 1000 reads
 `1000 row(s), 12 col(s), 0.114s · auto-limited to 1000`, and a result of 42 rows says nothing about it, because there
 the cap changed nothing and the count is the whole answer.
@@ -170,13 +175,62 @@ connection and leaves the server still working. (Needs the `mysqli` extension; s
 [Connection options](#connection-options).)
 
 **CLI History** `Up`/`Down` browse what you typed; `Alt+Up`/`Alt+Down` browse what actually ran — the normalized,
-expanded, capped SQL that went to the server. Both are kept across sessions. Commands that modify the database are
-prepended with `{Safety}`, forcing the user to remove that before sending in the same command again.
+expanded, macro expansion, capped SQL that went to the server. Both are kept across sessions. Commands that modify the 
+database are prepended with `{Safety}`, forcing the user to remove that before sending in the same command again.
+
+**`F5` re-runs the query behind the view you're looking at**, from the grid or the SQL line — exactly as you typed it
+(the macro call, no automatic `LIMIT`), so it is a refresh of what's on screen. Focus stays where it is. Handy after
+switching between data views, when Up-arrow would give you whichever query ran last. A statement that writes, or a
+whole batch, isn't fired: it comes back on the SQL line without its `;` for you to end yourself.
 
 **A dropped connection is handled quietly.** If the server closes an idle session, the header shows a small red `!db`,
 the statement is re-sent once, and the answer arrives with `· reconnected` behind its row count; the grid, the sort and
 your column layout stand untouched throughout. The one thing never re-sent by itself is a write that may already have
 run. If the socket is dead, it stops and says so, in words, and waits for you.
+
+## Scripting
+
+`-e` runs SQL with no full-screen UI, as it does in `mysql`, and so does SQL piped on stdin:
+
+```sh
+sqli -E prod -e "SELECT id, email FROM users WHERE active = 1" > active.csv
+sqli -E prod -N -e "SELECT COUNT(*) FROM orders"
+sqli -E prod --out report.csv < report.sql
+```
+
+**The output is CSV, and only CSV.** Each result set gets a header row (`-N` leaves it out), values come as the server
+sent them rather than in the grid's display formats, a NULL is a bare `NULL` while a string that reads `NULL` is
+`"NULL"`, and several result sets are separated by one blank line. `--out FILE` writes to a file instead of stdout; a
+run that fails leaves no partial file behind. **There is no 1000-row cap**: that cap exists for the grid, and a script
+that asks for a million rows gets them. stdout carries the CSV and nothing else; `-v` adds row counts and timings on
+stderr.
+
+**Anything sqli would ask you to confirm is refused.** Your SQL goes through the same macros and the same safety checks
+as it does in the full-screen UI, but nobody is there to answer a confirmation. So every `INSERT`, `REPLACE`, `CREATE`,
+`ALTER`, `DROP`, `TRUNCATE`, `RENAME`, `GRANT`, `REVOKE`, `LOAD`, `CALL`, every broad `DELETE`/`UPDATE`, and any
+`DELETE`/`UPDATE` among several statements stops with
+
+```
+sqli: refused: DELETE on `users`: no WHERE clause (all rows) — affects ~12,408 row(s). Nothing was run: this needs a confirmation, and only the TUI can give one.
+```
+
+and exit code **2**. Every statement is checked before any of them runs, so a refusal means **nothing** was sent, not
+"the first two ran". No flag overrides this. To run one of these, use the full-screen UI, where you can confirm it.
+
+**Scripting mode is not read-only.** A single `DELETE` or `UPDATE` scoped by primary key asks nothing in the
+full-screen UI, so it runs here too. If a script must never write, add `--read-only`.
+
+| Exit code | Meaning                                                            |
+|-----------|--------------------------------------------------------------------|
+| `0`       | Everything ran                                                     |
+| `1`       | An error: the connection, the server, a macro, or writing the output |
+| `2`       | Refused by the confirmation rule or by `--read-only`; nothing ran  |
+
+A `?{name}` prompt in a macro is an error here, since there is nobody to answer it; pass the value as a macro argument
+instead. With SQL on stdin a bare `-p` is refused, because the password prompt would read the SQL. Keep the password in
+`sqli_credentials.json`, or use `-e`. Piped SQL is detected under Git Bash
+(mintty) too, but pipe into `php.exe`, not `php`: Git Bash aliases `php` to `winpty php.exe`,
+and winpty refuses piped stdin with "stdin is not a tty".
 
 ## Completion
 
@@ -212,15 +266,18 @@ Four ways in, all the same menu: `Ctrl+L`, `Enter` on the header row, a click on
 column you clicked), or system menu → Data View Configuration. While any customization is live, a vertical **Layout
 Config** label sits on the grid's border, so the arrangement you're reading is never a surprise.
 
-**It remembers, per table.** Widths, order, hidden columns, sort and formats are saved in `.sqli/sqli_formatting.json`
-and come back the next time you query that table. The key is the whole connection — `host:port/db` — so `devel` on two
-servers keeps two arrangements.
+**It remembers.** Everything is saved in `.sqli/sqli_formatting.json`. Widths, sort and formats are kept per table and
+come back on any query of it. Column order and hidden columns are kept per **field list**: an arrangement made over
+`SELECT id, name, total …` comes back for that same list of columns, and `SELECT *` keeps its own. Spacing, backticks
+and the `WHERE` clause don't matter, but `id, name` and `name, id` are two different lists. The key is the whole
+connection — `host:port/db` — so `devel` on two servers keeps two arrangements.
 
 **A display format changes the display, never the data.** Put the `epoch` format on a column and the integer reads as
 local date/time; the stored value is untouched, and editing the cell still writes back what the column wants.
 
 **`Ctrl+Alt+O` exports the view as arranged** — your column order, your hidden columns left out, formatted columns
-written the way they are shown — to a CSV in the current directory. `Ctrl+C` copies a cell, `Ctrl+Alt+C` a row.
+written the way they are shown — to a CSV in the current directory. A NULL is written as a bare `NULL` and a string
+that reads `NULL` as `"NULL"`, so you can tell them apart. `Ctrl+C` copies a cell, `Ctrl+Alt+C` a row.
 
 ### Data views
 
@@ -245,6 +302,26 @@ again opens a blob nested inside it.
 anything happens — then puts the statement on the CLI so you read it before you run it. `Ctrl+Del` opens a checkbox
 column for deleting several at once. **No primary key, no delete:** sqli won't write a statement it can't scope to
 exactly the rows you picked.
+
+**The header says which table you're on.** On a joined result the header lists every
+table it drew from, numbered — `prod.templates(1), template_items(2)` — and the one the
+selected column came from is highlighted, so `1.id` never has to be decoded by counting.
+Columns whose names didn't clash light up their table too.
+
+**Joined results are read-only.** A generated `UPDATE` or `DELETE` names one table, and on a result built from two
+there is no safe way to know which one the column you're editing belongs to — so sqli refuses and tells you which
+tables the result joined. Query the one table you mean to change.
+
+**Two columns with the same name stay two columns.** `SELECT t.id, ti.* FROM templates t, template_items ti …` returns
+two columns called `id`; sqli numbers the tables and shows them as `1.id` and `2.id`, with `prod.templates(1),
+template_items(2)` on the header so the numbers mean something. Names that don't clash are left alone. **Exports spell
+them out in full** — `templates.id`, `template_items.id` — since a CSV has no header to explain a number, and a file
+has no width to save.
+
+**Hiding the address.** `--host-label acme-warehouse`, or `"host_label"` on an environment, puts that name in the header where
+`admin@db.internal:3306/prod` would be — handy when you're sharing a screen or a screenshot. It's cosmetic only: the
+driver, `[RO]` and the TLS marker still sit beside it, because those say what the *session* can do and a nickname must
+not be able to hide them. `--lint` refuses two environments using the same label.
 
 **Read-only mode** — `--read-only`, or `"read-only": true` on an environment — blocks every data-modifying statement,
 including one a macro expanded into. It is what makes a production connection safe to browse. Without it, broad
@@ -338,12 +415,29 @@ projects for tooling to read. It's machine-owned and safe to delete.)
 Lowest to highest: **built-in defaults → global → project layers (farthest to closest) → `--config` → `--user-config` →
 credentials → command-line flags.**
 
+### "Can a project config override my global one?"
+
+Yes. That is what "closest wins" means, and it is deliberate. sqli is a convenience for picking a server, not an access
+control system. A project's `.sqli/` can set `read-only: false` over a global `true`, or name a different host, and it
+wins, the same way a command-line flag wins over both.
+
+That isn't a hole, for two reasons. First, anyone who can edit a `.sqli/` folder can also edit your global config, or
+just type `--read-only=false`. The database account's grants are what actually limit a session, so use a read-only login
+for anything that must stay read-only. Second, your global config lives in your home directory, so it never travels with
+a repo. Clone a project on another machine and there is no global layer there to override.
+
+What sqli does do is make sure it is never a surprise. Config files can disagree about **which server** an environment
+means: a project's `prod` might set a different `host`, `port`, `socket`, `user` or `database` than the global `prod`.
+When that happens, sqli prints a warning at startup naming both values and both files, and repeats it on the status line.
+`--lint` lists every environment where this happens. The closest file still wins.
+
 Set `$SQLI_HOME` to put the global layer somewhere other than your home directory — useful if you want Windows and WSL
 to share one configuration.
 
 ### Environments
 
-Name your servers once and select one with `-e`:
+Name your servers once and select one with `-E` (or `--env`). It's a capital E because in `mysql`, `-e` runs a
+statement; sqli refuses `-e` with a message instead of guessing what you meant.
 
 ```json
 {
@@ -368,7 +462,7 @@ Name your servers once and select one with `-e`:
 ```
 
 ```sh
-php sqli.php -e prod
+php sqli.php -E prod
 ```
 
 An environment may `extends` another (chains are resolved across every config layer, and cycles are rejected). Passwords
@@ -381,24 +475,36 @@ means it:
 
 ```json
 {
-    "defaults": { "env": "local" },
-    "envs": { "local": { "host": "localhost", "database": "devel" } }
+    "defaults": {
+        "env": "local"
+    },
+    "envs": {
+        "local": {
+            "host": "localhost",
+            "database": "devel"
+        }
+    }
 }
 ```
 
 ```sh
-php sqli.php              # = php sqli.php -e local
-php sqli.php -e prod      # an explicit -e always wins
+php sqli.php              # = php sqli.php -E local
+php sqli.php -E prod      # an explicit -E always wins
 php sqli.php --no-env     # no environment at all, for once
 ```
 
 `env` is an ordinary cascaded key, so the `.sqli/` closest to your working directory decides: a global default of `prod`
 is overridden by a project whose `defaults{}` says `"env": "dev"`, and a project that says `"env": ""` has no default at
-all rather than inheriting the global one. Order of selection is `-e` → `$SQLI_ENV` → the config, and `--no-env` refuses
+all rather than inheriting the global one. Order of selection is `-E` → `$SQLI_ENV` → the config, and `--no-env` refuses
 the last two — the two nobody typed on the command line.
 
-It is the one option that belongs only to a file's base: inside an `envs{}` block it would be an environment selecting an
-environment, so it is ignored there (`extends` is the key that inherits one), and `--lint` says so.
+An env chosen this way is never silent. The header names it before `[RO]` — `env local (default)` — and a read-only
+refusal says which env turned read-only on (`editing is blocked (from env local, the config's default env)`), because the
+env's settings sit under everything you typed: `-H`, `-u` and `--comment` replace the env's own, but anything you didn't
+type (like `read-only`) still comes from it.
+
+It is the one option that belongs only to a file's base: inside an `envs{}` block it would be an environment selecting
+an environment, so it is ignored there (`extends` is the key that inherits one), and `--lint` says so.
 
 Because an environment chosen this way leaves no trace on the command line, sqli prints one line naming it before the UI
 opens, and `--lint` refuses a default `env` that names an environment no config file defines — the one typo that would
@@ -451,9 +557,9 @@ agency-id = 22
 agency-id = 4471
 ```
 
-`[env:prod]` loads only under `-e prod`, and an environment that `extends`
+`[env:prod]` loads only under `-E prod`, and an environment that `extends`
 another inherits its macros exactly as it inherits its options — so one name can mean a different id per server, and
-with no `-e` no such section loads at all.
+with no `-E` no such section loads at all.
 
 - **`?` then `Tab`** completes a macro name and shows a slice of each value beside it.
 - **System menu (`/`) → Macros** opens a read-only viewer: every name, its value, which file and which environment it
@@ -542,7 +648,7 @@ take `~` and `${SQLI_HOME}`:
 }
 ```
 
-After which the whole command is `sqli -e prod`. Check it before connecting with
+After which the whole command is `sqli -E prod`. Check it before connecting with
 `php sqli.php --lint`, which resolves the options and reports the mode it arrived at under *connection encryption*.
 
 ### Confirming it worked
@@ -625,8 +731,8 @@ temporary tables and session variables. `php sqli.php --lint` prints the set tha
 sqli renders through a **Base16** palette: 16 colours, mapped onto every UI element, emitted as 24-bit truecolor where
 the terminal supports it and gracefully downsampled to 256 colours where it doesn't (`--truecolor=auto`).
 
-Themes are **your assets** — sqli ships one scheme rather than a bundled library. Drop any Base16 scheme file
-(`base00`–`base0F`, YAML or JSON) into `.sqli/themes/`, in a project or globally. Hundreds are available at
+Themes are **your assets** — sqli ships one scheme rather than a bundled library. Drop any Base16 scheme file (`base00`–
+`base0F`, YAML or JSON) into `.sqli/themes/`, in a project or globally. Hundreds are available at
 [tinted-theming/schemes](https://github.com/tinted-theming/schemes), which is where the one in `.sqli/themes/` came
 from, unmodified: the file's base name is the theme name, so `nord.yaml` is `nord`.
 

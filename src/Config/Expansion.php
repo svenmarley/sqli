@@ -88,7 +88,7 @@ final class Expansion
             return implode(' · ', $parts) . ' — '
                 . ($this->env === null
                     ? 'this session picked no environment, so no [env:…] section is loaded.'
-                        . ' Start sqli with -e NAME, or move the macro out of the section.'
+                        . ' Start sqli with -E NAME, or move the macro out of the section.'
                     : 'this session is env ' . $this->env
                         . '. Define it under [env:' . $this->env . '] too, or move it out of the section.');
         }

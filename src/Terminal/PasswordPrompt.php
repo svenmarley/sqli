@@ -26,15 +26,11 @@ final class PasswordPrompt
      * stderr, not stdout, so `sqli ... | something` still works and the prompt
      * cannot end up inside piped output.
      *
-     * @param bool|null   $masked set to whether the input was actually hidden
-     * @param string|null $raw    set to the bytes as they arrived, before any
-     *                            cleanup — the only useful evidence when a
-     *                            pasted password "doesn't work"
+     * @param bool|null $masked set to whether the input was actually hidden
      */
     public static function read(
         string $label = 'Password',
         ?bool &$masked = null,
-        ?string &$raw = null,
     ): string {
         $interactive = self::isInteractive();
         $restore = $interactive ? self::disableEcho() : null;
@@ -88,21 +84,6 @@ final class PasswordPrompt
             $value = substr($value, 0, -6);
         }
         return $value;
-    }
-
-    /**
-     * Render bytes for a debug line: printable characters as themselves,
-     * everything else as `\xNN`, so a stray CR, a NBSP from a web page, or a
-     * paste wrapper is visible rather than merely absent.
-     */
-    public static function describeBytes(string $s): string
-    {
-        $out = '';
-        foreach (str_split($s) as $ch) {
-            $b = ord($ch);
-            $out .= ($b >= 0x20 && $b < 0x7F) ? $ch : sprintf('\x%02X', $b);
-        }
-        return $out;
     }
 
     /**

@@ -80,6 +80,14 @@ final class ConfigLint
         $lint->checkThemes($config->themeDirs(), $config->getString('theme', 'default'));
         $lint->checkTls($config);
         $lint->checkConnection($config);
+        // Every env, not just the selected one: lint is where you look at the
+        // envs you are not using today.
+        foreach ($config->envConflicts() as $conflict) {
+            $lint->warnings[] = 'envs: ' . $conflict;
+        }
+        foreach (RuntimeCheck::missing($config->getString('driver', ConnectionOptions::DRIVER_AUTO)) as $missing) {
+            $lint->notes[] = 'php: ' . $missing;
+        }
         return $lint;
     }
 
@@ -275,7 +283,7 @@ final class ConfigLint
             $scope = $macros->scopeOf($name);
             $named[] = $scope !== null ? $label . ' [env:' . $scope . ']' : $label;
         }
-        // An inherited env is worth naming: `-e prod` loading a `[env:base]`
+        // An inherited env is worth naming: `-E prod` loading a `[env:base]`
         // macro is the config's `extends` doing its job, and a lint that only
         // said "for env prod" would leave the reader hunting for a section that
         // is not there.
@@ -294,7 +302,7 @@ final class ConfigLint
             $this->notes[] = "$where: " . count($hidden)
                 . (count($hidden) === 1 ? ' macro' : ' macros')
                 . ' scoped to another environment, not loaded'
-                . ($env === null ? ' (no -e given)' : '') . ' — ' . implode(', ', $parts);
+                . ($env === null ? ' (no -E given)' : '') . ' — ' . implode(', ', $parts);
         }
     }
 
@@ -358,7 +366,7 @@ final class ConfigLint
     }
 
     /**
-     * The default `env` (§2): the env used when neither `-e` nor `$SQLI_ENV` names
+     * The default `env` (§2): the env used when neither `-E` nor `$SQLI_ENV` names
      * one. Both ways of getting it wrong are invisible until the day this layer
      * happens to be the closest one — a non-string value, and a name no `envs{}`
      * anywhere defines, which then stops sqli from starting at all. Worth saying
@@ -385,7 +393,7 @@ final class ConfigLint
             return;
         }
         $name = trim($value);
-        // Judge it against the pooled names — every layer's `envs{}`, the way `-e`
+        // Judge it against the pooled names — every layer's `envs{}`, the way `-E`
         // resolves — so a default naming a parent defined in another file passes.
         // With no Config to ask (a bare lint of one file), this file's own names
         // are the only ones there are.
@@ -422,6 +430,7 @@ final class ConfigLint
             return;
         }
         /** @var array<string,mixed> $envs */
+        $labels = [];
         foreach ($envs as $name => $def) {
             $name = (string) $name;
             if ($name === '' || $name[0] === '_') {
@@ -439,6 +448,11 @@ final class ConfigLint
                 }
                 $this->checkOption($where, "envs.$name.$key", $key, $value);
             }
+            foreach ($def as $key => $value) {
+                if (Config::canonicalKey((string) $key) === 'host_label' && is_string($value) && trim($value) !== '') {
+                    $labels[trim($value)][] = $name;
+                }
+            }
             // An env naming an env is the one placement that cannot mean anything:
             // `env` selects an environment, and by the time this block is applied
             // the selection has happened. `extends` is the key that was wanted.
@@ -448,7 +462,33 @@ final class ConfigLint
             }
             $this->checkExtendsRefs($where, $name, $def['extends'] ?? null, $envs);
         }
+        $this->checkLabels($where, $labels);
         $this->checkExtendsCycles($where, $envs);
+    }
+
+    /**
+     * `host_label` (§2) hides an environment's address behind a name, so two
+     * environments sharing one name is the failure the feature exists to
+     * prevent: the header would read `acme-prod` on both, and the whole point of
+     * the setting is that the header is the only thing saying which server this
+     * is. Reported as an error rather than a warning for that reason — nothing
+     * else on screen would catch it.
+     *
+     * Per file, because that is the scope the user asked for and the scope a
+     * lint of one file can actually judge; a name reused in a *farther* config
+     * layer is a different environment list and only one of them can win.
+     *
+     * @param array<string,list<string>> $labels
+     */
+    private function checkLabels(string $where, array $labels): void
+    {
+        foreach ($labels as $label => $envs) {
+            if (count($envs) > 1) {
+                $this->errors[] = "$where: host_label '$label' is used by more than one env ("
+                    . implode(', ', $envs) . ') — a host_label stands in for the address,'
+                    . ' so it has to say which server it means';
+            }
+        }
     }
 
     /** @param array<string,mixed> $envs */

@@ -125,6 +125,11 @@ final class Database
         ?TlsOptions $tls = null,
         ?ConnectionOptions $options = null,
         ?bool $preferMysqli = null,
+        /**
+         * The name to show instead of the address (§2). Cosmetic only — see
+         * {@see getConnectionLabel()}.
+         */
+        private readonly string $label = '',
     ) {
         $this->tls = $tls ?? TlsOptions::disabled();
         $this->options = $options ?? ConnectionOptions::defaults();
@@ -654,6 +659,21 @@ final class Database
 
     public function getConnectionLabel(): string
     {
+        // `host_label` (§2) replaces the whole address, user included: the point is
+        // that nothing about where this connects shows on a shared screen or in
+        // a screenshot, and `admin@` on its own still names an account.
+        //
+        // **Cosmetic only, deliberately.** The driver, `[RO]` and the TLS marker
+        // are drawn beside it and are untouched — those are claims about the
+        // session, not about the address, and a name must not be able to hide
+        // that a connection is writable or in the clear. Nor does the label
+        // reach anything keyed on the connection: the persisted-state scope
+        // stays `host:port/db` (v056), or two servers sharing a name would share
+        // each other's saved layouts, and the debug and connection logs keep the
+        // real address because their whole job is to say what actually happened.
+        if ($this->label !== '') {
+            return $this->label;
+        }
         $where = $this->socket !== '' ? $this->socket : $this->host . ':' . $this->port;
         $db = $this->database !== '' ? '/' . $this->database : '';
         $who = $this->user !== '' ? $this->user . '@' : '';
@@ -667,6 +687,12 @@ final class Database
      */
     public function target(): string
     {
+        // The label covers this line too. It is printed on the plain terminal
+        // before the TUI takes over, so leaving the address here would put it on
+        // screen — and in any scrollback — for every connection made.
+        if ($this->label !== '') {
+            return $this->label;
+        }
         $where = $this->socket !== '' ? $this->socket : $this->host . ':' . $this->port;
         $db = $this->database !== '' ? $this->database . ' ' : '';
         return $db . 'on ' . $where;
@@ -770,18 +796,37 @@ final class Database
 
         // A result-bearing statement reports one or more columns.
         if ($stmt->columnCount() > 0) {
-            $columns = [];
+            // PDO's metadata carries the alias and nothing else — no real table
+            // name, no database — so a join tiles as `t(1), ti(2)` here where
+            // mysqli manages `prod.templates t(1), template_items ti(2)`. The
+            // column naming is identical either way; only the label is poorer.
+            $fields = [];
             for ($i = 0; $i < $stmt->columnCount(); $i++) {
-                $meta = $stmt->getColumnMeta($i);
-                $columns[] = $meta['name'] ?? ('col' . $i);
+                $meta = $stmt->getColumnMeta($i) ?: [];
+                $fields[] = [
+                    'name'  => (string) ($meta['name'] ?? ('col' . $i)),
+                    'alias' => (string) ($meta['table'] ?? ''),
+                    'table' => '',
+                    'db'    => '',
+                ];
             }
-            $rows = $stmt->fetchAll();
+            ['columns' => $columns, 'sources' => $sources, 'columnSources' => $colSources]
+                = ResultColumns::resolve($fields);
+            // Numeric fetch, keyed afterwards: the connection's default
+            // `FETCH_ASSOC` would drop one of two same-named columns before the
+            // rows ever reached us ({@see ResultColumns}).
+            $rows = [];
+            foreach ($stmt->fetchAll(PDO::FETCH_NUM) as $row) {
+                $rows[] = array_combine($columns, $row);
+            }
             $this->drainRowsets($stmt);
             return new QueryResult(
                 columns: $columns,
                 rows: $rows,
                 elapsed: $elapsed,
                 isSelect: true,
+                sources: $sources,
+                columnSources: $colSources,
             );
         }
 
