@@ -18,7 +18,7 @@ You already know SQL. These are the parts of `mysql>` you work around.
   `SELECT`. → [Completion](#completion)  Supports `SELECT from {table} {columns}` where {table} and {columns} are
   auto-complete capable.
 - **A grid instead of a wall of pipes.** Sort, move, resize and hide columns; it remembers them and exports as
-  arranged. → [The result grid](#the-result-grid)
+  arranged. Find a field by name, copy a block of cells as CSV. → [The result grid](#the-result-grid)
 - **Edit a cell in place.** Checked against the live column type, and handed to you as one key-scoped `UPDATE` to run or
   cancel. JSON view/editing. → [Editing data](#editing-data)
 - **Nine result views on one connection.** `\3` runs CLI command into view 3, so a schema lookup doesn't cost you the
@@ -103,7 +103,9 @@ Options can be passed as flags, or stored in a config file so you don't put cred
 | `--truecolor`              |       | 24-bit output: `auto`, `on`, `off`                                                                                        | `auto`      |
 | `--dictionary`             |       | Data Dictionary CSV path                                                                                                  |             |
 | `--read-only`              |       | Block data-modifying queries                                                                                              | off         |
+| `--log-writes`             |       | Record every data-modifying statement that ran in `sqli_db_writes.log`. Off: `--no-log-writes` or `--log-writes=false`    | on          |
 | `--local-infile`           |       | Allow `LOAD DATA LOCAL INFILE` — the server can then ask this client for any file it can read. Refused with `--read-only` | off         |
+| `--project`                |       | Find the project `.sqli/` from this directory instead of the current one                                                  | cwd         |
 | `--config`                 | `-c`  | Load options from a JSON file (or `$SQLI_CONFIG`)                                                                         |             |
 | `--user-config`            |       | Personal overlay on `--config` (or `$SQLI_USER_CONFIG`)                                                                   |             |
 | `--lint`                   |       | Validate every config file sqli would read, then exit                                                                     |             |
@@ -122,7 +124,8 @@ Turn it on for a run, not in an environment: `debug.log` is never rotated or tri
 `Ctrl+D` swaps focus between the SQL line and the result grid; `F1` is the complete list of {keys} for whichever view 
 you're in, and the system menu is `/`. System menu and in Data View Configuration optinos are scrollable and using Enterhas a quick key
 executes that item.  Each option also have drawn in front of it (`1)` … `9)`, then `a)` … `z)`): press it and the item 
-runs, exactly as `Enter` on it would.
+runs, exactly as `Enter` on it would. In Data View Configuration the keys are letters from the option itself:
+`m)` Move column, `h)` Hide column, `a)` / `d)` Sort ASC / DESC, with every reset and clear kept apart at `v)` … `z)`.
 
 The header row says which server you are on, which database and table the grid is showing, and — if you set one — **your
 own short comment beside the `CLI`/`DATA`
@@ -183,6 +186,11 @@ database are prepended with `{Safety}`, forcing the user to remove that before s
 switching between data views, when Up-arrow would give you whichever query ran last. A statement that writes, or a
 whole batch, isn't fired: it comes back on the SQL line without its `;` for you to end yourself.
 
+**A leading `!` sends the statement exactly as typed.** `!SELECT * FROM big_table;` goes out with no automatic `LIMIT`,
+no macro expansion or `?{name}` prompts, and none of sqli's rewrites — only the `!` comes off. The endings in the table
+above still work, and the safety checks still run: read-only still blocks a write, and a broad `DELETE` still asks.
+History keeps the `!`, so Up-arrow and `F5` repeat it raw.
+
 **A dropped connection is handled quietly.** If the server closes an idle session, the header shows a small red `!db`,
 the statement is re-sent once, and the answer arrives with `· reconnected` behind its row count; the grid, the sort and
 your column layout stand untouched throughout. The one thing never re-sent by itself is a write that may already have
@@ -227,7 +235,8 @@ full-screen UI, so it runs here too. If a script must never write, add `--read-o
 | `2`       | Refused by the confirmation rule or by `--read-only`; nothing ran  |
 
 A `?{name}` prompt in a macro is an error here, since there is nobody to answer it; pass the value as a macro argument
-instead. With SQL on stdin a bare `-p` is refused, because the password prompt would read the SQL. Keep the password in
+instead. A leading `!` works here too: it skips macros, prompts and rewrites, but the refusals above still apply.
+With SQL on stdin a bare `-p` is refused, because the password prompt would read the SQL. Keep the password in
 `sqli_credentials.json`, or use `-e`. Piped SQL is detected under Git Bash
 (mintty) too, but pipe into `php.exe`, not `php`: Git Bash aliases `php` to `winpty php.exe`,
 and winpty refuses piped stdin with "stdin is not a tty".
@@ -255,7 +264,15 @@ It works from the statement you are actually writing:
 ## The result grid
 
 `Ctrl+D` moves focus to the grid. Arrows move the selection; `i` opens a detail view of the whole row, `v` expands one
-cell in a movable inspector, `j` opens a JSON cell in a tree viewer.
+cell in a movable inspector, `j` opens a JSON cell in a tree viewer, `t` opens a separated-value cell as a table
+(see [Editing data](#editing-data)).
+
+**Find a field — `Ctrl+Alt+F`.** Type part of a field name and the grid narrows to the fields whose name contains it;
+`Backspace` widens it again. `Esc` or `Ctrl+Alt+F` brings every field back with the cursor still on the field you were
+on. Hidden fields stay hidden and aren't searched. Nothing is saved.
+
+**`Ctrl+Alt+S` shows the columns A–Z** — the ones you haven't placed yourself; a column you moved keeps its place.
+Press it again for the result's own order. It is never saved, and it turns off when the view shows another table.
 
 **Rearrange it — `Ctrl+L`.** That opens **Data View Configuration**, the one menu for everything about how the grid
 looks. The top half acts on the column you're on and the title names it: sort, move, resize, fit, copy, hide, and a
@@ -269,7 +286,8 @@ Config** label sits on the grid's border, so the arrangement you're reading is n
 **It remembers.** Everything is saved in `.sqli/sqli_formatting.json`. Widths, sort and formats are kept per table and
 come back on any query of it. Column order and hidden columns are kept per **field list**: an arrangement made over
 `SELECT id, name, total …` comes back for that same list of columns, and `SELECT *` keeps its own. Spacing, backticks
-and the `WHERE` clause don't matter, but `id, name` and `name, id` are two different lists. The key is the whole
+and the `WHERE` clause don't matter, but `id, name` and `name, id` are two different lists. A join is its own entry:
+what you arrange over `templates, template_items` is kept apart from `templates` alone. The key is the whole
 connection — `host:port/db` — so `devel` on two servers keeps two arrangements.
 
 **A display format changes the display, never the data.** Put the `epoch` format on a column and the integer reads as
@@ -278,6 +296,11 @@ local date/time; the stored value is untouched, and editing the cell still write
 **`Ctrl+Alt+O` exports the view as arranged** — your column order, your hidden columns left out, formatted columns
 written the way they are shown — to a CSV in the current directory. A NULL is written as a bare `NULL` and a string
 that reads `NULL` as `"NULL"`, so you can tell them apart. `Ctrl+C` copies a cell, `Ctrl+Alt+C` a row.
+
+**Copy a block of cells as CSV.** `Shift`+arrows highlight a rectangle of cells, in its own colour, and `Ctrl+C` copies it
+as CSV, one line per row. Take it up past row 1 and the field names come along as the first line. Once a block is
+started, `Home`/`End`, `PgUp`/`PgDn` and `Ctrl`+arrows stretch it with or without `Shift`, because Windows Terminal keeps
+`Ctrl+Shift`+those keys for its own scrollback. A plain arrow, any other key or a click drops the block.
 
 ### Data views
 
@@ -297,6 +320,24 @@ unapplied, one edit is in flight at a time, and nothing is written behind your b
 
 JSON columns open in a **tree view** (`j`) you can read and edit as a document instead of as one long line; pressing `j`
 again opens a blob nested inside it.
+
+**`Ctrl+N` sets a cell to a real SQL `NULL`** — the same one-cell `UPDATE` on the CLI as a typed edit.
+
+**Cells that pack several records into one text value** — rows separated by newlines, fields by `@`, `|` or anything
+else — open as a **table** with `t`. The first time, you describe the layout once for that table and column:
+
+```
+rows = "\n"
+Inspection Group   "@"
+Inspection Type    "@!"
+Record Identifier
+```
+
+One line per field: its header, then the separator that follows it (several characters are fine, and each field can
+have its own). The last field has none. `\` in the data escapes a separator. The description is saved in
+`sqli_formatting.json`, and `c` in the table edits it. In the table, `Enter` edits a field, `Del` blanks it, `a`/`A` add
+a row, `d` deletes one, and `Esc` closes. If anything changed, the rebuilt text becomes one `UPDATE` on the CLI, like
+any cell edit. Rows you didn't touch are written back exactly as they were read.
 
 **Deleting.** `Del` on a row builds the `DELETE`, scoped to the primary key, counts what it will affect and asks before
 anything happens — then puts the statement on the CLI so you read it before you run it. `Ctrl+Del` opens a checkbox
@@ -326,6 +367,13 @@ not be able to hide them. `--lint` refuses two environments using the same label
 **Read-only mode** — `--read-only`, or `"read-only": true` on an environment — blocks every data-modifying statement,
 including one a macro expanded into. It is what makes a production connection safe to browse. Without it, broad
 statements still confirm first; see [Running queries](#running-queries).
+
+**The write log.** Every data-modifying statement that ran — typed, a cell edit, a grid delete, a macro, or `-e` — is
+appended to `sqli_db_writes.log`: date, time, user, server, database, table and the statement, tab-separated, one line
+each. It goes in `~/.sqli/` when that directory exists, otherwise in a `.sqli/` under the directory you started sqli
+from. Passwords in a statement (`IDENTIFIED BY '…'`) are written as `'***'`. It is on by default; turn it off with
+`"log-writes": false` in a config or environment, or `--no-log-writes` on the command line. It is a record for you, not
+an audit trail — anyone who can run sqli can switch it off.
 
 ## The Data Dictionary
 
@@ -381,6 +429,7 @@ Everything sqli reads or writes for a directory lives in a **`.sqli/`** folder:
 | `sqli_credentials.json` | Passwords, keyed by environment                            | **no**     |
 | `sqli_state.json`       | Saved history, layout, selected theme — app-written        | no         |
 | `sqli_formatting.json`  | Per-column widths, order, formats, hidden columns          | no         |
+| `sqli_db_writes.log`    | Every data-modifying statement that ran — app-written      | no         |
 | `themes/`               | Base16 scheme files                                        | up to you  |
 
 `.sqli/` holds only what sqli itself owns. A Data Dictionary is **not** one of those things — it's a document your
@@ -401,6 +450,9 @@ sqli walks from the current directory up to the filesystem root, and **every
 `.sqli/` it finds is a layer**. Settings merge per key, with the layer closest to your cwd winning — so a repo can carry
 shared defaults while a subdirectory overrides one of them. Your home directory's `.sqli/` is always the global base
 layer, never a project.
+
+To use a project's `.sqli/` from somewhere else, name it: `sqli --project ~/work/app -E prod`. The walk then starts at
+that directory (or its `.sqli` folder) instead of your cwd. A directory that doesn't exist is an error.
 
 **This is an ancestor walk, not a search.** sqli only ever looks at the directories between you and the root — your
 current directory, its parent, and so on — never *into* anything. It's a handful of `is_dir()` checks, done once at
@@ -734,7 +786,7 @@ the terminal supports it and gracefully downsampled to 256 colours where it does
 Themes are **your assets** — sqli ships one scheme rather than a bundled library. Drop any Base16 scheme file (`base00`–
 `base0F`, YAML or JSON) into `.sqli/themes/`, in a project or globally. Hundreds are available at
 [tinted-theming/schemes](https://github.com/tinted-theming/schemes), which is where the one in `.sqli/themes/` came
-from, unmodified: the file's base name is the theme name, so `nord.yaml` is `nord`.
+from, unmodified: the whole file name is the theme name, so `nord.yaml` is `nord.yaml` — nothing is assumed about the extension.
 
 From the system menu (`/`):
 

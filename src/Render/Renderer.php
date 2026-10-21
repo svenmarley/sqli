@@ -159,6 +159,19 @@ final class Renderer
             return;
         }
 
+        // The table view of a separated-value cell (§10a), and its definition
+        // editor on top when open. Like the JSON viewer, it owns input.
+        if ($state->splitView || $state->splitDefEdit) {
+            if ($state->splitView) {
+                $this->drawSplitViewer($screen, $state, $w, $h);
+            }
+            if ($state->splitDefEdit && $state->splitDefEditor !== null) {
+                $this->drawEditorFrame($screen, $state, $w, $h, $state->splitDefTitle, $state->splitDefEditor, -1, -1);
+            }
+            $this->drawBusy($screen, $state, $w, $h);
+            return;
+        }
+
         // Modal overlays paint last, centered over everything (§6).
         if ($state->layoutPopup) {
             $this->drawLayoutPopup($screen, $state, $w, $h);
@@ -814,6 +827,11 @@ final class Renderer
 
         $visible = $this->visibleColumns($widths, $gridW, $state->colOffset);
 
+        // A Shift+arrow range (§19) is drawn only while the grid has focus,
+        // like the selected cell, and takes over from the selected-row tint so
+        // the rectangle reads as one block.
+        $showRange = $state->focus === State::FOCUS_DATA && $state->hasRange();
+
         // Header row, with a sort arrow on the sorted column.
         $headerY = $y;
         foreach ($visible as [$colIdx, $colW, $colX]) {
@@ -827,6 +845,8 @@ final class Renderer
                 $style = $this->theme->style('col_moving');
             } elseif ($sel) {
                 $style = $this->theme->style('header_selected');
+            } elseif ($showRange && $state->inRange(-1, $colIdx)) {
+                $style = $this->theme->style('cell_range');
             } elseif ($state->formatOf($name) !== null) {
                 // A formatted column's header is tinted so it's obvious the shown
                 // value differs from what's stored (§6, backlog S).
@@ -883,7 +903,7 @@ final class Renderer
             if ($isMarked) {
                 $rowBase = $this->theme->style('row_marked');
             } else {
-                $rowBase = $isSelRow ? $this->theme->style('selected_row') : ($dispIdx % 2 ? $this->theme->style('row_odd') : $this->theme->style('row_even'));
+                $rowBase = $isSelRow && !$showRange ? $this->theme->style('selected_row') : ($dispIdx % 2 ? $this->theme->style('row_odd') : $this->theme->style('row_even'));
             }
 
             foreach ($visible as [$colIdx, $colW, $colX]) {
@@ -909,6 +929,8 @@ final class Renderer
                     $style = $this->theme->style('col_moving');
                 } elseif ($isSelCell) {
                     $style = $this->theme->style('selected_cell');
+                } elseif ($showRange && $state->inRange($dispIdx, $colIdx)) {
+                    $style = $this->theme->style('cell_range');
                 } elseif ($isMarked) {
                     // Whole row reads as one doomed record — a pending edit or a
                     // NULL inside it is not the point any more.
@@ -1279,7 +1301,13 @@ final class Renderer
             $left = 'Move column · [←/→] move · [Home/End] first/last · [Enter] done · [Esc] cancel';
         } elseif ($state->widthAdjust) {
             $left = 'Change width · [→/←] ±1 · [↑/↓] ±5 · [Enter] done';
+        } elseif ($state->colFilter !== null) {
+            $left = 'Filter fields: ' . $state->colFilter . '▏ · '
+                . $state->totalCols() . ' of ' . count($state->unfilteredColumnNames())
+                . ($state->colFilterMiss !== '' ? ' · no field contains "' . $state->colFilterMiss . '"' : '')
+                . ' · [←/→] move · [Esc] done';
         }
+        $filterMiss = $state->colFilter !== null && $state->colFilterMiss !== '';
         // While a cell edit is in flight its UPDATE sits on the CLI; remind the
         // user how to resolve it (§9) — takes precedence over the row/col stats.
         if ($left === '' && $state->hasPending()) {
@@ -1292,12 +1320,14 @@ final class Renderer
             $left = self::resultStats($state->result, $state->autoLimitedAt);
         }
 
-        $style = $state->statusIsError ? $this->theme->style('status_error') : $this->theme->style('status');
+        $style = $filterMiss || ($state->statusIsError && $state->colFilter === null)
+            ? $this->theme->style('status_error')
+            : $this->theme->style('status');
 
         // A column mode's key hint owns the whole status row — drop the generic
         // right-side hints so the mode hint isn't truncated (§6).
         $hints = '';
-        if (!$state->moveMode && !$state->widthAdjust) {
+        if (!$state->moveMode && !$state->widthAdjust && $state->colFilter === null) {
             // The status message has first claim on the row; the hints take what
             // is left and shed topics to fit (§3). Spelling out every binding is
             // what overflowed the line in the first place.
@@ -2133,6 +2163,219 @@ final class Renderer
         }
     }
 
+    /** Widest a table-view column grows before its cells are cut with `…`. */
+    private const SPLIT_COL_MAX = 40;
+
+    /**
+     * The table view of a separated-value cell (§10a): a centred box with the
+     * definition's headers on top, a row-number gutter (`•` marks a row that is
+     * new or changed), and the selected field highlighted. Scrolls both ways to
+     * keep the selection on screen; the title says which fields are showing
+     * when they do not all fit.
+     */
+    private function drawSplitViewer(Screen $screen, State $state, int $w, int $h): void
+    {
+        $border = $this->theme->style('popup_border');
+        $bg = $this->theme->style('popup');
+        if ($w < 30 || $h < 9) {
+            $this->drawDialog($screen, $w, $h, ['Terminal too small for the table view']);
+            return;
+        }
+
+        $headers = $state->splitHeaders;
+        $rows = $state->splitCells;
+        $n = count($rows);
+        $nf = max(1, count($headers));
+
+        $widths = [];
+        foreach ($headers as $k => $hd) {
+            $wk = mb_strlen($hd);
+            foreach ($rows as $row) {
+                $wk = max($wk, mb_strlen(self::splitShow($row[$k] ?? '')));
+            }
+            $widths[$k] = max(1, min($wk, self::SPLIT_COL_MAX));
+        }
+        $gutW = strlen((string) max(1, $n)) + 1;
+        $needed = $gutW;
+        foreach ($widths as $wk) {
+            $needed += 3 + $wk;
+        }
+        $boxW = min($w - 2, max($needed + 4, 56));
+        $iw = $boxW - 4;
+
+        // Horizontal: keep the selected field on screen.
+        $sc = max(0, min($state->splitCol, $nf - 1));
+        $off = max(0, min($state->splitColOffset, $nf - 1));
+        if ($sc < $off) {
+            $off = $sc;
+        }
+        $span = static function (int $from, int $to) use ($widths, $gutW): int {
+            $t = $gutW;
+            for ($k = $from; $k <= $to; $k++) {
+                $t += 3 + ($widths[$k] ?? 1);
+            }
+            return $t;
+        };
+        while ($off < $sc && $span($off, $sc) > $iw) {
+            $off++;
+        }
+        $state->splitColOffset = $off;
+        $lastShown = $off;
+        while ($lastShown + 1 < count($widths) && $span($off, $lastShown + 1) <= $iw) {
+            $lastShown++;
+        }
+
+        // Vertical: keep the selected row on screen.
+        $ih = max(1, min(max(1, $n), $h - 8));
+        $state->splitPageRows = $ih;
+        $boxH = $ih + 5;
+        $sel = $state->splitSel;
+        $rowOff = $state->splitOffset;
+        if ($sel >= $rowOff + $ih) {
+            $rowOff = $sel - $ih + 1;
+        }
+        if ($sel < $rowOff) {
+            $rowOff = $sel;
+        }
+        $rowOff = max(0, min($rowOff, max(0, $n - $ih)));
+        $state->splitOffset = $rowOff;
+
+        $x = max(0, intdiv($w - $boxW, 2));
+        $y = max(0, intdiv($h - $boxH, 2));
+
+        // Title on the top border.
+        $title = ' ' . $state->splitColumn . ' — ' . $n . ($n === 1 ? ' row' : ' rows');
+        if ($off > 0 || $lastShown < count($widths) - 1) {
+            $title .= ' · fields ' . ($off + 1) . '–' . ($lastShown + 1) . ' of ' . count($widths);
+        }
+        $title .= ' ';
+        $screen->put($x, $y, '┌' . str_repeat('─', $boxW - 2) . '┐', $border);
+        $screen->put($x + 2, $y, $this->truncate($title, $boxW - 4), $this->theme->style('popup_title'));
+
+        // One bordered row; $cells are [text, style] runs, cut at the inner width.
+        $line = function (int $ry, array $runs) use ($screen, $x, $boxW, $iw, $border, $bg): void {
+            $screen->put($x, $ry, '│', $border);
+            $screen->put($x + $boxW - 1, $ry, '│', $border);
+            $screen->fill($x + 1, $ry, $boxW - 2, ' ', $bg);
+            $cx = $x + 2;
+            $left = $iw;
+            foreach ($runs as [$t, $st]) {
+                if ($left <= 0) {
+                    break;
+                }
+                $t = mb_substr($t, 0, $left);
+                $screen->put($cx, $ry, $t, $st);
+                $cx += mb_strlen($t);
+                $left -= mb_strlen($t);
+            }
+        };
+        $sepStyle = $border;
+
+        // Header row + rule.
+        $head = [[str_repeat(' ', $gutW), $bg]];
+        for ($k = $off; $k <= $lastShown; $k++) {
+            $head[] = [' │ ', $sepStyle];
+            $head[] = [$this->pad($this->cut($headers[$k] ?? '', $widths[$k]), $widths[$k]), $this->theme->style('popup_title')];
+        }
+        $line($y + 1, $head);
+        $screen->put($x, $y + 2, '├' . str_repeat('─', $boxW - 2) . '┤', $border);
+
+        // Data rows.
+        $selCell = $this->theme->style('json_selected');
+        $selRow = $this->theme->style('popup_selected');
+        $mark = $this->theme->style('cell_pending');
+        for ($i = 0; $i < $ih; $i++) {
+            $ry = $y + 3 + $i;
+            $r = $rowOff + $i;
+            if ($r >= $n) {
+                $line($ry, $n === 0 && $i === 0 ? [['(no rows — a adds one)', $this->theme->style('fg_dim')]] : []);
+                continue;
+            }
+            $isSel = $r === $sel;
+            $runs = [
+                [($state->splitChanged[$r] ?? false) ? '•' : ' ', $mark],
+                [str_pad((string) ($r + 1), $gutW - 1, ' ', STR_PAD_LEFT), $isSel ? $selRow : $this->theme->style('row_num')],
+            ];
+            for ($k = $off; $k <= $lastShown; $k++) {
+                $runs[] = [' │ ', $sepStyle];
+                $text = $this->pad($this->cut(self::splitShow($rows[$r][$k] ?? ''), $widths[$k]), $widths[$k]);
+                $runs[] = [$text, $isSel && $k === $sc ? $selCell : $bg];
+            }
+            $line($ry, $runs);
+        }
+
+        // Hint (or a one-shot notice) + bottom border.
+        $hy = $y + 3 + $ih;
+        $screen->put($x, $hy, '│', $border);
+        $screen->put($x + $boxW - 1, $hy, '│', $border);
+        if ($state->splitNotice !== '') {
+            $screen->put($x + 1, $hy, $this->pad(' ' . $state->splitNotice, $boxW - 2), $this->theme->style('json_notice'));
+        } else {
+            $hint = ' ←↑↓→ move · Enter edit · Del blank · a/A add row · d delete row · c columns · Esc done';
+            $screen->put($x + 1, $hy, $this->pad($hint, $boxW - 2), $bg);
+        }
+        $screen->put($x, $y + $boxH - 1, '└' . str_repeat('─', $boxW - 2) . '┘', $border);
+
+        if ($state->splitEdit && $state->splitEditor !== null) {
+            $this->drawSplitCellEdit($screen, $state, $w, $h);
+        }
+    }
+
+    /** A field as shown in the table: control characters made visible. */
+    private static function splitShow(string $s): string
+    {
+        $s = strtr($s, ["\r" => '␍', "\n" => '␊', "\t" => '→']);
+        return (string) preg_replace('/[\x00-\x1F\x7F]/', '·', $s);
+    }
+
+    /** $text cut to $width, with `…` when anything was dropped. */
+    private function cut(string $text, int $width): string
+    {
+        if (mb_strlen($text) <= $width) {
+            return $text;
+        }
+        return $width <= 1 ? mb_substr($text, 0, $width) : mb_substr($text, 0, $width - 1) . '…';
+    }
+
+    /** The one-line field editor over the table view (§10a). */
+    private function drawSplitCellEdit(Screen $screen, State $state, int $w, int $h): void
+    {
+        $editor = $state->splitEditor;
+        if ($editor === null) {
+            return;
+        }
+        $border = $this->theme->style('popup_border');
+        $bg = $this->theme->style('popup');
+        $boxW = min($w - 2, 80);
+        $avail = $boxW - 4;
+        $x = max(0, intdiv($w - $boxW, 2));
+        $y = max(1, intdiv($h - 4, 2));
+
+        $field = $state->splitHeaders[$state->splitCol] ?? '';
+        $title = ' ' . $field . ' — row ' . ($state->splitSel + 1) . ' ';
+        $screen->put($x, $y, '┌' . str_repeat('─', $boxW - 2) . '┐', $border);
+        $screen->put($x + 2, $y, $this->truncate($title, $boxW - 4), $this->theme->style('popup_title'));
+
+        $ly = $y + 1;
+        $screen->put($x, $ly, '│', $border);
+        $screen->put($x + $boxW - 1, $ly, '│', $border);
+        $screen->fill($x + 1, $ly, $boxW - 2, ' ', $bg);
+        $text = $editor->text();
+        $cur = $editor->cursor();
+        $hScroll = $cur > $avail - 1 ? $cur - ($avail - 1) : 0;
+        $screen->put($x + 2, $ly, mb_substr($text, $hScroll, $avail), $this->theme->style('input_text'));
+        $this->drawFieldSelection($screen, $editor, 0, $x + 2, $ly, $hScroll, $avail, $this->theme->style('input_selection'));
+        $under = mb_substr($text, $cur, 1);
+        $screen->put($x + 2 + ($cur - $hScroll), $ly, $under === '' ? ' ' : $under, $this->theme->style('cursor'));
+        $state->editFieldRegion = ['top' => $ly, 'left' => $x + 2, 'width' => $avail, 'rows' => 1, 'vScroll' => 0, 'curRow' => 0, 'curHScroll' => $hScroll];
+
+        $hy = $y + 2;
+        $screen->put($x, $hy, '│', $border);
+        $screen->put($x + $boxW - 1, $hy, '│', $border);
+        $screen->put($x + 1, $hy, $this->pad(' Enter keep · Esc cancel · empty = blank', $boxW - 2), $bg);
+        $screen->put($x, $y + 3, '└' . str_repeat('─', $boxW - 2) . '┘', $border);
+    }
+
     /**
      * The viewer's title: the column, then one crumb per embedded document the
      * user has opened with `j` (§10).
@@ -2505,10 +2748,14 @@ final class Renderer
                 'i           Detail view for the selected row',
                 'v           Expand the cell in a movable inspector',
                 'j / J       JSON viewer for the cell (j again = nested blob)',
-                'Ctrl+C      Copy cell to clipboard',
+                't           Cell as a table, split by the column\'s separators',
+                'Shift+move  Highlight a range of cells (back = shrink)',
+                '  then      Home/End/PgUp/PgDn, Ctrl+Home/End/arrows stretch it',
+                'Ctrl+C      Copy the range as CSV, else the cell',
                 'Ctrl+Alt+C  Copy row to clipboard',
                 'Ctrl+Alt+O  Export the view to a CSV in the current dir',
                 'Ctrl+Alt+S  Unmoved columns A–Z / result order (not saved)',
+                'Ctrl+Alt+F  Filter fields by name; Esc keeps the cursor there',
                 'Ctrl+L      Data View Configuration (this column + the table)',
                 'Alt+1…9     Switch data view',
                 'Ctrl+Pg↑/↓  Previous / next data view (wraps at 1 and 9)',

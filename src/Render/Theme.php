@@ -47,6 +47,7 @@ final class Theme
         // Selection, edit, cursor
         'sel_active'  => ['00', '0D'], // active cell/selection — vivid
         'sel_passive' => ['05', '02'], // whole-row highlight — subtle
+        'sel_range'   => ['00', '0C'], // Shift+arrow cell range — apart from both above
         'edit'        => ['00', '0A'], // cell being edited
         'cursor'      => ['00', '05'], // painted cursor block
         // Chips (dark text on an accent) & the DD hint box
@@ -116,6 +117,7 @@ final class Theme
         'selected_row'        => ['sel_passive'],
         'selected_cell'       => ['sel_active'],
         'header_selected'     => ['sel_active'],
+        'cell_range'          => ['sel_range'],     // Shift+arrow range (§19)
         'cell_pending'        => ['warn', 'bi'],
         // Rows marked for deletion, and the mark-mode checkbox gutter (§22)
         'row_marked'          => ['error', 'b'],
@@ -199,7 +201,7 @@ final class Theme
         'base09' => 'orange — numbers',
         'base0A' => 'yellow — warn · edit · focus border',
         'base0B' => 'green — ok · strings · ⊕ badge',
-        'base0C' => 'cyan — (reserve)',
+        'base0C' => 'cyan — cell range',
         'base0D' => 'blue — accent · selection · titles',
         'base0E' => 'magenta — special · layout tag',
         'base0F' => 'brown — (reserve)',

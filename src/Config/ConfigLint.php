@@ -606,7 +606,10 @@ final class ConfigLint
             $this->errors[] = "$ctx must be an object";
             return;
         }
-        $allowed = ['widths' => 'object', 'order' => 'list', 'formats' => 'object', 'hidden' => 'list'];
+        $allowed = [
+            'widths' => 'object', 'order' => 'list', 'formats' => 'object', 'hidden' => 'list',
+            'lists' => 'object', 'splits' => 'object',
+        ];
         /** @var array<string,mixed> $spec */
         foreach ($spec as $key => $value) {
             $key = (string) $key;
@@ -614,8 +617,16 @@ final class ConfigLint
                 continue;
             }
             if (!isset($allowed[$key])) {
-                $this->warnings[] = "$ctx.$key: unknown key (expected widths/order/formats/hidden)";
+                $this->warnings[] = "$ctx.$key: unknown key (expected widths/order/formats/hidden/lists/splits)";
                 continue;
+            }
+            if ($key === 'splits' && is_array($value)) {
+                foreach ($value as $col => $def) {
+                    if (\Sqli\Split\SplitSpec::fromArray($def) === null) {
+                        $this->warnings[] = "$ctx.splits.$col: not a usable table-view definition "
+                            . '(expected {rows, fields:[{name, sep}]}, every field but the last with a separator)';
+                    }
+                }
             }
             $ok = $allowed[$key] === 'list' ? array_is_list((array) $value) && is_array($value) : self::isObject($value) || $value === [];
             if (!$ok) {

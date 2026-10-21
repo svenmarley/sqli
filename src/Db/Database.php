@@ -703,6 +703,18 @@ final class Database
         return $this->database;
     }
 
+    /** The account this session logged in as. */
+    public function user(): string
+    {
+        return $this->user;
+    }
+
+    /** The real server address — `host:port`, or the socket path — never the label. */
+    public function server(): string
+    {
+        return $this->socket !== '' ? $this->socket : $this->host . ':' . $this->port;
+    }
+
     /**
      * The key persisted UI state is filed under: `host:port/db`, or `socket/db`
      * on a socket connection. `''` when no database is selected — which every

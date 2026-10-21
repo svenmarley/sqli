@@ -250,6 +250,24 @@ final class Settings
         $this->setFmt($scope, $table, 'formats', $formats === [] ? null : $formats);
     }
 
+    /**
+     * Table-view definitions (§10a): column name => {rows, fields:[{name, sep}]}.
+     * Saved per table, like formats, and kept whatever layout the query has.
+     *
+     * @return array<string,array<string,mixed>>
+     */
+    public function getColSplits(string $scope, string $table): array
+    {
+        $s = $this->formatting['databases'][$scope]['tables'][$table]['splits'] ?? [];
+        return is_array($s) ? array_filter($s, 'is_array') : [];
+    }
+
+    /** @param array<string,array<string,mixed>> $splits */
+    public function setColSplits(string $scope, string $table, array $splits): void
+    {
+        $this->setFmt($scope, $table, 'splits', $splits === [] ? null : $splits);
+    }
+
     /** @return list<string> hidden field names, for one field list ({@see getColOrder()}) */
     public function getHiddenCols(string $scope, string $table, string $fields = '*'): array
     {
@@ -398,7 +416,8 @@ final class Settings
         $data = $this->formatting;
         $data = ['_comment' => 'sqli per-column display settings — safe to hand-edit. '
             . 'databases > <host:port/db> > tables > <table> > { hidden:[cols], order:[cols], '
-            . 'widths:{col:width}, formats:{col:formatId} }. Delete any key to reset it.']
+            . 'widths:{col:width}, formats:{col:formatId}, splits:{col:{rows, fields:[{name, sep}]}} }. '
+            . 'Delete any key to reset it.']
             + $data;
         $this->write($this->formattingPath(), $data);
     }

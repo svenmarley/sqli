@@ -10,7 +10,7 @@
     "dictionary": "//fileserver/Engineering/Schema/app_DD.csv"
   },
 
-  "_theme_note": "`theme` is a Base16 scheme name. Themes are user assets: drop any Base16 scheme file (base00..base0F) into .sqli/themes/ (project or global) — hundreds are at github.com/tinted-theming/schemes, and the one that ships in .sqli/themes/ (nord.yaml) is Nord taken unmodified from there — the file's base name is the theme name, so it appears as `nord`. Only `<default>` (Base16 Default Dark) is built into the code — it is always offered in the theme pickers, can be edited and saved under a new name but never overwritten, and setting theme to \"<default>\" forces it, overriding any theme saved from the app. The bare name `default` means \"unspecified\", so a default.yaml on the search path reskins the fallback. `truecolor` is auto|on|off — auto detects 24-bit support and falls back to 256-color otherwise. `php sqli.php --lint` lists available themes.",
+  "_theme_note": "`theme` is a Base16 scheme name. Themes are user assets: drop any Base16 scheme file (base00..base0F) into .sqli/themes/ (project or global) — hundreds are at github.com/tinted-theming/schemes, and the one that ships in .sqli/themes/ (nord.yaml) is Nord taken unmodified from there — the whole file name is the theme name, extension included, so it appears as `nord.yaml`. Only `<default>` (Base16 Default Dark) is built into the code — it is always offered in the theme pickers, can be edited and saved under a new name but never overwritten, and setting theme to \"<default>\" forces it, overriding any theme saved from the app. The bare name `default` means \"unspecified\", so a file named `default` on the search path reskins the fallback. `truecolor` is auto|on|off — auto detects 24-bit support and falls back to 256-color otherwise. `php sqli.php --lint` lists available themes.",
 
   "envs": {
     "base": {
@@ -43,6 +43,8 @@
       "init-command": "SET SESSION max_execution_time = 30000"
     }
   },
+
+  "_log_writes_note": "`log-writes` (default true) appends every data-modifying statement that ran to sqli_db_writes.log - date, time, user, server, database, table, statement, tab-separated - in ~/.sqli/ when that directory exists, else in a .sqli/ under the directory sqli was started from. Passwords inside a statement are written as '***'. Set `\"log-writes\": false` here, in defaults{} or on one env to turn it off; --no-log-writes does the same for one run.",
 
   "_comment_note": "`comment` is a short note sqli pins to the header row, in brackets and in its own colour, right after the CLI/DATA tag: ` sqli v2.36.1  CLI [PROD - careful] `. It answers the question the rest of the header cannot — which of the four windows you have open is this one — so it is worth setting on any env you would rather not type into by accident. Set it per env (as `prod` does above), or in `defaults` for a note that applies everywhere, or with `--comment \"...\"` for one run. It can also be set or cleared live from System menu -> Header Comment, but that lasts the session only; this file is where a permanent one lives. It is folded to one line and cut at 40 characters, and the header truncates it further when the row is narrow, so keep it short.",
 

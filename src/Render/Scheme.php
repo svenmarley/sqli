@@ -33,7 +33,7 @@ final class Scheme
      * a file — and it sorts to the top of the picker.
      *
      * Distinct from the bare name `default`, which still means "unspecified" and
-     * resolves through the normal search path, so dropping a `default.yaml` in a
+     * resolves through the normal search path, so dropping a file named `default` in a
      * themes dir reskins the fallback.
      */
     public const BUILT_IN = '<default>';

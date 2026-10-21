@@ -56,9 +56,9 @@ final class State
         // The result itself and what produced it
         'result', 'lastSql', 'lastTyped', 'currentTable',
         // Selection and scroll
-        'selectedRow', 'selectedCol', 'rowOffset', 'colOffset',
+        'selectedRow', 'selectedCol', 'rowOffset', 'colOffset', 'rangeRow', 'rangeCol',
         // Layout customization (§6)
-        'hiddenCols', 'colWidthOverride', 'colOrder', 'layoutFields', 'colAlpha', 'colFormats', 'ddColFormats',
+        'hiddenCols', 'colWidthOverride', 'colOrder', 'layoutFields', 'layoutUnsaved', 'colAlpha', 'colFormats', 'ddColFormats',
         'sortCol', 'sortDir', 'sortedOrder',
         // Output mode (§5/§8)
         'vertical', 'verticalScroll', 'detail', 'detailFieldIdx', 'detailVisibleFields',
@@ -169,6 +169,26 @@ final class State
     public int $rowOffset = 0;
     public int $colOffset = 0;
 
+    /**
+     * Shift+arrow cell range in the grid (§19): the corner the range was
+     * started from, or null when there is no range. The other corner is always
+     * the cursor (selectedRow/selectedCol), so moving back toward the anchor
+     * shrinks the range. Row -1 is the header row: a range that reaches it
+     * copies the field names as its first line.
+     */
+    public ?int $rangeRow = null;
+    public ?int $rangeCol = null;
+
+    /**
+     * Ctrl+Alt+F field filter (§6): while non-null, the grid shows only the
+     * visible columns whose name contains this text (case-insensitive). A
+     * modal of the grid, never saved and never part of a view: it ends on
+     * Esc / Ctrl+Alt+F, before anything can switch tabs.
+     */
+    public ?string $colFilter = null;
+    /** The last filter text refused for matching nothing, for the status line ('' = none). */
+    public string $colFilterMiss = '';
+
     // Layout customization (§6), persisted per db+table by App.
     /** @var list<string> hidden column names */
     public array $hiddenCols = [];
@@ -191,6 +211,16 @@ final class State
      * named, in its order. Widths and formats are per table and ignore it.
      */
     public string $layoutFields = '*';
+
+    /**
+     * True when this view's layout is never written to disk (§6): the query
+     * mixed a bare `*` with named columns (`SELECT id, *`), or is sqli
+     * re-running such a view. Widths, order, hidden columns and formats
+     * changed here last only as long as the result does. Saved table-wide
+     * widths and formats still apply on the way in; a saved order and hidden
+     * set do not, since this field list never has one on file.
+     */
+    public bool $layoutUnsaved = false;
 
     /**
      * Ctrl+Alt+S (§6): show the unmoved columns — the ones after
@@ -264,31 +294,41 @@ final class State
     public array $systemMenuView = [];
 
     /**
-     * The quick keys of a keyboard menu (§6, §12): `1`–`9` for the first nine
-     * items, then `a`–`z`. Separators (null label) get none and are not
-     * counted, so the numbers run on across a rule. One function for the
-     * renderer's `2) ` prefixes and App's key handling, so the label and the
-     * key can never disagree.
+     * The quick keys of a keyboard menu (§6, §12). An item that names its own
+     * `key` — `m` for Move column — keeps it. The rest are numbered in order:
+     * `1`–`9`, then whatever of `a`–`z` no item has claimed. Separators (null
+     * label) get none and are not counted, so the numbers run on across a
+     * rule. One function for the renderer's `2) ` prefixes and App's key
+     * handling, so the label and the key can never disagree.
      *
-     * @param  list<array{label:?string,...}> $items
+     * @param  list<array{label:?string,key?:string,...}> $items
      * @return array<int,string> item index => key
      */
     public static function menuQuickKeys(array $items): array
     {
+        $own = [];
+        foreach ($items as $i => $item) {
+            if (($item['label'] ?? null) !== null && ($item['key'] ?? '') !== '') {
+                $own[$i] = $item['key'];
+            }
+        }
+        $pool = array_values(array_diff(
+            array_merge(array_map('strval', range(1, 9)), range('a', 'z')),
+            $own,
+        ));
         $keys = [];
         $n = 0;
         foreach ($items as $i => $item) {
             if (($item['label'] ?? null) === null) {
                 continue;
             }
-            $keys[$i] = match (true) {
-                $n < 9  => (string) ($n + 1),
-                $n < 35 => chr(ord('a') + $n - 9),
-                default => '',
-            };
-            $n++;
+            if (isset($own[$i])) {
+                $keys[$i] = $own[$i];
+            } elseif (isset($pool[$n])) {
+                $keys[$i] = $pool[$n++];
+            }
         }
-        return array_filter($keys, static fn (string $k): bool => $k !== '');
+        return $keys;
     }
 
     // Theme editor (§13), opened from the system menu. A modal panel over the
@@ -576,6 +616,32 @@ final class State
      * did nothing. Cleared on the next key, so it is never stale.
      */
     public string $jsonNotice = '';
+
+    // Table view of a separated-value cell (`t`, §10a). App owns the SplitTable
+    // and publishes what the renderer needs here, as it does for the JSON tree.
+    // A modal of the app, not part of a data view.
+    public bool $splitView = false;
+    public string $splitColumn = '';
+    /** @var list<string> */
+    public array $splitHeaders = [];
+    /** @var list<list<string>> one list of cells per row */
+    public array $splitCells = [];
+    /** @var list<bool> per row: new, or a field in it changed */
+    public array $splitChanged = [];
+    public int $splitSel = 0;           // selected row
+    public int $splitCol = 0;           // selected field
+    public int $splitOffset = 0;        // first row on screen, kept by the renderer
+    public int $splitColOffset = 0;     // first field on screen, kept by the renderer
+    public int $splitPageRows = 0;      // rows on screen, published by the renderer
+    /** One-shot line in place of the key hints, cleared on the next key. */
+    public string $splitNotice = '';
+    // The single-line field editor (Enter saves, Esc cancels).
+    public bool $splitEdit = false;
+    public ?LineEditor $splitEditor = null;
+    // The definition editor: a framed multi-line box (Ctrl+S saves).
+    public bool $splitDefEdit = false;
+    public ?LineEditor $splitDefEditor = null;
+    public string $splitDefTitle = '';
     // "Invalid JSON" mode: an explicit j/J on a value that is not a JSON document
     // shows the raw string + why (§10). (Enter-edit falls back to the cell editor
     // instead, so it never lands here.)
@@ -647,6 +713,9 @@ final class State
     public bool $ddHint = false;
     public string $ddHintTitle = '';   // "table.field" heading; '' = plain message box
     public string $ddHintMessage = '';
+    // Only the `word?` hint strips a `?` when dismissed; the same box also
+    // carries plain notices (System menu → Write Log) that must not.
+    public bool $ddHintStripsMark = false;
 
     public string $statusLine = '';
     public bool $statusIsError = false;
@@ -828,6 +897,41 @@ final class State
         return $this->hasResult() ? $this->result->rowCount() - 1 : 0;
     }
 
+    public function hasRange(): bool
+    {
+        return $this->rangeRow !== null && $this->rangeCol !== null;
+    }
+
+    public function clearRange(): void
+    {
+        $this->rangeRow = null;
+        $this->rangeCol = null;
+    }
+
+    /**
+     * The range as [firstRow, lastRow, firstCol, lastCol] (display rows, visible
+     * columns, all inclusive), or null when there is none.
+     *
+     * @return array{0:int,1:int,2:int,3:int}|null
+     */
+    public function rangeBounds(): ?array
+    {
+        if (!$this->hasRange()) {
+            return null;
+        }
+        return [
+            min($this->rangeRow, $this->selectedRow), max($this->rangeRow, $this->selectedRow),
+            min($this->rangeCol, $this->selectedCol), max($this->rangeCol, $this->selectedCol),
+        ];
+    }
+
+    /** Whether display row $row / visible column $col is inside the range. */
+    public function inRange(int $row, int $col): bool
+    {
+        $b = $this->rangeBounds();
+        return $b !== null && $row >= $b[0] && $row <= $b[1] && $col >= $b[2] && $col <= $b[3];
+    }
+
     /** Number of selectable columns (visible, i.e. not hidden). */
     public function totalCols(): int
     {
@@ -869,8 +973,21 @@ final class State
         return array_merge($out, $tail);
     }
 
-    /** @return list<string> display-ordered columns minus the hidden ones */
+    /**
+     * @return list<string> display-ordered columns minus the hidden ones, and
+     * minus the ones the Ctrl+Alt+F filter leaves out while it is open
+     */
     public function visibleColumnNames(): array
+    {
+        $cols = $this->unfilteredColumnNames();
+        if ($this->colFilter === null || $this->colFilter === '') {
+            return $cols;
+        }
+        return self::filterColumns($cols, $this->colFilter);
+    }
+
+    /** @return list<string> display-ordered columns minus the hidden ones, ignoring the filter */
+    public function unfilteredColumnNames(): array
     {
         $ordered = $this->orderedColumnNames();
         if ($this->hiddenCols === [] || $ordered === []) {
@@ -878,6 +995,20 @@ final class State
         }
         $hidden = array_flip($this->hiddenCols);
         return array_values(array_filter($ordered, static fn (string $n): bool => !isset($hidden[$n])));
+    }
+
+    /**
+     * The columns whose name contains $text, case-insensitive, order kept.
+     *
+     * @param  list<string> $cols
+     * @return list<string>
+     */
+    public static function filterColumns(array $cols, string $text): array
+    {
+        return array_values(array_filter(
+            $cols,
+            static fn (string $n): bool => mb_stripos($n, $text) !== false,
+        ));
     }
 
     /**
@@ -954,7 +1085,7 @@ final class State
     public function formattedColumns(): array
     {
         $out = [];
-        foreach ($this->visibleColumnNames() as $name) {
+        foreach ($this->unfilteredColumnNames() as $name) {
             $id = $this->formatOf($name);
             if ($id !== null) {
                 $out[$name] = $id;

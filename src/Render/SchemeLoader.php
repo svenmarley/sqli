@@ -14,13 +14,12 @@ namespace Sqli\Render;
  * reader", not a framework.
  *
  * Directories are searched in the order given, first match wins — so a project
- * or user `themes/` dir overrides a built-in scheme of the same name. A file's
- * base name (sans extension) is its theme name: `nord.yaml` → `nord`.
+ * or user `themes/` dir overrides a built-in scheme of the same name. A theme's
+ * name is its whole file name, extension and all: `nord.yaml` is `nord.yaml`,
+ * and no extension is ever guessed or added.
  */
 final class SchemeLoader
 {
-    private const EXTENSIONS = ['yaml', 'yml', 'json', 'txt'];
-
     /** Matches `base00: "#181818"` / `base0A = a1b56c` etc., quotes and `#` optional. */
     private const SLOT_RE = '/\bbase0([0-9a-fA-F])\b\s*[:=]\s*["\']?#?([0-9a-fA-F]{6})\b/';
 
@@ -45,11 +44,11 @@ final class SchemeLoader
         return self::parse($path, $name, $reason);
     }
 
-    /** The file backing a theme name, searching each dir/extension in order. */
+    /** The file backing a theme name: that exact file name, in each dir in order. */
     public function find(string $name): ?string
     {
         // The built-in palette lives in code; no file may claim its name.
-        // Windows can't even create `<default>.yaml`, but Linux can.
+        // Windows can't even create `<default>`, but Linux can.
         if ($name === Scheme::BUILT_IN) {
             return null;
         }
@@ -59,11 +58,9 @@ final class SchemeLoader
             if ($dir === '' || !is_dir($dir)) {
                 continue;
             }
-            foreach (self::EXTENSIONS as $ext) {
-                $candidate = rtrim($dir, '/\\') . DIRECTORY_SEPARATOR . $base . '.' . $ext;
-                if (is_file($candidate)) {
-                    return $candidate;
-                }
+            $candidate = rtrim($dir, '/\\') . DIRECTORY_SEPARATOR . $base;
+            if (is_file($candidate)) {
+                return $candidate;
             }
         }
         return null;
@@ -86,11 +83,7 @@ final class SchemeLoader
                 if (!is_file($file)) {
                     continue;
                 }
-                $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
-                if (!in_array($ext, self::EXTENSIONS, true)) {
-                    continue;
-                }
-                $name = pathinfo($file, PATHINFO_FILENAME);
+                $name = basename($file);
                 if ($name === Scheme::BUILT_IN) {
                     continue; // reserved for the in-code palette
                 }
@@ -130,6 +123,6 @@ final class SchemeLoader
             return null;
         }
 
-        return new Scheme($name ?? pathinfo($path, PATHINFO_FILENAME), $colors);
+        return new Scheme($name ?? basename($path), $colors);
     }
 }

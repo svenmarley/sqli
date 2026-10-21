@@ -41,6 +41,41 @@ final class Path
     }
 
     /**
+     * Resolve a path a person typed or pasted, forgiving the spellings that
+     * come out of a Windows/WSL mix: backslash separators under Linux
+     * (`\mnt\d\a`, `/mnt/d\a\b`), shell escapes copied off a prompt
+     * (`/mnt/d/My\ Docs/\!x`), and a mount path missing its leading slash
+     * (`mnt/d/a`). The literal spelling is always tried first, so a real file
+     * with a backslash in its name still wins. Returns the first spelling that
+     * exists, or the input unchanged when none does.
+     */
+    public static function fromTyped(string $path): string
+    {
+        if ($path === '') {
+            return $path;
+        }
+        // Separators first: `\!x` in `\mnt\d\!x` is a separator plus `!`, and
+        // reading it as a shell escape would glue two segments together.
+        $spellings = [$path, str_replace('\\', '/', $path)];
+        if (DIRECTORY_SEPARATOR === '/') {
+            $spellings[] = (string) preg_replace('#\\\\(.)#', '$1', $path);
+        }
+        foreach ($spellings as $spelling) {
+            $tries = [$spelling];
+            if (preg_match('#^mnt/[A-Za-z](/|$)#', $spelling)) {
+                $tries[] = '/' . $spelling;
+            }
+            foreach ($tries as $try) {
+                $resolved = self::resolve($try);
+                if (@file_exists($resolved)) {
+                    return $resolved;
+                }
+            }
+        }
+        return $path;
+    }
+
+    /**
      * The path plus its cross-platform spellings, ordered with the current
      * runtime's native form first so an ambiguous path prefers what's local.
      *

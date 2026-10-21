@@ -73,6 +73,7 @@ final class Config
         'truecolor'          => [null, 'truecolor', false, 'auto', 'Truecolor output: auto|on|off'],
         'dictionary'         => [null, 'dictionary', false, null, 'Data Dictionary CSV path'],
         'read-only'          => [null, 'read-only', true, false, 'Block data-modifying queries'],
+        'log-writes'         => [null, 'log-writes', true, true, 'Log every data-modifying statement that ran to sqli_db_writes.log (off: --no-log-writes or --log-writes=false)'],
         'env'                => ['E', 'env', false, null, 'Named environment from the config `envs` section (also $SQLI_ENV)'],
         'no-env'             => [null, 'no-env', true, false, 'Ignore $SQLI_ENV and the config\'s default `env`; run with no named environment'],
         'lint'               => [null, 'lint', true, false, 'Validate the config/formatting JSON files and exit'],
@@ -80,6 +81,7 @@ final class Config
         'skip-column-names'  => ['N', 'skip-column-names', true, false, 'With -e / piped SQL: no header row in the CSV'],
         'out'                => [null, 'out', false, null, 'With -e / piped SQL: write the CSV to this file instead of stdout'],
         'verbose'            => ['v', 'verbose', true, false, 'With -e / piped SQL: row counts and timings on stderr'],
+        'project'            => [null, 'project', false, null, 'Project directory to find .sqli/ in (walks up from there, as from the cwd); default: the current directory'],
         'config'             => ['c', 'config', false, null, 'Load options from a JSON config file (or $SQLI_CONFIG)'],
         'user-config'        => [null, 'user-config', false, null, 'User JSON config overriding --config (or $SQLI_USER_CONFIG)'],
         'help'               => ['h', 'help', true, false, 'Print help and exit'],
@@ -88,7 +90,7 @@ final class Config
     ];
 
     /** Options that only make sense on the CLI/env, never inside a config file. */
-    private const FILE_EXCLUDED = ['no-env', 'config', 'user-config', 'help', 'version', 'lint', 'execute', 'out'];
+    private const FILE_EXCLUDED = ['no-env', 'project', 'config', 'user-config', 'help', 'version', 'lint', 'execute', 'out'];
 
     /**
      * Options a config file may set only in its **base** — its flat root keys or
@@ -175,6 +177,9 @@ final class Config
      * @var list<string>
      */
     private array $projectDirs = [];
+
+    /** Where the project `.sqli/` search starts: `--project DIR`, else the cwd. */
+    private string $projectStart = '.';
 
     /** @var list<string> informational lines: migrations performed, registry updates */
     private array $notices = [];
@@ -283,7 +288,8 @@ final class Config
         $this->migrateSqliDir(self::joinPath($this->sqliHome, '.sqli'));
         $this->migrateLegacyMoves($this->sqliHome, self::joinPath($this->sqliHome, '.sqli'));
         $this->globalConfig = self::joinPath($this->sqliHome, '.sqli', self::CONFIG_FILE);
-        $this->projectDirs  = $this->discoverProjectDirs(getcwd() ?: '.');
+        $this->projectStart = $this->resolveProjectStart(($provided['project'] ?? false) ? (string) $cli['project'] : null);
+        $this->projectDirs  = $this->discoverProjectDirs($this->projectStart);
         $this->updateRegistry();
 
         // Explicit --config / --user-config paths: a CLI flag beats the env var.
@@ -573,6 +579,47 @@ final class Config
         return $this->getString('password') === '' && $this->getString('user') !== '';
     }
 
+    /**
+     * The directory the project `.sqli/` search starts from: the `--project`
+     * dir when one was given, else the cwd. Also where a new project `.sqli/`
+     * is offered first.
+     */
+    public function projectStart(): string
+    {
+        return $this->projectStart;
+    }
+
+    /**
+     * Resolve `--project DIR`. A relative DIR is taken from the cwd, and naming
+     * the `.sqli` folder itself means its parent — either spelling finds the
+     * same project. A DIR that is not a directory is an error, never a silent
+     * fall back to the cwd: that would quietly load some other project's config.
+     */
+    private function resolveProjectStart(?string $given): string
+    {
+        $cwd = getcwd() ?: '.';
+        if ($given === null) {
+            return $cwd;
+        }
+        $given = trim($given);
+        if ($given === '') {
+            $this->errors[] = '--project needs a directory';
+            return $cwd;
+        }
+        if (str_starts_with($given, '~')) {
+            $given = $this->home . substr($given, 1);
+        }
+        $real = @realpath($given);
+        if ($real === false || !is_dir($real)) {
+            $this->errors[] = "--project directory not found: $given";
+            return $cwd;
+        }
+        if (strcasecmp(basename($real), '.sqli') === 0) {
+            $real = dirname($real);
+        }
+        return $real;
+    }
+
     /** The global `.sqli` directory ($SQLI_HOME/.sqli); may not exist yet. */
     public function globalSqliDir(): string
     {
@@ -591,6 +638,18 @@ final class Config
         }
         $global = $this->globalSqliDir();
         return is_dir($global) ? $global : null;
+    }
+
+    /**
+     * Where the `log-writes` record goes: the global `.sqli/` when that
+     * directory exists, otherwise a `.sqli/` in the project directory (the
+     * `--project` dir, else where sqli was started; created on the first write).
+     */
+    public function writeLogPath(): string
+    {
+        $global = $this->globalSqliDir();
+        $dir = is_dir($global) ? $global : self::joinPath($this->projectStart, '.sqli');
+        return self::joinPath($dir, \Sqli\Db\WriteLog::FILE);
     }
 
     /** Path of the home registry file (may not exist). */
@@ -815,6 +874,13 @@ final class Config
             $name = ltrim($arg, '-');
             $key = $this->keyForName($name);
             if ($key === null) {
+                // `--no-NAME` turns off a flag that is on by default (`--no-log-writes`).
+                // Only those: a flag that defaults to off has nothing to negate.
+                $negated = $isLong && str_starts_with($name, 'no-') ? $this->keyForName(substr($name, 3)) : null;
+                if ($negated !== null && self::OPTIONS[$negated][2] && self::OPTIONS[$negated][3] === true) {
+                    $cli[$negated] = false;
+                    $provided[$negated] = true;
+                }
                 continue;
             }
 
