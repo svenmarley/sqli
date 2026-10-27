@@ -143,10 +143,67 @@ final class JsonTree
         return self::encodeScalar($node->scalar);
     }
 
-    /** JSON encoding of a scalar (strings quoted), for display + edit prefill. */
+    /** JSON encoding of a scalar (strings quoted), for the tree display. */
     public static function encodeScalar(mixed $v): string
     {
         return (string) json_encode($v, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    }
+
+    /** The scalar types the value editor can switch between, in Tab order. */
+    public const EDIT_TYPES = [JsonNode::STRING, JsonNode::NUMBER, JsonNode::BOOL, JsonNode::NULL];
+
+    /**
+     * A scalar's value as the editor shows it: plain text, no JSON quoting or
+     * escaping — the type lives in its own field, so the text is just the value.
+     */
+    public static function editText(JsonNode $node): string
+    {
+        return match ($node->type) {
+            JsonNode::STRING => (string) $node->scalar,
+            JsonNode::BOOL => $node->scalar ? 'true' : 'false',
+            JsonNode::NULL => '',
+            default => self::encodeScalar($node->scalar),
+        };
+    }
+
+    /**
+     * Set a scalar leaf from the editor: plain $text read as $type. A string is
+     * taken verbatim; a number must be a JSON number; a bool is true/false (or
+     * 1/0); null ignores the text. Returns an error message when the text does
+     * not fit the type (nothing changes), else null.
+     */
+    public function setScalarAs(JsonNode $node, string $type, string $text): ?string
+    {
+        if ($node->isContainer()) {
+            return null;
+        }
+        $t = trim($text);
+        switch ($type) {
+            case JsonNode::STRING:
+                $val = $text;
+                break;
+            case JsonNode::NUMBER:
+                if (preg_match('/^-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?$/', $t) !== 1) {
+                    return 'Not a number: ' . ($t === '' ? '(empty)' : $t);
+                }
+                $val = json_decode($t);
+                break;
+            case JsonNode::BOOL:
+                $lc = strtolower($t);
+                if (!in_array($lc, ['true', 'false', '1', '0'], true)) {
+                    return 'A boolean is true or false';
+                }
+                $val = $lc === 'true' || $lc === '1';
+                break;
+            case JsonNode::NULL:
+                $val = null;
+                break;
+            default:
+                return 'Unknown type: ' . $type;
+        }
+        $node->type = $type;
+        $node->scalar = $val;
+        return null;
     }
 
     // --- mutation ----------------------------------------------------------

@@ -47,7 +47,7 @@ use Sqli\Terminal\PasswordPrompt;
 
 // Version scheme: major.<ISO week number>.<counter>. The middle digit tracks the
 // week we're working in; the trailing counter just keeps climbing per change.
-const SQLI_VERSION = '2.43.8';
+const SQLI_VERSION = '2.44.0';
 
 // Route my::lineout('FILE:FILE', …) to a log file that actually exists. The
 // library default (/data/tmp/error_logs/debug.log) is never created in FILE

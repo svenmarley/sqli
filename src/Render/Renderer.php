@@ -2490,13 +2490,13 @@ final class Renderer
 
         $boxW = min($w - 2, 80);
         $avail = $boxW - 4;
-        $boxH = 4;
+        $newKey = $state->jsonEditKind === 'newKey';
+        $boxH = $newKey ? 4 : 5;
         $x = max(0, intdiv($w - $boxW, 2));
         $y = max(1, intdiv($h - $boxH, 2));
 
-        $newKey = $state->jsonEditKind === 'newKey';
         $screen->put($x, $y, '┌' . str_repeat('─', $boxW - 2) . '┐', $border);
-        $title = $newKey ? ' New key ' : ' Edit ' . $state->jsonEditLabel . ' (as JSON) ';
+        $title = $newKey ? ' New key ' : ' Edit ' . $state->jsonEditLabel . ' ';
         $screen->put($x + 2, $y, $this->truncate($title, $boxW - 4), $this->theme->style('popup_title'));
 
         // Single text row with horizontal-scroll cursor tracking.
@@ -2515,14 +2515,34 @@ final class Renderer
         $state->editFieldRegion = ['top' => $ly, 'left' => $x + 2, 'width' => $avail, 'rows' => 1, 'vScroll' => 0, 'curRow' => 0, 'curHScroll' => $hScroll];
 
         $hy = $y + 2;
+        if (!$newKey) {
+            // Type row: the four JSON scalar types, the chosen one highlighted.
+            $screen->put($x, $hy, '│', $border);
+            $screen->put($x + $boxW - 1, $hy, '│', $border);
+            $screen->fill($x + 1, $hy, $boxW - 2, ' ', $bg);
+            $tx = $x + 2;
+            $screen->put($tx, $hy, 'Type:', $bg);
+            $tx += 6;
+            foreach (\Sqli\Json\JsonTree::EDIT_TYPES as $t) {
+                $label = ' ' . $t . ' ';
+                $on = $t === $state->jsonEditType;
+                $screen->put($tx, $hy, $label, $on ? $this->theme->style('input_selection') : $this->jsonValueStyle($t));
+                $tx += mb_strlen($label) + 1;
+            }
+            $hy++;
+        }
         $screen->put($x, $hy, '│', $border);
         $screen->put($x + $boxW - 1, $hy, '│', $border);
-        $editHint = $newKey
-            ? ' Enter: name it, then set its value · Esc cancel'
-            : ' Enter save · Esc cancel  ("text", 42, true, null)';
-        $screen->put($x + 1, $hy, $this->pad($editHint, $boxW - 2), $bg);
+        if (!$newKey && $state->jsonEditError !== '') {
+            $screen->put($x + 1, $hy, $this->pad(' ' . $state->jsonEditError, $boxW - 2), $this->theme->style('json_notice'));
+        } else {
+            $editHint = $newKey
+                ? ' Enter: name it, then set its value · Esc cancel'
+                : ' Enter save · Tab change type · Esc cancel';
+            $screen->put($x + 1, $hy, $this->pad($editHint, $boxW - 2), $bg);
+        }
 
-        $screen->put($x, $y + 3, '└' . str_repeat('─', $boxW - 2) . '┘', $border);
+        $screen->put($x, $hy + 1, '└' . str_repeat('─', $boxW - 2) . '┘', $border);
     }
 
     /**

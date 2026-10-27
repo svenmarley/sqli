@@ -211,6 +211,10 @@ final class App
     /** Where a not-yet-named new object member will be inserted (§10 add flow). */
     private ?JsonNode $jsonAddContainer = null;
     private int $jsonAddPos = 0;
+    // Value editor: the text before Tab switched it to bool, and the true/false
+    // put in its place — restored when Tab moves on, unless it was edited.
+    private ?string $jsonEditStash = null;
+    private string $jsonEditAuto = '';
     /**
      * Documents descended into with `j` from inside the viewer (§10), outermost
      * first. Each frame remembers the tree left behind, the **string leaf** the
@@ -7991,14 +7995,19 @@ final class App
     }
 
     /** Open the single-line editor for the selected scalar leaf's value (§10). */
-    private function openJsonNodeEdit(): void
+    private function openJsonNodeEdit(bool $fresh = false): void
     {
         $row = $this->jsonRows[$this->state->jsonSel] ?? null;
         if ($row === null || $row['container'] || $this->blockJsonIfReadOnly()) {
             return;
         }
+        // Plain text in, type in its own field (Tab cycles it). A just-added
+        // node is a null placeholder, but what people add is usually text.
         $editor = new LineEditor();
-        $editor->setText(JsonTree::encodeScalar($row['node']->scalar));
+        $editor->setText(JsonTree::editText($row['node']));
+        $this->state->jsonEditType = $fresh ? JsonNode::STRING : $row['node']->type;
+        $this->state->jsonEditError = '';
+        $this->jsonEditStash = null;
         $this->state->jsonEditor = $editor;
         $this->state->jsonEditLabel = $row['label'] !== '' ? $row['label'] : '(value)';
         $this->state->jsonEditKind = '';
@@ -8080,7 +8089,7 @@ final class App
         $this->publishJson();
         if ($node !== null) {
             $this->jsonSelectNode($node);
-            $this->openJsonNodeEdit();
+            $this->openJsonNodeEdit(fresh: true);
         }
     }
 
@@ -8104,9 +8113,16 @@ final class App
                 $this->state->jsonEdit = false;
                 $this->state->jsonEditor = null;
                 $this->state->jsonEditKind = '';
+                $this->state->jsonEditError = '';
                 $this->jsonAddContainer = null;
                 return;
+            case Key::Tab:
+                if ($this->state->jsonEditKind === '') {
+                    $this->cycleJsonEditType();
+                }
+                return;
         }
+        $this->state->jsonEditError = '';
         if ($this->editorClipboardKey($e, $editor)) {
             return;
         }
@@ -8134,7 +8150,7 @@ final class App
                 $this->publishJson();
                 if ($node !== null) {
                     $this->jsonSelectNode($node);
-                    $this->openJsonNodeEdit(); // reopens as a value edit on the new node
+                    $this->openJsonNodeEdit(fresh: true); // reopens as a value edit on the new node
                     return;
                 }
             }
@@ -8145,12 +8161,47 @@ final class App
 
         $node = $this->selectedJsonNode();
         if ($node !== null && $this->jsonTree !== null) {
-            $this->jsonTree->setScalar($node, $editor->text());
+            $err = $this->jsonTree->setScalarAs($node, $this->state->jsonEditType, $editor->text());
+            if ($err !== null) {
+                // Keep the editor open so the value or the type can be fixed.
+                $this->state->jsonEditError = $err;
+                return;
+            }
             $this->publishJson();
         }
         $this->state->jsonEdit = false;
         $this->state->jsonEditor = null;
         $this->state->jsonEditKind = '';
+        $this->state->jsonEditError = '';
+    }
+
+    /**
+     * Tab in the value editor: next type (string → number → bool → null).
+     * Switching to bool turns the text into true/false so Enter just works.
+     */
+    private function cycleJsonEditType(): void
+    {
+        $types = JsonTree::EDIT_TYPES;
+        $i = array_search($this->state->jsonEditType, $types, true);
+        $next = $types[((int) $i + 1) % count($types)];
+        $this->state->jsonEditType = $next;
+        $this->state->jsonEditError = '';
+        $editor = $this->state->jsonEditor;
+        if ($editor === null) {
+            return;
+        }
+        if ($next === JsonNode::BOOL) {
+            // Remember the text so Tabbing on past bool gives it back.
+            $this->jsonEditStash = $editor->text();
+            $lc = strtolower(trim($this->jsonEditStash));
+            $this->jsonEditAuto = in_array($lc, ['false', '0', ''], true) ? 'false' : 'true';
+            $editor->setText($this->jsonEditAuto);
+        } elseif ($this->jsonEditStash !== null) {
+            if ($editor->text() === $this->jsonEditAuto) {
+                $editor->setText($this->jsonEditStash);
+            }
+            $this->jsonEditStash = null;
+        }
     }
 
     /** Strip one surrounding matched pair of single or double quotes. */

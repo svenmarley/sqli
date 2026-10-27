@@ -319,7 +319,9 @@ What comes out is **one `UPDATE`, scoped to the primary key, put on the CLI** fo
 unapplied, one edit is in flight at a time, and nothing is written behind your back.
 
 JSON columns open in a **tree view** (`j`) you can read and edit as a document instead of as one long line; pressing `j`
-again opens a blob nested inside it.
+again opens a blob nested inside it. `Enter` on a value edits it as plain text — no quotes, no escaping — with its type
+(`string`, `number`, `bool`, `null`) shown underneath; `Tab` changes the type, so `"hello"` can become `true`. Text that
+does not fit the chosen type is refused with the reason.
 
 **`Ctrl+N` sets a cell to a real SQL `NULL`** — the same one-cell `UPDATE` on the CLI as a typed edit.
 
@@ -369,7 +371,7 @@ including one a macro expanded into. It is what makes a production connection sa
 statements still confirm first; see [Running queries](#running-queries).
 
 **The write log.** Every data-modifying statement that ran — typed, a cell edit, a grid delete, a macro, or `-e` — is
-appended to `sqli_db_writes.log`: date, time, user, server, database, table and the statement, tab-separated, one line
+appended to `sqli_db_writes.log`: date and time, your OS login, the database user, server, database, table and the statement, tab-separated, one line
 each. It goes in `~/.sqli/` when that directory exists, otherwise in a `.sqli/` under the directory you started sqli
 from. Passwords in a statement (`IDENTIFIED BY '…'`) are written as `'***'`. It is on by default; turn it off with
 `"log-writes": false` in a config or environment, or `--no-log-writes` on the command line. It is a record for you, not

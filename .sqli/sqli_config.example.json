@@ -44,7 +44,7 @@
     }
   },
 
-  "_log_writes_note": "`log-writes` (default true) appends every data-modifying statement that ran to sqli_db_writes.log - date, time, user, server, database, table, statement, tab-separated - in ~/.sqli/ when that directory exists, else in a .sqli/ under the directory sqli was started from. Passwords inside a statement are written as '***'. Set `\"log-writes\": false` here, in defaults{} or on one env to turn it off; --no-log-writes does the same for one run.",
+  "_log_writes_note": "`log-writes` (default true) appends every data-modifying statement that ran to sqli_db_writes.log - date and time, OS login, database user, server, database, table, statement, tab-separated - in ~/.sqli/ when that directory exists, else in a .sqli/ under the directory sqli was started from. Passwords inside a statement are written as '***'. Set `\"log-writes\": false` here, in defaults{} or on one env to turn it off; --no-log-writes does the same for one run.",
 
   "_comment_note": "`comment` is a short note sqli pins to the header row, in brackets and in its own colour, right after the CLI/DATA tag: ` sqli v2.36.1  CLI [PROD - careful] `. It answers the question the rest of the header cannot — which of the four windows you have open is this one — so it is worth setting on any env you would rather not type into by accident. Set it per env (as `prod` does above), or in `defaults` for a note that applies everywhere, or with `--comment \"...\"` for one run. It can also be set or cleared live from System menu -> Header Comment, but that lasts the session only; this file is where a permanent one lives. It is folded to one line and cut at 40 characters, and the header truncates it further when the row is narrow, so keep it short.",
 

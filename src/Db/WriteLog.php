@@ -10,7 +10,10 @@ namespace Sqli\Db;
  *
  * A line is tab-separated, in this order:
  *
- *     date  time  user  server  database  table  query
+ *     datetime  login  user  server  database  table  query
+ *
+ * `datetime` is local `Y-m-d H:i:s` (one field). `login` is the operating
+ * system account that ran sqli; `user` is the database account it logged in as.
  *
  * One statement is always one line — a newline or tab inside the statement is
  * written as a literal `\n` / `\t` — so the file greps and cuts cleanly.
@@ -26,7 +29,8 @@ final class WriteLog
 {
     public const FILE = 'sqli_db_writes.log';
 
-    public function __construct(private readonly string $path)
+    /** @param ?string $login the OS login to write; null = {@see loginName()} */
+    public function __construct(private readonly string $path, private ?string $login = null)
     {
     }
 
@@ -52,12 +56,14 @@ final class WriteLog
         if (!is_dir($dir) && !@mkdir($dir, 0700, true) && !is_dir($dir)) {
             return false;
         }
-        $line = self::line($user, $server, $database, $table, $sql, $when ?? time());
+        $this->login ??= self::loginName();
+        $line = self::line($this->login, $user, $server, $database, $table, $sql, $when ?? time());
         return @file_put_contents($this->path, $line . PHP_EOL, FILE_APPEND | LOCK_EX) !== false;
     }
 
     /** The line {@see record()} writes, without its newline. */
     public static function line(
+        string $login,
         string $user,
         string $server,
         string $database,
@@ -66,14 +72,36 @@ final class WriteLog
         int $when,
     ): string {
         return implode("\t", [
-            date('Y-m-d', $when),
-            date('H:i:s', $when),
+            date('Y-m-d H:i:s', $when),
+            self::flat($login),
             self::flat($user),
             self::flat($server),
             self::flat($database),
             self::flat($table),
             self::flat(self::redact(trim($sql))),
         ]);
+    }
+
+    /**
+     * The operating system account running sqli: the effective user on POSIX
+     * (so `sudo` shows root), `USERNAME` on Windows, `USER`/`LOGNAME` as the
+     * fallback; empty when none can be read.
+     */
+    public static function loginName(): string
+    {
+        if (function_exists('posix_geteuid') && function_exists('posix_getpwuid')) {
+            $pw = @posix_getpwuid(posix_geteuid());
+            if (is_array($pw) && ($pw['name'] ?? '') !== '') {
+                return $pw['name'];
+            }
+        }
+        foreach (['USERNAME', 'USER', 'LOGNAME'] as $var) {
+            $v = getenv($var);
+            if (is_string($v) && $v !== '') {
+                return $v;
+            }
+        }
+        return '';
     }
 
     /**

@@ -655,6 +655,8 @@ final class State
     public ?LineEditor $jsonEditor = null;
     public string $jsonEditLabel = '';  // label of the node being edited (for the box title)
     public string $jsonEditKind = '';   // '' = value edit, 'newKey' = new object key
+    public string $jsonEditType = 'string'; // value edit: the JSON type to save as (Tab cycles)
+    public string $jsonEditError = '';      // value edit: why the last Enter was refused
 
     // Reusable Y/N/Cancel confirm modal (§5, §9, §18).
     public bool $confirm = false;
