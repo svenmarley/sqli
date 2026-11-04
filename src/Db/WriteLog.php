@@ -5,15 +5,20 @@ declare(strict_types=1);
 namespace Sqli\Db;
 
 /**
- * The record of what sqli changed: one line per data-modifying statement that
- * ran, appended to `sqli_db_writes.log` (the `log-writes` option, on by default).
+ * The record of what sqli sent: one line per data-modifying statement that
+ * reached the server, appended to `sqli_db_writes.log` (the `log-writes`
+ * option, on by default). A statement the server rejected is logged too,
+ * marked FAILED; one sqli refused before sending (read-only, a declined
+ * confirm) never ran and is not logged.
  *
  * A line is tab-separated, in this order:
  *
- *     datetime  login  user  server  database  table  query
+ *     datetime  status  login  user  server  database  table  query  error
  *
- * `datetime` is local `Y-m-d H:i:s` (one field). `login` is the operating
- * system account that ran sqli; `user` is the database account it logged in as.
+ * `datetime` is local `Y-m-d H:i:s` (one field). `status` is `ok` or `FAILED`;
+ * `error` is the server's message on a FAILED line and empty otherwise.
+ * `login` is the operating system account that ran sqli; `user` is the
+ * database account it logged in as.
  *
  * One statement is always one line — a newline or tab inside the statement is
  * written as a literal `\n` / `\t` — so the file greps and cuts cleanly.
@@ -21,6 +26,8 @@ namespace Sqli\Db;
  * The statement is logged as it was sent, with one exception: a password is
  * never written down. Anything that sets one (`IDENTIFIED BY '…'`,
  * `PASSWORD('…')`) keeps its shape and loses the secret — see {@see redact()}.
+ * The error text gets the same treatment, and when the statement held a
+ * password, the server's `near '…'` quote from it is masked whole.
  *
  * This is a convenience record, not an audit trail: anyone who can run sqli can
  * turn it off or edit the file.
@@ -51,17 +58,21 @@ final class WriteLog
         string $table,
         string $sql,
         ?int $when = null,
+        ?string $error = null,
     ): bool {
         $dir = dirname($this->path);
         if (!is_dir($dir) && !@mkdir($dir, 0700, true) && !is_dir($dir)) {
             return false;
         }
         $this->login ??= self::loginName();
-        $line = self::line($this->login, $user, $server, $database, $table, $sql, $when ?? time());
+        $line = self::line($this->login, $user, $server, $database, $table, $sql, $when ?? time(), $error);
         return @file_put_contents($this->path, $line . PHP_EOL, FILE_APPEND | LOCK_EX) !== false;
     }
 
-    /** The line {@see record()} writes, without its newline. */
+    /**
+     * The line {@see record()} writes, without its newline. A null $error is a
+     * statement that worked; a string (even empty) is one that failed.
+     */
     public static function line(
         string $login,
         string $user,
@@ -70,16 +81,36 @@ final class WriteLog
         string $table,
         string $sql,
         int $when,
+        ?string $error = null,
     ): string {
+        $sql = trim($sql);
+        $hidden = self::redact($sql) !== $sql;
         return implode("\t", [
             date('Y-m-d H:i:s', $when),
+            $error === null ? 'ok' : 'FAILED',
             self::flat($login),
             self::flat($user),
             self::flat($server),
             self::flat($database),
             self::flat($table),
-            self::flat(self::redact(trim($sql))),
+            self::flat(self::redact($sql)),
+            $error === null ? '' : self::flat(self::redactError($error, $hidden)),
         ]);
+    }
+
+    /**
+     * A server error message, safe to write: {@see redact()} on it, and when the
+     * statement held a password ($hidden), the `near '…'` fragment the server
+     * quotes from the statement is replaced whole. That fragment can start in
+     * the middle of the literal, where redact() cannot recognise it.
+     */
+    public static function redactError(string $error, bool $hidden): string
+    {
+        $error = self::redact($error);
+        if ($hidden) {
+            $error = preg_replace("/near '.*'(?= at line|\\s*\$)/s", "near '***'", $error) ?? $error;
+        }
+        return $error;
     }
 
     /**

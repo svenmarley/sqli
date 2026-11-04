@@ -12,9 +12,10 @@ namespace Sqli\Config;
  * overriding the one before it (lowest → highest precedence):
  *
  *   1. built-in defaults (self::OPTIONS)
- *   2. the **global** config       (`$SQLI_HOME/.sqli/sqli_config.json`)
- *   3. **project** configs         (every `.sqli/` from the cwd up to the root;
- *                                   closest to the cwd wins per key)
+ *   2. the **home** config         (`$SQLI_HOME/.sqli/sqli_config.json`;
+ *                                   `$SQLI_HOME` replaces `~` when set)
+ *   3. the **project** config      (one `.sqli/`: the listed project the cwd —
+ *                                   or `--project DIR` — is inside; see below)
  *   4. the **main** config file   (`-c`/`--config FILE`, or `$SQLI_CONFIG`)
  *   5. the **user** config file   (`--user-config FILE`, or `$SQLI_USER_CONFIG`)
  *   6. credentials files           (secrets for the selected env)
@@ -35,6 +36,17 @@ namespace Sqli\Config;
  * `--no-env` cancels the two nobody typed. `env` is the one option a file may set
  * only in its base: inside `envs{}` it would be an environment naming an
  * environment, which is what `extends` is for.
+ *
+ * **Projects are listed, never discovered.** The home config's `projects` key
+ * names the project directories; nothing walks up the tree looking for `.sqli/`
+ * folders. The active project is the deepest listed one the cwd is inside, or
+ * `--project DIR` (listed or not — it was typed). A `.sqli/` that is not listed
+ * is not read; sqli says so once. `projects` anywhere but the home config is
+ * ignored, so a project cannot vouch for another one.
+ *
+ * **`init-command` runs automatically only from the home `.sqli/` or the
+ * command line.** One set anywhere else (a project, `--config`) is held back
+ * and offered: {@see offeredInitCommand()}.
  */
 final class Config
 {
@@ -60,7 +72,7 @@ final class Config
         'server-public-key'  => [null, 'server-public-key', false, null, 'RSA public key file for sha2 auth on an unencrypted link'],
         'connect-timeout'    => [null, 'connect-timeout', false, 10, 'Seconds to wait for the connection (0 = OS default)'],
         'read-timeout'       => [null, 'read-timeout', false, 1800, 'Seconds of server silence before the connection is dropped (0 = PHP default)'],
-        'init-command'       => [null, 'init-command', false, null, 'A single SET statement run on every connect'],
+        'init-command'       => [null, 'init-command', false, null, 'A single SET statement run on every connect (from the home config or the command line; elsewhere it is offered, not run)'],
         'driver'             => [null, 'driver', false, 'auto', 'Connection driver: auto|mysqli|pdo (mysqli is what makes Esc able to cancel a query)'],
         'compress'           => [null, 'compress', true, false, 'Compress the client/server protocol'],
         'found-rows'         => [null, 'found-rows', true, false, 'Report rows matched rather than rows changed'],
@@ -81,7 +93,7 @@ final class Config
         'skip-column-names'  => ['N', 'skip-column-names', true, false, 'With -e / piped SQL: no header row in the CSV'],
         'out'                => [null, 'out', false, null, 'With -e / piped SQL: write the CSV to this file instead of stdout'],
         'verbose'            => ['v', 'verbose', true, false, 'With -e / piped SQL: row counts and timings on stderr'],
-        'project'            => [null, 'project', false, null, 'Project directory to find .sqli/ in (walks up from there, as from the cwd); default: the current directory'],
+        'project'            => [null, 'project', false, null, 'Project directory whose .sqli/ to use (need not be listed in `projects`); default: the listed project the cwd is inside'],
         'config'             => ['c', 'config', false, null, 'Load options from a JSON config file (or $SQLI_CONFIG)'],
         'user-config'        => [null, 'user-config', false, null, 'User JSON config overriding --config (or $SQLI_USER_CONFIG)'],
         'help'               => ['h', 'help', true, false, 'Print help and exit'],
@@ -116,8 +128,8 @@ final class Config
     private const FORMATTING_FILE = 'sqli_formatting.json';
     private const MACROS_FILE = Macros::FILE;
 
-    /** Registry of known project `.sqli` dirs (home `.sqli/` only; machine-owned cache). */
-    private const REGISTRY_FILE = 'sqli_registry.json';
+    /** The home-config key listing the project directories (§2). */
+    public const PROJECTS_KEY = 'projects';
 
     /** Pre-2.30.4 names inside a `.sqli/` dir, auto-renamed on discovery. */
     private const LEGACY_RENAMES = [
@@ -132,7 +144,7 @@ final class Config
     ];
 
     /** Reserved top-level keys in a config file (not options; other subsystems own them). */
-    private const RESERVED_SECTIONS = ['defaults', 'envs'];
+    private const RESERVED_SECTIONS = ['defaults', 'envs', self::PROJECTS_KEY];
 
     /** Seed contents written by {@see scaffoldAt()} when the files are absent. */
     private const DEFAULT_CONFIG_JSON = <<<'JSON'
@@ -170,19 +182,49 @@ final class Config
     private string $globalConfig = '';
 
     /**
-     * Project `.sqli/` dirs discovered walking from the cwd up to the filesystem
-     * root, **closest first**. The home/global `.sqli` is never listed here — it
-     * is the base layer, not a project.
+     * The active project's `.sqli/` dir — zero or one entry. Kept as a list so
+     * the callers that layer "home, then project" read the same either way.
+     * The home `.sqli` is never here: it is the base layer, not a project.
      *
      * @var list<string>
      */
     private array $projectDirs = [];
 
-    /** Where the project `.sqli/` search starts: `--project DIR`, else the cwd. */
+    /** The directory the active project is chosen from: `--project DIR`, else the cwd. */
     private string $projectStart = '.';
 
-    /** @var list<string> informational lines: migrations performed, registry updates */
+    /**
+     * The home config's `projects`, each resolved to a directory on this
+     * platform (a `D:/…` entry seen from WSL becomes `/mnt/d/…`).
+     *
+     * @var list<string>
+     */
+    private array $projects = [];
+
+    /** A `.sqli/` in the start dir that is not a listed project, so was not read. */
+    private ?string $unlistedSqli = null;
+
+    /** @var list<string> informational lines: migrations performed, ignored files */
     private array $notices = [];
+
+    /**
+     * Every assignment of `init-command`, in precedence order (lowest first),
+     * with the file it came from or `command line`.
+     *
+     * @var list<array{0:mixed,1:string}>
+     */
+    private array $initAssignments = [];
+
+    /**
+     * Per env name, per key: the file that last set it while the envs were
+     * pooled — so a value applied through `env NAME` still knows its file.
+     *
+     * @var array<string,array<string,string>>
+     */
+    private array $envKeyFiles = [];
+
+    /** @var array{sql:string,source:string}|null */
+    private ?array $offeredInit = null;
 
     /** Selected environment name (from -E/--env, or $SQLI_ENV), or null. */
     private ?string $envName = null;
@@ -280,17 +322,25 @@ final class Config
         $this->home = self::homeDir($env);
         $this->sqliHome = self::nonEmpty($env['SQLI_HOME'] ?? null) ?? $this->home;
 
-        // Discover config files (all optional). Each lives in a `.sqli/` dir:
-        //   global:   $SQLI_HOME/.sqli/sqli_config.json
-        //   projects: every `.sqli/` dir walking up from the cwd to the root
-        // Legacy layouts (pre-2.30.4 names, dot-files beside `.sqli/`) are
-        // migrated in place as they are discovered.
+        // Config files (all optional), each in a `.sqli/` dir:
+        //   home:    $SQLI_HOME/.sqli/sqli_config.json
+        //   project: the one listed in the home config's `projects` that the
+        //            cwd is inside, or `--project DIR`
+        // Nothing walks the tree: an unlisted `.sqli/` is reported, not read.
         $this->migrateSqliDir(self::joinPath($this->sqliHome, '.sqli'));
         $this->migrateLegacyMoves($this->sqliHome, self::joinPath($this->sqliHome, '.sqli'));
         $this->globalConfig = self::joinPath($this->sqliHome, '.sqli', self::CONFIG_FILE);
-        $this->projectStart = $this->resolveProjectStart(($provided['project'] ?? false) ? (string) $cli['project'] : null);
-        $this->projectDirs  = $this->discoverProjectDirs($this->projectStart);
-        $this->updateRegistry();
+        $explicitProject = ($provided['project'] ?? false);
+        $errorsBefore = count($this->errors);
+        $this->projectStart = $this->resolveProjectStart($explicitProject ? (string) $cli['project'] : null);
+        $projectOk = count($this->errors) === $errorsBefore;
+        $this->projects = $this->readProjectList();
+        $active = $this->chooseProject($this->projectStart, $explicitProject && $projectOk);
+        if ($active !== null) {
+            $this->migrateSqliDir($active);
+            $this->migrateLegacyMoves(dirname($active), $active);
+            $this->projectDirs = [$active];
+        }
 
         // Explicit --config / --user-config paths: a CLI flag beats the env var.
         $mainPath = ($provided['config'] ?? false)
@@ -301,9 +351,8 @@ final class Config
             : self::nonEmpty($env['SQLI_USER_CONFIG'] ?? null);
 
         // Ordered config layers, lowest → highest precedence:
-        //   2. global config
-        //   3. project configs    — farthest ancestor first, so the one closest
-        //                           to the cwd wins per key
+        //   2. home config
+        //   3. the active project's config
         //   4. explicit --config
         //   5. explicit --user-config
         // (6. credentials and 7. explicit CLI flags are applied further below.)
@@ -352,7 +401,18 @@ final class Config
             if ($resolved !== null) {
                 $this->envMatched = true;
                 $this->envChain = self::flattenChain(self::chainOf($mergedEnvs, $this->envName, []));
-                $this->applyMap($resolved, origin: 'env ' . $this->envName);
+                // Which file each resolved key came from: the most specific env in
+                // the chain that set it, and within that env the last file to.
+                $fileByKey = [];
+                foreach (array_keys($resolved) as $k) {
+                    foreach (array_reverse($this->envChain) as $name) {
+                        if (isset($this->envKeyFiles[$name][(string) $k])) {
+                            $fileByKey[(string) $k] = $this->envKeyFiles[$name][(string) $k];
+                            break;
+                        }
+                    }
+                }
+                $this->applyMap($resolved, origin: 'env ' . $this->envName, fileByKey: $fileByKey);
             }
         }
 
@@ -378,8 +438,13 @@ final class Config
             if ($given) {
                 $this->values[$key] = $cli[$key];
                 $this->origins[$key] = 'command line';
+                if ($key === 'init-command') {
+                    $this->initAssignments[] = [$cli[$key], 'command line'];
+                }
             }
         }
+
+        $this->settleInitCommand();
 
         // Expand ${SQLI_HOME} / leading ~ in resolved string values (e.g. paths).
         $this->expandTokens();
@@ -580,9 +645,9 @@ final class Config
     }
 
     /**
-     * The directory the project `.sqli/` search starts from: the `--project`
-     * dir when one was given, else the cwd. Also where a new project `.sqli/`
-     * is offered first.
+     * The directory the active project is chosen from: the `--project` dir when
+     * one was given, else the cwd. Also where a new project `.sqli/` is offered
+     * first.
      */
     public function projectStart(): string
     {
@@ -641,32 +706,165 @@ final class Config
     }
 
     /**
-     * Where the `log-writes` record goes: the global `.sqli/` when that
-     * directory exists, otherwise a `.sqli/` in the project directory (the
-     * `--project` dir, else where sqli was started; created on the first write).
+     * Where the `log-writes` record goes: always the home `.sqli/` ($SQLI_HOME,
+     * else the user's home), created on the first write if missing. Only when
+     * there is no home directory at all does it fall back to a `.sqli/` in the
+     * current directory (the `--project` dir when given).
      */
     public function writeLogPath(): string
     {
-        $global = $this->globalSqliDir();
-        $dir = is_dir($global) ? $global : self::joinPath($this->projectStart, '.sqli');
+        $hasHome = $this->sqliHome !== '.' && is_dir($this->sqliHome);
+        $dir = $hasHome ? $this->globalSqliDir() : self::joinPath($this->projectStart, '.sqli');
         return self::joinPath($dir, \Sqli\Db\WriteLog::FILE);
     }
 
-    /** Path of the home registry file (may not exist). */
-    public function registryPath(): string
-    {
-        return self::joinPath($this->sqliHome, '.sqli', self::REGISTRY_FILE);
-    }
-
     /**
-     * Migration / registry-update reports ("moved X -> Y", "updated <registry>"),
-     * so the app can say exactly which file in which dir it touched.
+     * Things worth one line each: migrations ("moved X -> Y"), an unlisted
+     * `.sqli/` that was not read, a listed project that is gone, a `projects`
+     * key outside the home config.
      *
      * @return list<string>
      */
     public function notices(): array
     {
         return $this->notices;
+    }
+
+    /**
+     * The home config's `projects`, resolved to directories on this platform.
+     *
+     * @return list<string>
+     */
+    public function projectList(): array
+    {
+        return $this->projects;
+    }
+
+    /** A `.sqli/` in the start dir that was not read because it is not listed. */
+    public function unlistedSqliDir(): ?string
+    {
+        return $this->unlistedSqli;
+    }
+
+    /**
+     * Where this run's configuration was read from, lowest precedence first:
+     * `[label, path]` pairs for the home `.sqli/`, the active project's `.sqli/`
+     * and any `--config` / `--user-config` file. Only what exists is listed, so
+     * an empty list means built-in defaults and the command line alone.
+     *
+     * @return list<array{0:string,1:string}>
+     */
+    public function sources(): array
+    {
+        $out = [];
+        if (is_dir($this->globalSqliDir())) {
+            $out[] = ['home', $this->globalSqliDir()];
+        }
+        foreach ($this->projectDirs as $dir) {
+            $out[] = ['project', $dir];
+        }
+        foreach (['config' => '--config', 'user-config' => '--user-config'] as $key => $label) {
+            $path = $this->values[$key] ?? null;
+            if (is_string($path) && $path !== '' && is_file($path)) {
+                $out[] = [$label, $path];
+            }
+        }
+        return $out;
+    }
+
+    /** One line naming {@see sources()}, for the plain terminal at startup. */
+    public function sourcesLine(): string
+    {
+        $parts = array_map(static fn (array $s): string => $s[0] . ' ' . $s[1], $this->sources());
+        return $parts === []
+            ? 'Config: none found — built-in defaults and the command line only'
+            : 'Config from: ' . implode(' · ', $parts);
+    }
+
+    /**
+     * An `init-command` that a file outside the home `.sqli/` set and that was
+     * therefore **not** run — for the app to show and let the user run (§2).
+     * Null when there is nothing held back.
+     *
+     * @return array{sql:string,source:string}|null
+     */
+    public function offeredInitCommand(): ?array
+    {
+        return $this->offeredInit;
+    }
+
+    /**
+     * Add $dir to the home config's `projects`, creating the home `.sqli/` and
+     * its config when missing. A no-op when it is already listed. Returns null
+     * on success, or the reason it failed (path + OS reason).
+     *
+     * The file is rewritten as pretty JSON with its keys in their old order;
+     * a file that is not valid JSON is left alone and reported, never replaced.
+     */
+    public function registerProject(string $dir): ?string
+    {
+        $real = @realpath($dir) ?: $dir;
+        if (strcasecmp(basename($real), '.sqli') === 0) {
+            $real = dirname($real);
+        }
+        $home = $this->globalSqliDir();
+        if (!is_dir($home) && !@mkdir($home, 0700, true) && !is_dir($home)) {
+            return "Could not create $home: " . self::lastOsError();
+        }
+        $data = [];
+        if (is_file($this->globalConfig)) {
+            $decoded = json_decode((string) @file_get_contents($this->globalConfig), true);
+            if (!is_array($decoded) || ($decoded !== [] && array_is_list($decoded))) {
+                return "Not adding to projects: {$this->globalConfig} is not a valid JSON object — fix it first";
+            }
+            $data = $decoded;
+        } else {
+            $data = json_decode(self::DEFAULT_CONFIG_JSON, true) ?: [];
+        }
+        $list = $data[self::PROJECTS_KEY] ?? [];
+        if (!is_array($list)) {
+            return 'Not adding to projects: `' . self::PROJECTS_KEY . "` in {$this->globalConfig} is not a list";
+        }
+        foreach ($list as $entry) {
+            if (is_string($entry) && self::canonPath($this->localProjectPath($entry) ?? $entry) === self::canonPath($real)) {
+                return null; // already listed
+            }
+        }
+        $list[] = str_replace('\\', '/', $real);
+        $data[self::PROJECTS_KEY] = array_values($list);
+        $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if ($json === false || @file_put_contents($this->globalConfig, $json . PHP_EOL) === false) {
+            return "Could not write {$this->globalConfig}: " . self::lastOsError();
+        }
+        if (!in_array($real, $this->projects, true)) {
+            $this->projects[] = $real;
+        }
+        return null;
+    }
+
+    /**
+     * Problems with the home `.sqli/`'s permissions (§2): it holds the
+     * credentials, the write log and the only `projects` list and `init-command`
+     * sqli trusts, so nobody but its owner should be able to change it — and
+     * the credentials file should not be readable by anyone else either.
+     *
+     * Reported, not repaired: each line names the command that fixes it. Under
+     * Linux the mode bits are read; under Windows `icacls` is asked whether
+     * Everyone, Users or Authenticated Users hold write access.
+     *
+     * @return list<string>
+     */
+    public function homePermissionProblems(): array
+    {
+        $dir = $this->globalSqliDir();
+        if (!is_dir($dir)) {
+            return [];
+        }
+        $creds = self::joinPath($dir, self::CREDENTIALS_FILE);
+        if (DIRECTORY_SEPARATOR === '\\') {
+            return HomePermissions::windows($dir);
+        }
+        return HomePermissions::posix($dir, is_file($creds) ? $creds : null);
     }
 
     /**
@@ -956,6 +1154,13 @@ final class Config
             return;
         }
 
+        // Only the home config names projects. Anywhere else the list would let
+        // one project vouch for the next, so it is ignored — and said once.
+        if (array_key_exists(self::PROJECTS_KEY, $data) && $path !== $this->globalConfig) {
+            $this->notices[] = "`projects` in $path ignored — only the home config's list is read ("
+                . $this->globalConfig . ')';
+        }
+
         // Base: flat root-level options, then an explicit defaults{} section.
         $this->applyMap($data, rootOnly: true, origin: $path);
         if (isset($data['defaults']) && is_array($data['defaults'])) {
@@ -994,6 +1199,12 @@ final class Config
                 $mergedEnvs[$key] = isset($mergedEnvs[$key])
                     ? array_merge($mergedEnvs[$key], $def)
                     : $def;
+                foreach (array_keys($def) as $optName) {
+                    $optKey = $this->keyForName((string) $optName);
+                    if ($optKey !== null) {
+                        $this->envKeyFiles[$key][$optKey] = $path;
+                    }
+                }
                 foreach (self::IDENTITY_KEYS as $identity) {
                     if (array_key_exists($identity, $def) && is_scalar($def[$identity])) {
                         $this->envDefinitions[$key][$identity][] = [$path, (string) $def[$identity]];
@@ -1012,8 +1223,10 @@ final class Config
      * file carrying one is ignored, not obeyed.
      *
      * @param array<string,mixed> $map
+     * @param array<string,string> $fileByKey the file behind each key when
+     *        $origin is not itself a file (`env NAME`)
      */
-    private function applyMap(array $map, bool $rootOnly = false, string $origin = ''): void
+    private function applyMap(array $map, bool $rootOnly = false, string $origin = '', array $fileByKey = []): void
     {
         foreach ($map as $name => $value) {
             if ($rootOnly && in_array((string) $name, self::RESERVED_SECTIONS, true)) {
@@ -1028,6 +1241,9 @@ final class Config
             }
             $this->values[$key] = self::OPTIONS[$key][2] ? self::truthy($value) : $value;
             $this->origins[$key] = $origin;
+            if ($key === 'init-command') {
+                $this->initAssignments[] = [$value, $fileByKey[$key] ?? $origin];
+            }
         }
     }
 
@@ -1142,8 +1358,9 @@ final class Config
         foreach ($this->values as $key => $value) {
             // The password is an opaque secret, never a path — a literal `~` or
             // `$SQLI_HOME` inside it must survive verbatim. The same goes for the
-            // SQL given to -e, which is not a path either.
-            if ($key === 'password' || $key === 'execute' || !is_string($value) || $value === '') {
+            // SQL given to -e or as init-command, which is not a path either.
+            if ($key === 'password' || $key === 'execute' || $key === 'init-command'
+                || !is_string($value) || $value === '') {
                 continue;
             }
             $v = str_replace(['${SQLI_HOME}', '$SQLI_HOME'], $this->sqliHome, $value);
@@ -1165,42 +1382,160 @@ final class Config
     }
 
     /**
-     * Walk from $start up to the filesystem root collecting every project
-     * `.sqli/` dir, closest first. A dir counts as a project when it has a
-     * `.sqli/` subdir *or* legacy pre-2.30.4 dot-files (`.sqli.json` /
-     * `.sqli_formatting.json`) — those are migrated into a freshly-created
-     * `.sqli/` on the spot. The home / $SQLI_HOME dir is skipped: its `.sqli`
-     * is the global base layer, never a project.
+     * The home config's `projects`, each resolved to an existing directory on
+     * this platform. Read straight from the file, ahead of the layering, because
+     * the list decides which other files are layers at all. An entry that does
+     * not resolve is reported once and skipped; a malformed list is an error.
      *
      * @return list<string>
      */
-    private function discoverProjectDirs(string $start): array
+    private function readProjectList(): array
     {
-        $skip = array_filter([self::canonPath($this->sqliHome), self::canonPath($this->home)]);
-        $found = [];
-        $dir = @realpath($start) ?: $start;
-        $prev = null;
-        while ($dir !== '' && $dir !== $prev) {
-            if (!in_array(self::canonPath($dir), $skip, true)) {
-                $sqliDir = self::joinPath($dir, '.sqli');
-                $hasLegacy = false;
-                foreach (self::LEGACY_MOVES as $old => $_) {
-                    $hasLegacy = $hasLegacy || is_file(self::joinPath($dir, $old));
-                }
-                if (is_dir($sqliDir) || $hasLegacy) {
-                    if (!is_dir($sqliDir) && !@mkdir($sqliDir, 0700, true) && !is_dir($sqliDir)) {
-                        $this->notices[] = "could not create $sqliDir to migrate legacy state files: " . self::lastOsError();
-                    } else {
-                        $this->migrateSqliDir($sqliDir);
-                        $this->migrateLegacyMoves($dir, $sqliDir);
-                        $found[] = $sqliDir;
-                    }
-                }
-            }
-            $prev = $dir;
-            $dir = dirname($dir);
+        if (!is_file($this->globalConfig)) {
+            return [];
         }
-        return $found;
+        $data = json_decode((string) @file_get_contents($this->globalConfig), true);
+        if (!is_array($data) || !array_key_exists(self::PROJECTS_KEY, $data)) {
+            return []; // a broken file is reported by the layer load
+        }
+        $list = $data[self::PROJECTS_KEY];
+        if (!is_array($list) || ($list !== [] && !array_is_list($list))) {
+            $this->errors[] = '`' . self::PROJECTS_KEY . '` in ' . $this->globalConfig
+                . ' must be a list of directory paths';
+            return [];
+        }
+        $out = [];
+        foreach ($list as $entry) {
+            if (!is_string($entry) || trim($entry) === '') {
+                $this->notices[] = 'projects: a non-path entry in ' . $this->globalConfig . ' was skipped';
+                continue;
+            }
+            $local = $this->localProjectPath(trim($entry));
+            $real = $local === null ? false : @realpath($local);
+            if ($real === false || !is_dir($real)) {
+                // The other platform's spelling (C:\ from WSL with no /mnt/c) is
+                // not a mistake, just not reachable from here — no notice for it.
+                if ($local !== null) {
+                    $this->notices[] = "projects: $entry not found — skipped";
+                }
+                continue;
+            }
+            $out[] = $real;
+        }
+        return $out;
+    }
+
+    /**
+     * A `projects` entry as a path this platform can open: `~` and
+     * `${SQLI_HOME}` expanded, `D:/…` turned into `/mnt/d/…` under Linux and
+     * the reverse under Windows. Null when it cannot be reached from here.
+     */
+    private function localProjectPath(string $p): ?string
+    {
+        $p = str_replace(['${SQLI_HOME}', '$SQLI_HOME'], $this->sqliHome, $p);
+        if ($p === '~' || str_starts_with($p, '~/') || str_starts_with($p, '~\\')) {
+            $p = $this->home . substr($p, 1);
+        }
+        $windows = DIRECTORY_SEPARATOR === '\\';
+        if (!$windows && preg_match('#^([A-Za-z]):[\\\\/]?(.*)$#', $p, $m)) {
+            $mnt = '/mnt/' . strtolower($m[1]);
+            return is_dir($mnt) ? $mnt . '/' . str_replace('\\', '/', $m[2]) : null;
+        }
+        if ($windows && preg_match('#^/mnt/([a-z])(/.*)?$#i', $p, $m)) {
+            return strtoupper($m[1]) . ':' . ($m[2] ?? '/');
+        }
+        if ($windows && str_starts_with($p, '/')) {
+            return null; // a Linux path seen from Windows
+        }
+        return $p;
+    }
+
+    /**
+     * The active project's `.sqli/` dir, or null. The candidates are the listed
+     * projects, plus `--project DIR` itself when one was given; the winner is
+     * the deepest candidate that holds $start and has a `.sqli/` folder. A
+     * `.sqli/` in $start that loses (not listed, no `--project`) is remembered
+     * for {@see unlistedSqliDir()} and reported, never read.
+     */
+    private function chooseProject(string $start, bool $explicit): ?string
+    {
+        $home = self::canonPath($this->sqliHome);
+        $candidates = $this->projects;
+        if ($explicit) {
+            $candidates[] = $start;
+        }
+        $startCanon = self::canonPath(@realpath($start) ?: $start);
+        $best = null;
+        $bestLen = -1;
+        foreach ($candidates as $root) {
+            $canon = self::canonPath($root);
+            if ($canon === $home) {
+                continue; // the home `.sqli` is the base layer, never a project
+            }
+            $inside = $startCanon === $canon || str_starts_with($startCanon, rtrim($canon, '/') . '/');
+            if (!$inside || strlen($canon) <= $bestLen) {
+                continue;
+            }
+            $sqliDir = self::joinPath($root, '.sqli');
+            if (!is_dir($sqliDir)) {
+                if ($explicit && $root === $start) {
+                    continue; // --project DIR with no .sqli/: a listed parent may still hold it
+                }
+                $this->notices[] = "project $root is listed but has no .sqli folder";
+                continue;
+            }
+            $best = $sqliDir;
+            $bestLen = strlen($canon);
+        }
+
+        $here = self::joinPath(@realpath($start) ?: $start, '.sqli');
+        if (is_dir($here) && $startCanon !== $home
+            && ($best === null || self::canonPath($here) !== self::canonPath($best))) {
+            $this->unlistedSqli = $here;
+            $this->notices[] = "$here was not read: its directory is not in `projects` in "
+                . $this->globalConfig . ' (add it there, or use --project)';
+        }
+        return $best;
+    }
+
+    /**
+     * Decide which `init-command` runs on connect (§2). Only one set in the home
+     * `.sqli/` or typed on the command line runs automatically. One that came
+     * from anywhere else and would have won is held back as an *offer* for the
+     * user to accept or not, and the highest trusted one runs instead.
+     */
+    private function settleInitCommand(): void
+    {
+        $winner = null;
+        $trusted = null;
+        foreach ($this->initAssignments as $a) {
+            $winner = $a;
+            if ($this->isTrustedSource($a[1])) {
+                $trusted = $a;
+            }
+        }
+        $this->values['init-command'] = $trusted[0] ?? null;
+        if ($trusted !== null) {
+            $this->origins['init-command'] = $trusted[1];
+        } else {
+            unset($this->origins['init-command']);
+        }
+        if ($winner !== null && !$this->isTrustedSource($winner[1])
+            && is_string($winner[0]) && trim($winner[0]) !== ''
+            && $winner[0] !== ($trusted[0] ?? null)) {
+            $this->offeredInit = ['sql' => trim($winner[0]), 'source' => $winner[1]];
+        }
+    }
+
+    /** Is $source (a file path, or `command line`) one whose init-command runs unasked? */
+    private function isTrustedSource(string $source): bool
+    {
+        if ($source === 'command line') {
+            return true;
+        }
+        $dir = $this->globalSqliDir();
+        $home = rtrim(self::canonPath(@realpath($dir) ?: $dir), '/') . '/';
+        return str_starts_with(self::canonPath(@realpath($source) ?: $source), $home);
     }
 
     /** Rename pre-2.30.4 filenames inside an existing `.sqli/` dir. */
@@ -1242,64 +1577,6 @@ final class Config
     }
 
     /**
-     * Record the discovered project dirs in the home registry — an "ugly cache"
-     * of where `.sqli` configs live, so tooling can list known projects without
-     * scanning drives. Self-pruning: entries whose path style matches the
-     * running platform and no longer exist are dropped; foreign-style entries
-     * (e.g. `/mnt/d/...` seen from Windows, `D:\...` seen from WSL) are kept —
-     * the other OS owns them. Paths are canonicalised so the same project seen
-     * from Windows and WSL collapses to one entry. Skipped quietly when the
-     * global `.sqli/` doesn't exist yet — a cache never creates directories.
-     */
-    private function updateRegistry(): void
-    {
-        if ($this->projectDirs === []) {
-            return;
-        }
-        $globalDir = $this->globalSqliDir();
-        if (!is_dir($globalDir)) {
-            return;
-        }
-        $path = $this->registryPath();
-        $data = null;
-        if (is_file($path)) {
-            $raw = @file_get_contents($path);
-            $data = is_string($raw) ? json_decode($raw, true) : null;
-        }
-        $existing = is_array($data) && isset($data['projects']) && is_array($data['projects'])
-            ? array_values(array_filter($data['projects'], 'is_string'))
-            : [];
-
-        // Index by canonical form so Windows + WSL spellings dedupe.
-        $byCanon = [];
-        foreach ($existing as $p) {
-            $canon = self::canonPath($p);
-            // Prune: only judge paths this platform can actually check.
-            if (self::pathStyleMatchesPlatform($p) && !is_dir($p)) {
-                continue;
-            }
-            $byCanon[$canon] = $p;
-        }
-        foreach ($this->projectDirs as $sqliDir) {
-            $project = dirname($sqliDir); // register the project root, not .sqli itself
-            $byCanon[self::canonPath($project)] = $project;
-        }
-
-        $projects = array_values($byCanon);
-        sort($projects);
-        if ($projects === $existing) {
-            return; // nothing changed — don't churn the file
-        }
-        $json = json_encode([
-            '_comment' => 'sqli project registry — machine-owned cache of dirs containing a .sqli config. Safe to delete; rebuilt as projects are visited.',
-            'projects' => $projects,
-        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-        if ($json !== false && @file_put_contents($path, $json . PHP_EOL) !== false) {
-            $this->notices[] = "updated registry $path";
-        }
-    }
-
-    /**
      * Canonical comparison key for a path: forward slashes, WSL `/mnt/<x>/...`
      * folded to `<x>:/...`, lower-cased, no trailing slash. Lower-casing is safe
      * here — these are Windows-drive or user-owned paths where case-insensitive
@@ -1312,13 +1589,6 @@ final class Config
             $p = $m[1] . ':' . ($m[2] ?? '');
         }
         return strtolower(rtrim($p, '/')) ?: '/';
-    }
-
-    /** True when this platform can meaningfully existence-check the path. */
-    private static function pathStyleMatchesPlatform(string $p): bool
-    {
-        $isWindowsStyle = (bool) preg_match('#^[A-Za-z]:[\\\\/]#', $p);
-        return DIRECTORY_SEPARATOR === '\\' ? $isWindowsStyle : !$isWindowsStyle;
     }
 
     /** Join path segments with the platform separator, trimming trailing slashes. */
@@ -1391,9 +1661,10 @@ final class Config
         $lines[] = '';
         $lines[] = 'Config files (JSON) layer, lowest -> highest precedence:';
         $lines[] = '  built-in defaults';
-        $lines[] = '  < $SQLI_HOME/.sqli/sqli_config.json      (global; $SQLI_HOME defaults to ~)';
-        $lines[] = '  < every .sqli/sqli_config.json from the cwd up to the root';
-        $lines[] = '    (closest to the cwd wins per key)';
+        $lines[] = '  < $SQLI_HOME/.sqli/sqli_config.json      (home; $SQLI_HOME replaces ~ when set)';
+        $lines[] = '  < DIR/.sqli/sqli_config.json for ONE project: the deepest DIR listed in the';
+        $lines[] = '    home config\'s "projects": [...] that the cwd is inside, or --project DIR.';
+        $lines[] = '    A .sqli/ that is not listed is not read. Startup names every folder read.';
         $lines[] = '  < --config (or $SQLI_CONFIG) < --user-config (or $SQLI_USER_CONFIG)';
         $lines[] = '  < .sqli/sqli_credentials.json            (secrets for the selected env)';
         $lines[] = '  < explicit command-line flags';
@@ -1405,6 +1676,9 @@ final class Config
         $lines[] = 'neither is given (closest layer wins, "" cancels a farther one), and';
         $lines[] = '--no-env ignores $SQLI_ENV and that default (an explicit -E still wins).';
         $lines[] = 'Paths may use ${SQLI_HOME} and a leading ~.  Validate files with --lint.';
+        $lines[] = 'init-command runs unasked only from the home .sqli/ or --init-command; one set';
+        $lines[] = 'elsewhere is shown at startup for you to run or skip. With --read-only the';
+        $lines[] = 'server is also told SET SESSION TRANSACTION READ ONLY on every connect.';
         $lines[] = '';
         $lines[] = 'Scripting: -e "SQL" (or SQL piped on stdin) runs without the TUI and prints';
         $lines[] = 'each result set as CSV (NULL as a bare NULL), header row unless -N.';

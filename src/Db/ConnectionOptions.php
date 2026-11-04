@@ -106,13 +106,18 @@ final class ConnectionOptions
     /**
      * The only command `init-command` may run.
      *
-     * Not paranoia about typos — about reach. The config cascade walks **up**
-     * from the cwd, so a `.sqli/` in any ancestor directory can inject an
-     * init-command into every sqli run beneath it, and that command runs on
-     * every connect *and* on every automatic reconnect. Bounded to `SET`, that
-     * is a session preference. Unbounded, a shared checkout could hand out
-     * arbitrary SQL. `USE` is refused by the same rule for a duller reason: it
-     * would desynchronise {@see Database::currentDatabase()} from the session.
+     * It runs on every connect *and* every automatic reconnect, so it should be
+     * a session preference — and `SET` is what a session preference looks like.
+     * The rule stops a `DROP` or `DELETE` dressed up as one. It does **not** make
+     * every `SET` harmless: `SET @x = (SELECT f())` runs a stored function that
+     * may write, `SET PASSWORD` changes an account, `SET GLOBAL` changes the
+     * server, and `SET autocommit = 0` quietly loses every cell edit. Those pass
+     * here and are named by {@see initCommandRisks()} instead — warned about,
+     * not refused. What stops a stranger's file from supplying one is that only
+     * the home `.sqli/` and the command line are run unasked (Config, §2).
+     *
+     * `USE` is refused for a duller reason: it would desynchronise
+     * {@see Database::currentDatabase()} from the session.
      */
     public const INIT_COMMAND_VERB = 'SET';
 
@@ -286,6 +291,9 @@ final class ConnectionOptions
      * is what this would otherwise be — is exactly the bypass the splitter was
      * built to close, and re-introducing it here would be re-opening it.
      *
+     * Passing this check means "one SET statement", not "harmless" — the risky
+     * forms of SET are added to $warnings by {@see initCommandRisks()}.
+     *
      * @param list<string> $errors
      * @param list<string> $warnings
      */
@@ -330,8 +338,62 @@ final class ConnectionOptions
             $warnings[] = 'init-command: SET NAMES overrides the utf8mb4 character set sqli connects with '
                 . '— text may come back mis-decoded';
         }
+        foreach (self::initCommandRisks($statement) as $risk) {
+            $warnings[] = 'init-command: ' . $risk;
+        }
 
         return $statement;
+    }
+
+    /**
+     * What a `SET` init-command does beyond setting a session preference, one
+     * sentence each — empty for an ordinary one. Shared by startup, `--lint`
+     * and the prompt that offers a project's init-command, so all three say the
+     * same thing. Never a reason to refuse: the statement still runs if the
+     * user wants it.
+     *
+     * String literals are blanked first, so `SET @note = 'GLOBAL (x)'` is not
+     * mistaken for either; the body of a `/*! … *​/` comment is kept, because
+     * the server runs it.
+     *
+     * @return list<string>
+     */
+    public static function initCommandRisks(string $sql): array
+    {
+        $code = preg_replace(
+            ["/'(?:[^'\\\\]|\\\\.|'')*'/s", '/"(?:[^"\\\\]|\\\\.|"")*"/s', '/\/\*!\d*/', '/\*\//'],
+            ["''", '""', ' ', ' '],
+            $sql,
+        ) ?? $sql;
+        $risks = [];
+        if (preg_match('/\b(GLOBAL|PERSIST|PERSIST_ONLY)\b|@@(global|persist|persist_only)\./i', $code) === 1) {
+            $risks[] = 'changes the whole server (GLOBAL/PERSIST), not just this session';
+        }
+        if (preg_match('/^\s*SET\s+PASSWORD\b/i', $code) === 1) {
+            $risks[] = 'changes an account password';
+        }
+        if (preg_match('/\(/', $code) === 1) {
+            $risks[] = 'calls a function or runs a subquery — that code runs on every connect and can do '
+                . 'anything the account can, including change data';
+        }
+        if (preg_match('/\bautocommit\s*(:?=)\s*(0|OFF|FALSE)\b/i', $code) === 1) {
+            $risks[] = 'turns autocommit off — cell edits look saved but are rolled back when the connection closes';
+        }
+        if (preg_match('/\bsql_log_bin\s*(:?=)\s*(0|OFF|FALSE)\b/i', $code) === 1) {
+            $risks[] = 'turns off binary logging — this session\'s changes never reach replicas';
+        }
+        if (preg_match('/\b(foreign_key_checks|unique_checks)\s*(:?=)\s*(0|OFF|FALSE)\b/i', $code) === 1) {
+            $risks[] = 'turns off key checks — rows that break foreign/unique keys are accepted';
+        }
+        // Against the original text: blanking literals would make every
+        // `sql_mode = '…'` look empty.
+        if (preg_match('/\bsql_mode\s*(:?=)\s*(\'\'|"")/i', $sql) === 1) {
+            $risks[] = 'clears sql_mode — bad values are truncated or converted with a warning instead of refused';
+        }
+        if (preg_match('/\bTRANSACTION\b.*\bREAD\s+WRITE\b/is', $code) === 1) {
+            $risks[] = 'makes transactions read-write — under read-only sqli sets it back after connecting';
+        }
+        return $risks;
     }
 
     /**

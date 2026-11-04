@@ -54,7 +54,7 @@ final class ConfigLint
     /**
      * Lint every config/state file sqli would consult for the given config:
      * the global + every project config/credentials layer, the resolved state +
-     * formatting files, the home registry, and all discoverable themes.
+     * formatting files, the home `.sqli/` permissions, and all discoverable themes.
      */
     public static function run(Config $config): self
     {
@@ -74,7 +74,9 @@ final class ConfigLint
         foreach (Settings::lintTargets($config->stateDir()) as $label => $t) {
             $lint->checkFile($label, $t['path'], $t['kind']);
         }
-        $lint->checkFile('registry', $config->registryPath(), 'registry');
+        foreach ($config->homePermissionProblems() as $problem) {
+            $lint->warnings[] = 'permissions: ' . $problem;
+        }
         // Base16 theme/scheme files: the project + global .sqli/themes dirs.
         // Themes are user assets — sqli ships none.
         $lint->checkThemes($config->themeDirs(), $config->getString('theme', 'default'));
@@ -132,6 +134,24 @@ final class ConfigLint
             $this->warnings[] = 'connection: ' . $w;
         }
         $this->notes[] = 'connection options: ' . $opts->describe();
+
+        // A project's init-command is held back and offered, not run (§2). It is
+        // still checked here, with the same rules, so the offer is not the first
+        // place a typo shows up.
+        $offered = $config->offeredInitCommand();
+        if ($offered !== null) {
+            $this->notes[] = 'init-command from ' . $offered['source'] . ' is not run automatically'
+                . ' (only the home .sqli/ or --init-command is) — sqli offers it at startup: ' . $offered['sql'];
+            $oErrors = [];
+            $oWarnings = [];
+            ConnectionOptions::fromValues(initCommand: $offered['sql'], errors: $oErrors, warnings: $oWarnings);
+            foreach ($oErrors as $e) {
+                $this->errors[] = 'offered ' . $e . ' (' . $offered['source'] . ')';
+            }
+            foreach ($oWarnings as $w) {
+                $this->warnings[] = 'offered ' . $w . ' (' . $offered['source'] . ')';
+            }
+        }
     }
 
     /**
@@ -193,7 +213,7 @@ final class ConfigLint
     }
 
     /**
-     * Check one file. $kind ∈ {config, credentials, formatting, state, registry}.
+     * Check one file. $kind ∈ {config, credentials, formatting, state, macros}.
      * Missing files are skipped silently (nothing to lint).
      */
     public function checkFile(string $label, string $path, string $kind): void
@@ -230,11 +250,10 @@ final class ConfigLint
         }
 
         match ($kind) {
-            'config'      => $this->checkConfig($where, $data),
+            'config'      => $this->checkConfig($where, $data, $label === 'global config'),
             'credentials' => $this->checkCredentials($where, $data),
             'formatting'  => $this->checkFormatting($where, $data),
             'state'       => $this->checkState($where, $data),
-            'registry'    => $this->checkRegistry($where, $data),
             default       => null,
         };
     }
@@ -306,27 +325,39 @@ final class ConfigLint
         }
     }
 
-    /** @param array<string,mixed> $data */
-    private function checkRegistry(string $where, array $data): void
+    /**
+     * `projects` (§2): a list of directory paths, read from the home config
+     * only. Anywhere else it is ignored, which is worth a warning — whoever
+     * wrote it expects it to do something.
+     *
+     * @param mixed $projects
+     */
+    private function checkProjects(string $where, mixed $projects, bool $isHome): void
     {
-        $projects = $data['projects'] ?? null;
-        if ($projects === null) {
+        if (!$isHome) {
+            $this->warnings[] = "$where: `projects` is ignored here — only the home config's list is read";
             return;
         }
-        if (!is_array($projects) || !array_is_list($projects)) {
+        if (!is_array($projects) || ($projects !== [] && !array_is_list($projects))) {
             $this->errors[] = "$where: `projects` must be a list of directory paths";
             return;
         }
         foreach ($projects as $p) {
-            if (!is_string($p)) {
-                $this->warnings[] = "$where: non-string entry in `projects` (ignored)";
+            if (!is_string($p) || trim($p) === '') {
+                $this->warnings[] = "$where: a non-path entry in `projects` (ignored)";
             }
         }
+        $resolved = $this->config?->projectList() ?? [];
+        $this->notes[] = "$where: " . count($projects) . ' project(s) listed, '
+            . count($resolved) . ' found on this machine';
     }
 
     /** @param array<string,mixed> $data */
-    private function checkConfig(string $where, array $data): void
+    private function checkConfig(string $where, array $data, bool $isHome = false): void
     {
+        if (array_key_exists(Config::PROJECTS_KEY, $data)) {
+            $this->checkProjects($where, $data[Config::PROJECTS_KEY], $isHome);
+        }
         foreach ($data as $key => $value) {
             $key = (string) $key;
             if ($key === '' || $key[0] === '_') {

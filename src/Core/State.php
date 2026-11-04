@@ -538,6 +538,9 @@ final class State
     public ?LineEditor $cellEditor = null;
     public int $cellEditRow = -1;   // raw row index under edit
     public string $cellEditCol = '';
+    // Read-only mode: the inspector's `e` opens the editor as a copy-only viewer —
+    // caret, selection and Ctrl+C work; typing, paste and save are refused.
+    public bool $cellEditViewOnly = false;
 
     // Cell inspector (§9): a NON-modal, movable popup showing one column's full
     // value (multi-line and all). Opened with `v`; it stays open while the grid

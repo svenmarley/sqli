@@ -114,6 +114,26 @@ final class Database
      */
     private ConnectionLog $log;
 
+    /**
+     * Ask the server to refuse writes too (§2): `SET SESSION TRANSACTION READ
+     * ONLY` after every connect. sqli's own read-only check stays the first
+     * line; this one also covers what that check cannot see, such as a stored
+     * function that writes.
+     */
+    private bool $sessionReadOnly = false;
+
+    /**
+     * Statements the user accepted for this session — a project's offered
+     * init-command (§2). Run again after every reconnect, before the
+     * read-only line, so read-only always has the last word.
+     *
+     * @var list<string>
+     */
+    private array $sessionStatements = [];
+
+    /** @var list<string> what the last connect's session setup could not do */
+    private array $sessionProblems = [];
+
     public function __construct(
         private readonly string $host = 'localhost',
         private readonly string $user = '',
@@ -245,6 +265,7 @@ final class Database
         }
 
         $this->lost = false;
+        $this->applySessionSetup();
 
         // The session's own limits, read here because here is the only place
         // they can be read: they describe the connection that a later 2006 will
@@ -259,6 +280,85 @@ final class Database
             tls: $this->tlsDescription(),
             limits: $snapshot['limits'] ?? [],
         );
+    }
+
+    /** Have the server refuse writes as well (see {@see $sessionReadOnly}); set before connecting. */
+    public function setSessionReadOnly(bool $on): void
+    {
+        $this->sessionReadOnly = $on;
+    }
+
+    public function sessionReadOnly(): bool
+    {
+        return $this->sessionReadOnly;
+    }
+
+    /**
+     * Run $sql now and again after every reconnect — how an offered
+     * init-command the user accepted keeps applying (§2). Read-only, when on,
+     * is re-asserted after it. Returns null, or the server's error (and then
+     * it is not kept).
+     */
+    public function addSessionStatement(string $sql): ?string
+    {
+        try {
+            $this->run($sql, microtime(true));
+        } catch (\Throwable $e) {
+            return $this->formatError($e);
+        }
+        $this->sessionStatements[] = $sql;
+        if ($this->sessionReadOnly) {
+            $problem = $this->runSetup(self::READ_ONLY_SQL);
+            if ($problem !== null) {
+                return 'ran, but read-only could not be re-applied: ' . $problem;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * What the last connect's session setup could not do — one line each.
+     * Empty when it all ran. Never fatal: the connection is up either way.
+     *
+     * @return list<string>
+     */
+    public function sessionProblems(): array
+    {
+        return $this->sessionProblems;
+    }
+
+    /** The statement that asks the server for a read-only session. */
+    public const READ_ONLY_SQL = 'SET SESSION TRANSACTION READ ONLY';
+
+    private function applySessionSetup(): void
+    {
+        $this->sessionProblems = [];
+        foreach ($this->sessionStatements as $sql) {
+            $problem = $this->runSetup($sql);
+            if ($problem !== null) {
+                $this->sessionProblems[] = 'accepted init-command failed after reconnecting: ' . $problem;
+            }
+        }
+        if ($this->sessionReadOnly) {
+            $problem = $this->runSetup(self::READ_ONLY_SQL);
+            if ($problem !== null) {
+                $this->sessionProblems[] = 'read-only: the server would not take '
+                    . self::READ_ONLY_SQL . ' (' . $problem . ') — sqli still refuses writes itself';
+            }
+        }
+        foreach ($this->sessionProblems as $p) {
+            my::lineout('FILE:FILE', 'session setup', $p);
+        }
+    }
+
+    private function runSetup(string $sql): ?string
+    {
+        try {
+            $this->run($sql, microtime(true));
+            return null;
+        } catch (\Throwable $e) {
+            return $this->formatError($e);
+        }
     }
 
     /**

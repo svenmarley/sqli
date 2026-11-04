@@ -8,6 +8,7 @@ use includes\my;
 use Sqli\Config\Config;
 use Sqli\Config\Settings;
 use Sqli\Config\Macros;
+use Sqli\Db\ConnectionOptions;
 use Sqli\Db\Database;
 use Sqli\Db\DataDictionary;
 use Sqli\Db\FieldValidator;
@@ -617,6 +618,9 @@ final class App
                 . (count($conflicts) > 1 ? sprintf(' (+%d more — see --lint)', count($conflicts) - 1) : '');
             $this->state->statusIsError = true;
         }
+
+        // A project's init-command is never run unasked (§2): offer it, once.
+        $this->offerInitCommand();
 
         // Only load a Data Dictionary at startup when one is explicitly passed via
         // --dictionary. A saved per-db association is loaded lazily, the first time
@@ -1573,6 +1577,19 @@ final class App
                 $sel($ed, $e->shift);
                 $ed->downLine();
                 return true;
+            case Key::PageUp:
+            case Key::PageDown:
+                // A page = the rows the box last drew (from the renderer's
+                // published field geometry); Shift extends the selection.
+                if (!$multiline) {
+                    return false;
+                }
+                $sel($ed, $e->shift);
+                $step = max(1, (int) ($this->state->editFieldRegion['rows'] ?? 10) - 1);
+                for ($i = 0; $i < $step; $i++) {
+                    $e->key === Key::PageUp ? $ed->upLine() : $ed->downLine();
+                }
+                return true;
             default:
                 return false;
         }
@@ -1622,6 +1639,9 @@ final class App
         // key/value) drop them so a stray newline can't corrupt the value.
         $s = $this->state;
         $modalEd = $this->activeModalEditor();
+        if ($modalEd !== null && $modalEd === $s->cellEditor && $s->cellEditViewOnly) {
+            return; // the read-only viewer takes no paste
+        }
         if ($modalEd !== null) {
             // Multi-line fields (cell edit, DD comment) keep pasted newlines;
             // single-line fields (DD path, JSON node) drop them.
@@ -1753,12 +1773,6 @@ final class App
             ($e->shift && ($isJump || $isArrow))
             || ($isJump && $this->state->hasRange())
         );
-        if ($e->shift || $this->state->hasRange()) {
-            // Range keys trace (§19): what the terminal actually delivers.
-            my::lineout('FILE:FILE', 'range key', $e->key->name,
-                ($e->ctrl ? 'C' : '') . ($e->alt ? 'A' : '') . ($e->shift ? 'S' : ''),
-                $isRangeMove ? 'stretch' : 'other');
-        }
         $isCopy = $e->key === Key::Char && $e->ctrl && !$e->alt && strtolower($e->char) === 'c';
         if ($isRangeMove) {
             if (!$this->state->hasRange()) {
@@ -3783,12 +3797,17 @@ final class App
 
     /**
      * "Create Local sqli Config": pick which directory (the cwd or any of its
-     * ancestors) should get a fresh `.sqli/` — for when a project deserves its
-     * own config/state instead of inheriting whatever is further up the tree.
+     * ancestors) should get a fresh `.sqli/`, which is then added to the home
+     * config's `projects` (§2). When the cwd already has a `.sqli/` that is not
+     * listed, the first choice adds that one instead of creating anything.
      */
     private function openCreateConfigChooser(): void
     {
         $items = [];
+        $unlisted = $this->config->unlistedSqliDir();
+        if ($unlisted !== null) {
+            $items[] = dirname($unlisted) . '   (has a .sqli — add it to projects)';
+        }
         foreach ($this->candidateConfigDirs() as $dir) {
             $items[] = $dir;
         }
@@ -3901,6 +3920,14 @@ final class App
     private function applyChooser(string $purpose, int $sel): void
     {
         if ($purpose === 'create_config') {
+            $unlisted = $this->config->unlistedSqliDir();
+            if ($unlisted !== null) {
+                if ($sel === 0) {
+                    $this->registerProjectDir(dirname($unlisted), created: false);
+                    return;
+                }
+                $sel--;
+            }
             $dirs = $this->candidateConfigDirs();
             $dir = $dirs[$sel] ?? null;
             if ($dir !== null) {
@@ -3949,8 +3976,30 @@ final class App
             . ' (sqli_config.json, sqli_credentials.json, themes/)';
         $this->state->statusIsError = false;
         my::lineout('FILE:FILE', 'config scaffolded', $sqliDir);
+        // A project `.sqli/` is only read when it is listed (§2), so a new one
+        // goes straight into the home config's `projects`.
+        if (rtrim($sqliDir, '/\\') !== rtrim($this->config->globalSqliDir(), '/\\')) {
+            $this->registerProjectDir(dirname($sqliDir), created: true);
+        }
         // A write error from the relocation (e.g. read-only dir) trumps the
         // success message — surfaced on the next frame by the main loop.
+    }
+
+    /** Add $dir to the home config's `projects` and say so (§2). */
+    private function registerProjectDir(string $dir, bool $created): void
+    {
+        $err = $this->config->registerProject($dir);
+        if ($err !== null) {
+            $this->state->statusLine = $err;
+            $this->state->statusIsError = true;
+            my::lineout('FILE:FILE', 'register project failed', $dir, $err);
+            return;
+        }
+        $this->state->statusLine = ($created ? 'Created ' . $dir . DIRECTORY_SEPARATOR . '.sqli and added' : 'Added ' . $dir)
+            . ' to projects in ' . $this->config->globalSqliDir()
+            . ($created ? '' : ' — restart sqli to load its config');
+        $this->state->statusIsError = false;
+        my::lineout('FILE:FILE', 'project registered', $dir);
     }
 
     private function toggleDebugLogging(): void
@@ -6299,11 +6348,12 @@ final class App
      * `log-writes` option, §25). Called from every place a statement's result
      * comes back — the CLI, the grid's own UPDATE and DELETE, and scripting
      * mode — and decides for itself whether there is anything to write: a
-     * statement that failed changed nothing, and a SELECT is not a write.
+     * SELECT is not a write. A write the server rejected is still logged,
+     * marked FAILED with the server's message.
      */
     private function logWrite(string $sql, QueryResult $result, string $first = ''): void
     {
-        if (!$this->config->isFlag('log-writes') || $result->hasError()) {
+        if (!$this->config->isFlag('log-writes')) {
             return;
         }
         $first = $first !== '' ? $first : Splitter::commandKeyword($sql);
@@ -6317,6 +6367,8 @@ final class App
             $this->database->currentDatabase(),
             $this->affectedTable(Splitter::stripComments($sql), $first),
             $sql,
+            null,
+            $result->hasError() ? ($result->error ?? 'unknown error') : null,
         );
         if (!$written) {
             my::lineout('FILE:FILE', 'logWrite: could not write', $this->writeLog->path());
@@ -6510,10 +6562,15 @@ final class App
         if ($col === '' || $rawIdx === null) {
             return;
         }
-        if ($this->blockIfReadOnly() || $this->blockIfMultiSource('edit') || $this->blockIfPrimaryKey($col)) {
-            return;
+        // Read-only: no edit, but the same box opens as a copy-only viewer so a
+        // big value can still be selected and copied (handleCellEditKey).
+        $viewOnly = $this->state->readOnly;
+        if (!$viewOnly) {
+            if ($this->blockIfMultiSource('edit') || $this->blockIfPrimaryKey($col)) {
+                return;
+            }
+            $this->warnIfForeignKey($col);
         }
-        $this->warnIfForeignKey($col);
         $current = $this->cellIsNull($rawIdx, $col) ? null : $this->cellValueAt($rawIdx, $col);
         $editor = new LineEditor();
         // Edit in the column's displayed form; converted back on commit (§6).
@@ -6522,8 +6579,12 @@ final class App
         $this->state->cellEditRow = $rawIdx;
         $this->state->cellEditCol = $col;
         $this->state->cellEditFromView = true;
+        $this->state->cellEditViewOnly = $viewOnly;
         $this->state->cellMoveMode = false;
         $this->state->cellEdit = true;
+        if ($viewOnly) {
+            $editor->setCursorOffset(0);
+        }
     }
 
     /**
@@ -6633,6 +6694,10 @@ final class App
             $this->state->cellEdit = false;
             return;
         }
+        if ($this->state->cellEditViewOnly) {
+            $this->handleCellViewOnlyKey($e, $editor);
+            return;
+        }
         // Field specials first (Ctrl+S save, Enter=newline, Esc cancel — §9), then
         // shared clipboard + base editing so the cell box matches the CLI: a
         // multi-line field.
@@ -6654,6 +6719,36 @@ final class App
             return;
         }
         $this->applyEditingKey($editor, $e, multiline: true);
+    }
+
+    /**
+     * The read-only inspector viewer: caret moves, Shift selects, Ctrl+A selects
+     * all, Ctrl+C (and Ctrl+X) copy without cutting, Esc closes. Anything that
+     * would change the text is refused with the read-only notice.
+     */
+    private function handleCellViewOnlyKey(KeyEvent $e, LineEditor $editor): void
+    {
+        if ($e->key === Key::Escape) {
+            $this->closeCellEdit();
+            return;
+        }
+        if ($e->key === Key::Char && $e->ctrl && !$e->alt && in_array(strtolower($e->char), ['c', 'x'], true)) {
+            $sel = $editor->selectedText();
+            if ($sel !== '') {
+                $this->copyToClipboard($sel, 'selection (' . mb_strlen($sel) . ' chars)');
+            }
+            return;
+        }
+        $navigation = [Key::Left, Key::Right, Key::Home, Key::End, Key::Up, Key::Down, Key::PageUp, Key::PageDown];
+        $selectAll = $e->key === Key::Char && $e->ctrl && !$e->alt && strtolower($e->char) === 'a';
+        if ($selectAll || in_array($e->key, $navigation, true)) {
+            $this->applyEditingKey($editor, $e, multiline: true);
+            return;
+        }
+        if (in_array($e->key, [Key::Char, Key::Backspace, Key::Delete, Key::Enter], true)) {
+            $this->state->statusLine = '[RO] Read-only mode — select and copy only' . $this->readOnlyWhy();
+            $this->state->statusIsError = true;
+        }
     }
 
     private function confirmCellEdit(): void
@@ -6707,6 +6802,7 @@ final class App
         $this->state->cellEditor = null;
         $this->state->cellEditPopup = false;
         $this->state->cellEditFromView = false;
+        $this->state->cellEditViewOnly = false;
         // Drop any half-finished mouse grab; the box the user was dragging is gone.
         // The chosen position/size deliberately survive — see State::$cellEditX.
         $this->editorDrag = null;
@@ -8344,6 +8440,56 @@ final class App
         }
     }
 
+    // --- offered init-command (§2) -------------------------------------------
+
+    /**
+     * Show the init-command a file outside the home `.sqli/` set, with what it
+     * does beyond a session preference, and let the user run it for this
+     * session (it then re-runs on every reconnect) or skip it.
+     */
+    private function offerInitCommand(): void
+    {
+        $offer = $this->config->offeredInitCommand();
+        if ($offer === null) {
+            return;
+        }
+        $lines = [
+            'init-command from ' . $offer['source'],
+            'Not run automatically — only the home .sqli/ or --init-command runs one.',
+            '',
+            '  ' . $offer['sql'],
+        ];
+        $risks = ConnectionOptions::initCommandRisks($offer['sql']);
+        if ($risks !== []) {
+            $lines[] = '';
+            foreach ($risks as $r) {
+                $lines[] = 'Warning: it ' . $r;
+            }
+        }
+        $lines[] = '';
+        $lines[] = 'Run it for this session (and after any reconnect)?';
+        $this->openConfirm('init_offer', implode("\n", $lines), [['Y', 'Run it'], ['N', 'Skip']]);
+    }
+
+    private function acceptOfferedInit(bool $run): void
+    {
+        $offer = $this->config->offeredInitCommand();
+        if ($offer === null) {
+            return;
+        }
+        if (!$run) {
+            $this->state->statusLine = 'init-command not run (from ' . $offer['source'] . ')';
+            $this->state->statusIsError = false;
+            return;
+        }
+        $problem = $this->database->addSessionStatement($offer['sql']);
+        my::lineout('FILE:FILE', 'offered init-command', $offer['source'], $problem ?? 'ran');
+        $this->state->statusLine = $problem === null
+            ? 'Ran init-command: ' . $offer['sql']
+            : 'init-command failed: ' . $problem;
+        $this->state->statusIsError = $problem !== null;
+    }
+
     // --- confirm modal (§5, §9, §18) ---------------------------------------
 
     /**
@@ -8422,6 +8568,17 @@ final class App
                 $this->clearView();
             } elseif ($key === 'n' || $key === 'c' || $key === 'esc') {
                 $this->closeConfirm();
+            }
+            return;
+        }
+
+        if ($kind === 'init_offer') {
+            if ($key === 'y') {
+                $this->closeConfirm();
+                $this->acceptOfferedInit(true);
+            } elseif ($key === 'n' || $key === 'esc') {
+                $this->closeConfirm();
+                $this->acceptOfferedInit(false);
             }
             return;
         }
@@ -10074,6 +10231,7 @@ final class App
         $this->state->cellEditor = null;
         $this->state->cellEditPopup = false;
         $this->state->cellEditFromView = false;
+        $this->state->cellEditViewOnly = false;
         $this->state->cellView = false;
         $this->state->cellViewCol = '';
         $this->state->cellViewScroll = 0;

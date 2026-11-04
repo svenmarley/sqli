@@ -47,7 +47,7 @@ use Sqli\Terminal\PasswordPrompt;
 
 // Version scheme: major.<ISO week number>.<counter>. The middle digit tracks the
 // week we're working in; the trailing counter just keeps climbing per change.
-const SQLI_VERSION = '2.44.0';
+const SQLI_VERSION = '2.44.4';
 
 // Route my::lineout('FILE:FILE', …) to a log file that actually exists. The
 // library default (/data/tmp/error_logs/debug.log) is never created in FILE
@@ -89,6 +89,12 @@ if ($config->isFlag('lint')) {
 $configErrors = $config->configErrors();
 if ($configErrors !== []) {
     fwrite(STDERR, 'sqli: ' . implode(PHP_EOL . 'sqli: ', $configErrors) . PHP_EOL);
+    // The notes are often the reason: an env "not defined anywhere" is usually
+    // defined in a `.sqli/` that was not read because it is not listed (§2).
+    fwrite(STDERR, $config->sourcesLine() . PHP_EOL);
+    foreach ($config->notices() as $n) {
+        fwrite(STDERR, 'sqli: note: ' . $n . PHP_EOL);
+    }
     exit(1);
 }
 
@@ -142,6 +148,28 @@ $warn = $script ? STDERR : STDOUT;
 
 if ($chatter !== null) {
     fwrite($chatter, 'Starting sqli ' . SQLI_VERSION . ' …' . PHP_EOL);
+    // Which `.sqli/` folders (and -c files) this run reads (§2). Projects are
+    // listed in the home config, never found by walking, so this is the
+    // whole answer to "where did that setting come from?".
+    fwrite($chatter, $config->sourcesLine() . PHP_EOL);
+    foreach ($config->notices() as $n) {
+        fwrite($chatter, 'sqli: note: ' . $n . PHP_EOL);
+    }
+}
+
+// The home `.sqli/` holds the credentials and the only init-command and
+// project list sqli trusts, so another account able to change it is worth a
+// line every time. Reported with the fix; nothing is changed.
+foreach ($config->homePermissionProblems() as $problem) {
+    fwrite($warn, 'sqli: warning: ' . $problem . PHP_EOL);
+}
+
+// An init-command from outside the home `.sqli/` is not run unasked (§2). The
+// TUI offers it once connected; a script has nobody to ask, so it says so.
+$offeredInit = $config->offeredInitCommand();
+if ($script && $offeredInit !== null) {
+    fwrite(STDERR, 'sqli: note: init-command from ' . $offeredInit['source'] . ' not run — only the home '
+        . '.sqli/ or --init-command runs one: ' . $offeredInit['sql'] . PHP_EOL);
 }
 
 // An env nobody typed gets one line on the plain terminal. A default `env` in a
@@ -261,18 +289,24 @@ if ($askForPassword) {
 
 // The password is readonly on Database, so a retry builds a fresh one rather
 // than mutating a connection object that has already failed.
-$makeDatabase = static fn (string $pw): Database => new Database(
-    host: $config->getString('host', 'localhost'),
-    user: $config->getString('user'),
-    password: $pw,
-    database: $config->getString('database'),
-    port: $config->getInt('port', 3306),
-    socket: $config->getString('socket'),
-    debug: $config->isFlag('debug'),
-    tls: $tls,
-    options: $connection,
-    label: $config->getString('host_label'),
-);
+$makeDatabase = static function (string $pw) use ($config, $tls, $connection): Database {
+    $db = new Database(
+        host: $config->getString('host', 'localhost'),
+        user: $config->getString('user'),
+        password: $pw,
+        database: $config->getString('database'),
+        port: $config->getInt('port', 3306),
+        socket: $config->getString('socket'),
+        debug: $config->isFlag('debug'),
+        tls: $tls,
+        options: $connection,
+        label: $config->getString('host_label'),
+    );
+    // read-only is enforced by sqli first; the server is asked to refuse
+    // writes as well, on every connect and reconnect (§2).
+    $db->setSessionReadOnly($config->isFlag('read-only'));
+    return $db;
+};
 
 /**
  * Connect here, on the plain terminal, before the TUI exists.
@@ -322,6 +356,10 @@ for ($attempt = 1; ; $attempt++) {
         );
         $database = $makeDatabase($password);
     }
+}
+
+foreach ($database->sessionProblems() as $problem) {
+    fwrite($warn, 'sqli: warning: ' . $problem . PHP_EOL);
 }
 
 $app = new App($database, $config, $settings, SQLI_VERSION);

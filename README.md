@@ -370,10 +370,11 @@ not be able to hide them. `--lint` refuses two environments using the same label
 including one a macro expanded into. It is what makes a production connection safe to browse. Without it, broad
 statements still confirm first; see [Running queries](#running-queries).
 
-**The write log.** Every data-modifying statement that ran — typed, a cell edit, a grid delete, a macro, or `-e` — is
-appended to `sqli_db_writes.log`: date and time, your OS login, the database user, server, database, table and the statement, tab-separated, one line
-each. It goes in `~/.sqli/` when that directory exists, otherwise in a `.sqli/` under the directory you started sqli
-from. Passwords in a statement (`IDENTIFIED BY '…'`) are written as `'***'`. It is on by default; turn it off with
+**The write log.** Every data-modifying statement sent to the server — typed, a cell edit, a grid delete, a macro, or `-e` — is
+appended to `sqli_db_writes.log`: date and time, `ok` or `FAILED`, your OS login, the database user, server, database, table,
+the statement and, for a failed one, the server's error — tab-separated, one line each. It always goes in `~/.sqli/`
+(created if missing); only when there is no home directory does it go in a `.sqli/` under the directory you started sqli
+from. Passwords in a statement (`IDENTIFIED BY '…'`) or its error are written as `'***'`. It is on by default; turn it off with
 `"log-writes": false` in a config or environment, or `--no-log-writes` on the command line. It is a record for you, not
 an audit trail — anyone who can run sqli can switch it off.
 
@@ -446,47 +447,60 @@ cp .sqli/sqli_macros.example.ini     .sqli/sqli_macros.ini
 php sqli.php --lint          # check what sqli will read, and from where
 ```
 
-### Cascade
+### Where sqli looks
 
-sqli walks from the current directory up to the filesystem root, and **every
-`.sqli/` it finds is a layer**. Settings merge per key, with the layer closest to your cwd winning — so a repo can carry
-shared defaults while a subdirectory overrides one of them. Your home directory's `.sqli/` is always the global base
-layer, never a project.
+Two places, and only two:
 
-To use a project's `.sqli/` from somewhere else, name it: `sqli --project ~/work/app -E prod`. The walk then starts at
-that directory (or its `.sqli` folder) instead of your cwd. A directory that doesn't exist is an error.
+1. **Your home `.sqli/`** — `~/.sqli/`, or `$SQLI_HOME/.sqli/` when `$SQLI_HOME` is set (it replaces your home directory;
+   useful if you want Windows and WSL to share one configuration).
+2. **One project's `.sqli/`** — a project you have listed in your home config:
 
-**This is an ancestor walk, not a search.** sqli only ever looks at the directories between you and the root — your
-current directory, its parent, and so on — never *into* anything. It's a handful of `is_dir()` checks, done once at
-startup, and it does not care how large the tree below you is.
+```json
+{
+    "projects": ["D:/dev/app", "~/work/billing"],
+    "defaults": { }
+}
+```
 
-It's done by looking rather than by remembering because a project's `.sqli/` is meant to be **committed with the repo**.
-Clone a project onto a new machine,
-`cd` in, and its environments have to work the very first time sqli sees that directory — which rules out relying on a
-list of places sqli has been before. (One is kept anyway, at `~/.sqli/sqli_registry.json`, purely as a cache of known
-projects for tooling to read. It's machine-owned and safe to delete.)
+When you start sqli inside a listed directory (or anywhere below it), that project's `.sqli/` is read on top of your home
+one. If listed projects are nested, the deepest one wins, and only that one is read. A `.sqli/` folder you have *not*
+listed is never read — sqli says so once and tells you where to add it. Nothing walks up or down the tree looking for
+config, so a folder someone else put above your checkout can't change anything.
 
-Lowest to highest: **built-in defaults → global → project layers (farthest to closest) → `--config` → `--user-config` →
-credentials → command-line flags.**
+The first line sqli prints says exactly what it read:
 
-### "Can a project config override my global one?"
+```
+Config from: home C:\Users\me\.sqli · project D:\dev\app\.sqli
+```
 
-Yes. That is what "closest wins" means, and it is deliberate. sqli is a convenience for picking a server, not an access
-control system. A project's `.sqli/` can set `read-only: false` over a global `true`, or name a different host, and it
-wins, the same way a command-line flag wins over both.
+Ways to add a project: put it in `projects` yourself, or use **System menu → Create Local sqli Config**, which creates
+the folder and adds it to the list (or adds an unlisted `.sqli/` that is already there). `projects` is read from your
+home config only — the same key in a project config is ignored. A `D:/…` entry works from WSL too (as `/mnt/d/…`).
 
-That isn't a hole, for two reasons. First, anyone who can edit a `.sqli/` folder can also edit your global config, or
+To use a project from somewhere else, name it: `sqli --project ~/work/app -E prod`. `--project` works whether or not
+the directory is listed — you typed it. A directory that doesn't exist is an error.
+
+Lowest to highest: **built-in defaults → home → project → `--config` → `--user-config` → credentials → command-line
+flags.**
+
+Keep your home `.sqli/` private: it holds your passwords and decides which other folders count. sqli warns at startup
+(and in `--lint`) when other accounts can get at it, and prints the `chmod` or `icacls` command that fixes it.
+
+### "Can a project config override my home one?"
+
+Yes, and it is deliberate. sqli is a convenience for picking a server, not an access control system. A project's
+`.sqli/` can set `read-only: false` over a home `true`, or name a different host, and it wins, the same way a
+command-line flag wins over both. The one exception is `init-command` (see Connection options).
+
+That isn't a hole, for two reasons. First, anyone who can edit a `.sqli/` folder can also edit your home config, or
 just type `--read-only=false`. The database account's grants are what actually limit a session, so use a read-only login
-for anything that must stay read-only. Second, your global config lives in your home directory, so it never travels with
-a repo. Clone a project on another machine and there is no global layer there to override.
+for anything that must stay read-only. Second, your home config lives in your home directory, so it never travels with
+a repo. Clone a project on another machine and there is no home layer there to override.
 
 What sqli does do is make sure it is never a surprise. Config files can disagree about **which server** an environment
-means: a project's `prod` might set a different `host`, `port`, `socket`, `user` or `database` than the global `prod`.
+means: a project's `prod` might set a different `host`, `port`, `socket`, `user` or `database` than the home `prod`.
 When that happens, sqli prints a warning at startup naming both values and both files, and repeats it on the status line.
-`--lint` lists every environment where this happens. The closest file still wins.
-
-Set `$SQLI_HOME` to put the global layer somewhere other than your home directory — useful if you want Windows and WSL
-to share one configuration.
+`--lint` lists every environment where this happens. The project file still wins.
 
 ### Environments
 
@@ -547,9 +561,9 @@ php sqli.php -E prod      # an explicit -E always wins
 php sqli.php --no-env     # no environment at all, for once
 ```
 
-`env` is an ordinary cascaded key, so the `.sqli/` closest to your working directory decides: a global default of `prod`
-is overridden by a project whose `defaults{}` says `"env": "dev"`, and a project that says `"env": ""` has no default at
-all rather than inheriting the global one. Order of selection is `-E` → `$SQLI_ENV` → the config, and `--no-env` refuses
+`env` is an ordinary layered key, so the project beats your home config: a home default of `prod` is overridden by a
+project whose `defaults{}` says `"env": "dev"`, and a project that says `"env": ""` has no default at all rather than
+inheriting the home one. Order of selection is `-E` → `$SQLI_ENV` → the config, and `--no-env` refuses
 the last two — the two nobody typed on the command line.
 
 An env chosen this way is never silent. The header names it before `[RO]` — `env local (default)` — and a read-only
@@ -750,7 +764,7 @@ environment:
 |--------------------|---------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `connect-timeout`  | `10`    | Seconds to establish the connection. `0` leaves it to the OS.                                                                                                                                                                                                                                                      |
 | `read-timeout`     | `1800`  | Seconds of server **silence** before the client gives up. `0` keeps PHP's own setting.                                                                                                                                                                                                                             |
-| `init-command`     | —       | A single `SET`, run on every connect.                                                                                                                                                                                                                                                                              |
+| `init-command`     | —       | A SQL statement the server runs at the start of every session and every automatic reconnect. One `SET` only, which may set several variables (`SET a = 1, b = 2`). Example and placement below.                                                                                                                  |
 | `compress`         | `false` | Compress the protocol — worth it for large result sets over a WAN.                                                                                                                                                                                                                                                 |
 | `found-rows`       | `false` | An UPDATE reports rows *matched* instead of rows *changed*.                                                                                                                                                                                                                                                        |
 | `multi-statements` | `false` | Whether the server accepts several statements in one packet.                                                                                                                                                                                                                                                       |
@@ -773,8 +787,45 @@ For a limit that applies without anyone watching, ask the server to enforce one:
 ```
 
 Thirty seconds, enforced server-side, on read-only statements. `init-command`
-accepts a single `SET` and nothing else — it runs on every connect *and* every automatic reconnect, and a config file in
-a parent directory can supply one.
+accepts a single `SET` and nothing else, and it runs on every connect *and* every automatic reconnect.
+
+### Where `init-command` goes
+
+Put it in your **home** `sqli_config.json` (`~/.sqli/`), in one of three places:
+
+```json
+{
+    "defaults": {
+        "init-command": "SET SESSION max_execution_time = 30000"
+    },
+    "envs": {
+        "prod": {
+            "host": "db1.example.com",
+            "init-command": "SET SESSION max_execution_time = 10000"
+        }
+    }
+}
+```
+
+- **In `defaults{}`** (or at the file's top level, next to `projects`): every connection gets it.
+- **Inside one environment** in `envs{}`: only that server gets it, and it replaces the one from `defaults{}`. An
+  environment that `extends` another inherits its `init-command`.
+- **On the command line:** `--init-command "SET …"` for one run. It beats both.
+
+Only one `init-command` is used per connection, never a combination. To set several variables, put them in one `SET`.
+
+It works the same way in a project's `sqli_config.json`, except that sqli asks before running it (below).
+
+A `SET` can still do more than set a preference — `SET GLOBAL`, `SET PASSWORD`, a function call, or `SET autocommit = 0`
+(which makes cell edits look saved and then rolls them back). sqli warns about each of these at startup and in `--lint`
+but still runs it if you asked for it.
+
+**Only your home `.sqli/` (or `--init-command`) runs one without asking.** One in a project config is shown when sqli
+connects — the statement, the file, and any warnings — and you press `Y` to run it for this session or `N` to skip it.
+With `-e` it is not run, and a note says so.
+
+**`read-only` is enforced by the server too.** With `read-only` on, sqli also sends `SET SESSION TRANSACTION READ ONLY`
+on every connect, so even a stored function that writes is refused.
 
 **Everything here is fixed when the connection opens**, so there is no in-app screen for any of it — the driver has no
 way to change these on a live connection, and a menu that quietly reconnected to look responsive would throw away your

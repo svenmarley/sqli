@@ -265,7 +265,17 @@ final class Renderer
                 static fn (array $o): string => '[' . $o[0] . '] ' . $o[1],
                 $state->confirmOptions,
             ));
-            $state->modalRect = $this->drawDialog($screen, $w, $h, [$state->confirmMessage, $opts]);
+            // A message may carry several lines (the init-command offer, §2);
+            // each is wrapped to the screen so nothing is cut off.
+            $lines = [];
+            $wrapAt = max(20, $w - 8);
+            foreach (explode("\n", $state->confirmMessage) as $line) {
+                foreach (explode("\n", wordwrap($line, $wrapAt, "\n", true)) as $piece) {
+                    $lines[] = $piece;
+                }
+            }
+            $lines[] = $opts;
+            $state->modalRect = $this->drawDialog($screen, $w, $h, $lines);
         }
 
         // A "please wait" popup, topmost of all, while a slow op blocks the loop.
@@ -2950,7 +2960,7 @@ final class Renderer
             $footer = '↑↓←→ move · Enter/Esc/m done';
         } else {
             $title = $col . '  ·  row ' . ($rowPos + 1);
-            $footer = 'e edit · m move (or drag title) · wheel scroll · v close';
+            $footer = ($state->readOnly ? 'e select/copy' : 'e edit') . ' · m move (or drag title) · wheel scroll · v close';
         }
         $innerW = max(mb_strlen($title), mb_strlen($footer));
         foreach ($lines as $l) {
@@ -2983,7 +2993,7 @@ final class Renderer
         if ($editor === null) {
             return;
         }
-        $title = $state->cellViewCol . '  ·  editing';
+        $title = $state->cellViewCol . ($state->cellEditViewOnly ? '  ·  [RO] select & copy' : '  ·  editing');
         [$bx, $by, $bw, $bh] = $this->drawEditorFrame(
             $screen, $state, $w, $h, $title, $editor, $state->cellPopupX, $state->cellPopupY,
         );
@@ -3028,7 +3038,9 @@ final class Renderer
         $lines = $editor->lines();
         [$curRow, $curCol] = $editor->cursorRowCol();
 
-        $footer = '↵ new line · Ctrl+S save · Esc cancel';
+        $footer = ($state->cellEditViewOnly && $editor === $state->cellEditor)
+            ? 'arrows/Shift select · Ctrl+A all · Ctrl+C copy · Esc close'
+            : '↵ new line · Ctrl+S save · Esc cancel';
         $longest = 0;
         foreach ($lines as $l) {
             $longest = max($longest, mb_strlen($l));
