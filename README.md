@@ -321,7 +321,8 @@ unapplied, one edit is in flight at a time, and nothing is written behind your b
 JSON columns open in a **tree view** (`j`) you can read and edit as a document instead of as one long line; pressing `j`
 again opens a blob nested inside it. `Enter` on a value edits it as plain text — no quotes, no escaping — with its type
 (`string`, `number`, `bool`, `null`) shown underneath; `Tab` changes the type, so `"hello"` can become `true`. Text that
-does not fit the chosen type is refused with the reason.
+does not fit the chosen type is refused with the reason. `Ctrl+Up`/`Ctrl+Down` (and `Ctrl+PgUp`/`PgDn`/`Home`/`End`)
+show the same column in other rows without leaving the viewer.
 
 **`Ctrl+N` sets a cell to a real SQL `NULL`** — the same one-cell `UPDATE` on the CLI as a typed edit.
 

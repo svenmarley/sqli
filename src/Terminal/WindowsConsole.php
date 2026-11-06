@@ -82,6 +82,7 @@ final class WindowsConsole
             int GetNumberOfConsoleInputEvents(HANDLE hConsoleInput, unsigned long* lpNumberOfEvents);
             int PeekConsoleInputW(HANDLE hConsoleInput, INPUT_RECORD* lpBuffer, unsigned long nLength, unsigned long* lpNumberOfEventsRead);
             int ReadConsoleInputW(HANDLE hConsoleInput, INPUT_RECORD* lpBuffer, unsigned long nLength, unsigned long* lpNumberOfEventsRead);
+            unsigned long WaitForSingleObject(HANDLE hHandle, unsigned long dwMilliseconds);
         CDEF, 'kernel32.dll');
 
         $this->hIn = $this->ffi->GetStdHandle(self::STD_INPUT_HANDLE);
@@ -220,6 +221,24 @@ final class WindowsConsole
             }
         }
         return false;
+    }
+
+    /**
+     * Sleep until the console has an input record or $ms passes. The input
+     * handle is signalled while any record is queued — key, mouse, resize, focus
+     * — so a keypress ends the wait at once instead of after a fixed sleep.
+     *
+     * @return bool|null true = woken by input, false = timed out, null = the
+     *                   wait failed (the caller sleeps the old way).
+     */
+    public function waitForInput(int $ms): ?bool
+    {
+        $r = (int) $this->ffi->WaitForSingleObject($this->hIn, max(0, $ms));
+        return match ($r) {
+            0 => true,         // WAIT_OBJECT_0
+            0x102 => false,    // WAIT_TIMEOUT
+            default => null,   // WAIT_FAILED / WAIT_ABANDONED
+        };
     }
 
     /** Returns and clears the "a resize record arrived" flag (event-driven repaint). */

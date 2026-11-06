@@ -91,6 +91,16 @@ final class InputReader
     }
 
     /**
+     * True while bytes are buffered but not yet decoded — a lone ESC waiting to
+     * be confirmed as Escape, or half an escape sequence. The loop must poll
+     * again soon rather than sleep, or Esc would be answered late.
+     */
+    public function hasPending(): bool
+    {
+        return $this->buf !== '';
+    }
+
+    /**
      * Consume the most recent DSR cursor-position report, if any. Returned as
      * [width, height]; used by the terminal sizer (a report taken right after
      * moving the cursor to the bottom-right extreme measures the viewport).

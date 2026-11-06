@@ -2049,8 +2049,9 @@ final class Renderer
                 $screen,
                 $w,
                 $h,
-                'Not JSON — ' . $state->jsonColumn,
-                $state->jsonInvalidMessage . "\n\n" . $state->jsonRaw . "\n\n(any key to close)",
+                'Not JSON — ' . $state->jsonColumn . $this->jsonRowLabel($state),
+                $state->jsonInvalidMessage . "\n\n" . $state->jsonRaw
+                    . "\n\n(Ctrl+↑↓ other rows · any other key to close)",
             );
             return;
         }
@@ -2162,7 +2163,7 @@ final class Renderer
         if ($state->jsonNotice !== '') {
             $screen->put($x + 1, $hy, $this->pad(' ' . $state->jsonNotice, $boxW - 2), $this->theme->style('json_notice'));
         } else {
-            $hint = ' ↑↓ move · Enter edit/fold · j nested · a add-in · A add-after · d delete · Esc '
+            $hint = ' ↑↓ move · Ctrl+↑↓ row · Enter edit/fold · j nested · a/A add · d delete · Esc '
                 . ($state->jsonPath === [] ? 'close' : 'back');
             $screen->put($x + 1, $hy, $this->pad($hint, $boxW - 2), $bg);
         }
@@ -2393,13 +2394,24 @@ final class Renderer
      * When it will not fit, the **tail** is kept — the level on screen is what
      * the title is for, and the path to it is the part the user already walked.
      */
+    /** ` · row N/M` for the JSON viewer's title — Ctrl+arrows walk the rows (§10). */
+    private function jsonRowLabel(State $state): string
+    {
+        $total = count($state->displayOrder());
+        if ($total === 0 || $state->jsonRow < 0) {
+            return '';
+        }
+        return ' · row ' . (max(0, $state->selectedRow) + 1) . '/' . $total;
+    }
+
     private function jsonTitle(State $state, int $width): string
     {
         $title = ' JSON — ' . $state->jsonColumn;
         foreach ($state->jsonPath as $crumb) {
             $title .= ' › ' . $crumb;
         }
-        $title .= ' ';
+        // Last, so a trimmed title (it keeps its tail) still shows the row.
+        $title .= $this->jsonRowLabel($state) . ' ';
         if ($width > 3 && mb_strlen($title) > $width) {
             return ' …' . mb_substr($title, mb_strlen($title) - ($width - 2));
         }
@@ -2778,6 +2790,7 @@ final class Renderer
                 'i           Detail view for the selected row',
                 'v           Expand the cell in a movable inspector',
                 'j / J       JSON viewer for the cell (j again = nested blob)',
+                '  in it     Ctrl+arrows/PgUp/PgDn/Home/End = other rows',
                 't           Cell as a table, split by the column\'s separators',
                 'Shift+move  Highlight a range of cells (back = shrink)',
                 '  then      Home/End/PgUp/PgDn, Ctrl+Home/End/arrows stretch it',

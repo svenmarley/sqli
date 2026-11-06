@@ -58,6 +58,12 @@ final class Terminal
     private int $platformMisses = 0;
     /** Writes that gave up with bytes unsent. Never silently zero — see write(). */
     private int $writeDrops = 0;
+    /**
+     * Input arrives as console records (the full console API works), so the
+     * loop can sleep on the input handle. False under Git Bash/MSYS, where
+     * stdin is a pipe and the console queue stays empty.
+     */
+    private bool $consoleWait = false;
 
     public function __construct()
     {
@@ -98,6 +104,7 @@ final class Terminal
         // the loop and drive resize on their own.
         $win = $this->win;
         if ($win !== null && $win->size() !== null) {
+            $this->consoleWait = true;
             // Drains non-character records (resize/focus/key-up) and reports
             // whether real key/mouse bytes are waiting, so the read never wedges.
             $this->input->setReadableProbe(static fn (): ?bool => $win->readableForBytes());
@@ -125,6 +132,38 @@ final class Terminal
     public function input(): InputReader
     {
         return $this->input;
+    }
+
+    /**
+     * Sleep until input arrives or $seconds pass, so an idle loop costs nothing
+     * and a keypress is still answered at once.
+     *
+     * Windows console: WaitForSingleObject on the input handle. POSIX tty:
+     * stream_select() on stdin; a SIGWINCH interrupts it, so a resize wakes it
+     * too. Anything else (a pipe under Git Bash/MSYS, where the DSR replies drive
+     * the loop) cannot wait this way.
+     *
+     * @return bool|null true = woken by input, false = timed out, null = this
+     *                   terminal cannot wait on input — the caller sleeps instead.
+     */
+    public function waitForInput(float $seconds): ?bool
+    {
+        $seconds = max(0.0, $seconds);
+        if ($this->consoleWait && $this->win !== null) {
+            return $this->win->waitForInput((int) round($seconds * 1000));
+        }
+        if (PHP_OS_FAMILY !== 'Windows' && $this->stdinNonBlocking) {
+            $read = [$this->stdin];
+            $write = null;
+            $except = null;
+            $sec = (int) $seconds;
+            $usec = (int) round(($seconds - $sec) * 1_000_000);
+            $ready = @stream_select($read, $write, $except, $sec, $usec);
+            // false = interrupted (SIGWINCH) or failed: report "woken", so the
+            // loop takes a look rather than going back to sleep blind.
+            return $ready === false ? true : $ready > 0;
+        }
+        return null;
     }
 
     /**

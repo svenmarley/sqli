@@ -87,7 +87,16 @@ final class App
     // size, so a single repaint can leave the freshly-grown rows blank.
     private const RESIZE_SETTLE = 0.4;      // seconds to keep repainting after a resize
     private const FLASH_SECONDS = 3.0;      // how long a top-line notice (e.g. copy) stays up
-    private const FRAME_SLEEP_US = 8000;    // ~8ms idle pause; only diffs are flushed
+    private const FRAME_SLEEP_US = 8000;    // ~8ms pause while something is moving (query, resize, resend)
+    /**
+     * Longest the loop sleeps on input when nothing is moving. Input ends the
+     * wait at once, so this bounds only the size poll and the DD lock check.
+     */
+    private const IDLE_WAIT = 0.1;
+    /** Redraw at least this often even when nothing seems to have changed. */
+    private const SAFETY_REDRAW = 1.0;
+    /** While a query runs, the spinner and clock redraw at most this often. */
+    private const QUERY_REDRAW = 0.05;
     private const DD_LOCK_POLL = 2.0;       // seconds between DD file-lock checks while the viewer is open
     private const AUTO_LIMIT = 1000;        // rows a SELECT/WITH is auto-capped at when it has no LIMIT (§5)
     /** MySQL's code for a statement stopped by KILL QUERY — i.e. a successful cancel (§21). */
@@ -156,6 +165,16 @@ final class App
      */
     private array $phaseMax = ['input' => 0.0, 'query' => 0.0, 'resize' => 0.0, 'draw' => 0.0];
     private float $resizeRedrawUntil = 0.0;
+    /** When the loop last drew a frame — the base for the deadline checks. */
+    private float $lastDrawAt = 0.0;
+    /** The last idle wait ended on input; see idleWait(). */
+    private bool $wokeByInput = false;
+    /**
+     * A wake on input found nothing to read (a console record no one reads), so
+     * the next pass sleeps the fixed way instead — a record the probe cannot
+     * drain must not turn the wait into a spin.
+     */
+    private bool $quietWake = false;
     /** Next time (microtime) to re-probe whether the DD file is locked elsewhere. */
     private float $ddLockNextCheck = 0.0;
     /** DSR-size-report cycle state (non-FFI/pipe path): keep exactly one in flight. */
@@ -639,9 +658,11 @@ final class App
     private function loop(): void
     {
         $this->draw();
+        $this->lastDrawAt = microtime(true);
         while ($this->state->running) {
             $phase = microtime(true);
             $events = $this->terminal->input()->poll();
+            $this->quietWake = $this->wokeByInput && $events === [];
             foreach ($events as $event) {
                 if ($event instanceof KeyEvent) {
                     $this->handleKey($event);
@@ -655,6 +676,11 @@ final class App
                 }
             }
             $this->mark('input', $phase);
+
+            // What the work below can change without a key being pressed, so
+            // the redraw test at the bottom can tell whether it did.
+            $before = $this->frameFingerprint();
+            $wasRunning = $this->state->queryRunning;
 
             // Collect a finished query before anything else looks at the frame:
             // the result reshapes the grid, and drawing it in the same pass it
@@ -694,7 +720,8 @@ final class App
             // poll() drains console resize records; if one arrived, repaint right
             // away (force past the size-poll throttle) so resize feels instant.
             $phase = microtime(true);
-            $this->maybeResize($this->terminal->takeResizeSignal());
+            $resized = $this->terminal->takeResizeSignal();
+            $this->maybeResize($resized);
             $this->mark('resize', $phase);
             // While the DD viewer is open, watch (throttled) for the file being
             // locked/freed by another program so the banner + edit gate stay live.
@@ -704,7 +731,8 @@ final class App
             // Within the post-resize settle window, keep repainting the whole
             // screen each frame so the bottom rows reappear once the terminal has
             // finished growing its viewport (see RESIZE_SETTLE).
-            if ($this->resizeRedrawUntil > 0.0) {
+            $settling = $this->resizeRedrawUntil > 0.0;
+            if ($settling) {
                 if (microtime(true) < $this->resizeRedrawUntil) {
                     $this->screen->invalidate();
                 } else {
@@ -722,12 +750,84 @@ final class App
                 $this->state->statusLine = $writeError;
                 $this->state->statusIsError = true;
             }
-            $phase = microtime(true);
-            $this->draw();
-            $this->mark('draw', $phase);
+            // Draw only when the frame can differ from the last one. An idle
+            // frame used to be rebuilt in full ~100 times a second just to find
+            // nothing to send; that was the whole idle CPU cost.
+            $now = microtime(true);
+            $dirty = $events !== []
+                || $resized
+                || $settling
+                || ($wasRunning && !$this->state->queryRunning)
+                || ($this->state->queryRunning && $now - $this->lastDrawAt >= self::QUERY_REDRAW)
+                || $before !== $this->frameFingerprint()
+                || $this->deadlinePassed($this->state->flashUntil, $now)
+                || $this->deadlinePassed($this->state->linkLingerUntil, $now)
+                || $now - $this->lastDrawAt >= self::SAFETY_REDRAW;
+            if ($dirty) {
+                $phase = microtime(true);
+                $this->draw();
+                $this->lastDrawAt = microtime(true);
+                $this->mark('draw', $phase);
+            }
             $this->heartbeat();
-            usleep(self::FRAME_SLEEP_US);
+            $this->idleWait();
         }
+    }
+
+    /**
+     * The state that loop work other than input can change — a finished
+     * query's status, the link, a size report, the DD lock, a settings write
+     * error. Compared before and after that work to decide on a redraw.
+     *
+     * @return list<mixed>
+     */
+    private function frameFingerprint(): array
+    {
+        $s = $this->state;
+        return [
+            $s->statusLine, $s->statusIsError, $s->linkState, $s->secure, $s->ddLocked,
+            $s->chooser !== null, $s->queryRunning, $s->queryCancelling,
+            $this->pendingResend !== null,
+            $this->screen->width(), $this->screen->height(),
+        ];
+    }
+
+    /** True when a display deadline (a flash, the `!db` linger) fell since the last draw. */
+    private function deadlinePassed(float $deadline, float $now): bool
+    {
+        return $deadline > $this->lastDrawAt && $deadline <= $now;
+    }
+
+    /**
+     * Sleep until the next pass. While something is moving — a query, a resend,
+     * a resize settling, half an escape sequence — the loop keeps its fixed short
+     * pause. Otherwise it sleeps on input for up to IDLE_WAIT (or until the next
+     * display deadline), so a keypress is answered at once and an idle sqli costs
+     * next to nothing. A terminal that cannot wait on input sleeps the old way.
+     */
+    private function idleWait(): void
+    {
+        $this->wokeByInput = false;
+        $moving = $this->state->queryRunning
+            || $this->pendingResend !== null
+            || $this->resizeRedrawUntil > 0.0
+            || $this->terminal->input()->hasPending()
+            || $this->quietWake;
+        if (!$moving) {
+            $now = microtime(true);
+            $timeout = self::IDLE_WAIT;
+            foreach ([$this->state->flashUntil, $this->state->linkLingerUntil] as $deadline) {
+                if ($deadline > $now) {
+                    $timeout = min($timeout, $deadline - $now + 0.005);
+                }
+            }
+            $woke = $this->terminal->waitForInput($timeout);
+            if ($woke !== null) {
+                $this->wokeByInput = $woke;
+                return;
+            }
+        }
+        usleep(self::FRAME_SLEEP_US);
     }
 
     private function draw(): void
@@ -7862,6 +7962,77 @@ final class App
         $this->state->jsonNotice = '';
     }
 
+    /**
+     * Ctrl+Up/Down/PgUp/PgDn/Home/End in the JSON viewer: show the same column
+     * of another row (§10). The grid cursor moves with it, so closing the viewer
+     * lands on the row last shown. The tree selection is kept by position, which
+     * suits the common case of rows sharing one shape.
+     *
+     * A changed document blocks the move: one edit is in flight at a time (§9),
+     * and Esc is the key that stages it.
+     */
+    private function jsonMoveRow(Key $key): void
+    {
+        $this->state->jsonNotice = '';
+        $order = $this->state->displayOrder();
+        if ($order === [] || $this->state->jsonRow < 0) {
+            return;
+        }
+        $last = count($order) - 1;
+        $cur = max(0, min($last, $this->state->selectedRow));
+        $target = match ($key) {
+            Key::Up => $cur - 1,
+            Key::Down => $cur + 1,
+            Key::PageUp => $cur - $this->gridPageStep(),
+            Key::PageDown => $cur + $this->gridPageStep(),
+            Key::Home => 0,
+            Key::End => $last,
+            default => $cur,
+        };
+        $target = max(0, min($last, $target));
+        if ($target === $cur) {
+            $this->state->jsonNotice = $cur === 0 ? 'Already on the first row.' : 'Already on the last row.';
+            return;
+        }
+        if ($this->jsonChanged()) {
+            $this->state->jsonNotice = 'This document has changes — Esc to stage the UPDATE before changing rows.';
+            return;
+        }
+        $col = $this->state->jsonColumn;
+        $sel = $this->state->jsonSel;
+        $this->state->selectedRow = $target;
+        $rawIdx = $order[$target];
+        $this->openJsonView($col, $rawIdx, $this->cellValueAt($rawIdx, $col));
+        if (!$this->state->jsonInvalid) {
+            $this->state->jsonSel = $this->clampIndex($sel, count($this->state->jsonNodes));
+        }
+    }
+
+    /**
+     * Whether the open document differs from the value it was opened on, at any
+     * nested level — without folding the levels, which would move the user.
+     */
+    private function jsonChanged(): bool
+    {
+        if ($this->state->jsonInvalid || $this->jsonTree === null || $this->state->jsonRow < 0) {
+            return false;
+        }
+        $norm = static fn (string $s): string => JsonTree::parse($s)?->encode() ?? $s;
+        // Level 0's tree is the bottom of the stack, or the open tree if no stack.
+        $trees = array_map(static fn (array $f) => $f['tree'], $this->jsonStack);
+        $trees[] = $this->jsonTree;
+        $opened = $this->cellValueAt($this->state->jsonRow, $this->state->jsonColumn);
+        if ($trees[0]->encode() !== $norm($opened)) {
+            return true;
+        }
+        foreach ($this->jsonStack as $i => $frame) {
+            if ($trees[$i + 1]->encode() !== $norm($frame['original'])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** One PageUp/PageDown step in the JSON tree (a full visible page, §10). */
     private function jsonPageStep(): int
     {
@@ -7876,7 +8047,14 @@ final class App
             $this->handleJsonEditKey($e);
             return;
         }
-        // Invalid-JSON mode is a quick look — any key dismisses it.
+        // Ctrl + a move key steps the grid row under the viewer, like the `v`
+        // inspector follows the grid (§10). Ahead of the invalid mode, so a row
+        // that is not JSON does not end the walk.
+        if ($e->ctrl && !$e->alt && in_array($e->key, [Key::Up, Key::Down, Key::PageUp, Key::PageDown, Key::Home, Key::End], true)) {
+            $this->jsonMoveRow($e->key);
+            return;
+        }
+        // Invalid-JSON mode is a quick look — any other key dismisses it.
         if ($this->state->jsonInvalid) {
             $this->closeJson();
             return;
