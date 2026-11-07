@@ -51,6 +51,8 @@ You already know SQL. These are the parts of `mysql>` you work around.
   ask the operating system for the window size directly, which makes resizing instant and keeps several sqli in several
   terminals from getting in each other's way. Without it sqli measures the window by asking the terminal instead:
   correct, but slower to settle.
+- **Xdebug off** for everyday use. With Xdebug active every redraw is many times slower, and sqli prints a one-line
+  warning at startup saying so. Set `xdebug.mode=off` in `php.ini`, and start a debug run with `XDEBUG_MODE=debug`.
 - A **modern terminal** with ANSI/alt-screen support — Windows Terminal, WSL, macOS Terminal/iTerm, or any Linux
   terminal. (Legacy `cmd.exe` works but is slower.)
 - **No third-party PHP packages.** sqli has zero external dependencies, no
@@ -115,9 +117,10 @@ Options can be passed as flags, or stored in a config file so you don't put cred
 
 Run `php sqli.php --help` for the full list.
 
-**`-d` answers "why won't it connect?"** It writes the DSN it built, the TLS and driver decisions it made, the
-connection options in force, every automatic reconnect and every query error code to `debug.log` beside `sqli.php`.
-Turn it on for a run, not in an environment: `debug.log` is never rotated or trimmed.
+**`-d` answers "why won't it connect?" — and "why is it slow to start?"** Without it, sqli writes no `debug.log`
+at all. With it, it writes the DSN it built, the TLS and driver decisions it made, the connection options in force,
+every automatic reconnect, every query error code, and a `startup` line timing each step to the first screen, to
+`debug.log` beside `sqli.php`. Turn it on for a run, not in an environment: `debug.log` is never rotated or trimmed.
 
 ## Getting around
 

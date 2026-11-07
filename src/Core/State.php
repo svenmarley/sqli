@@ -285,8 +285,8 @@ final class State
     // open flag and the highlighted row.
     public bool $systemMenu = false;
     public int $systemMenuItem = 0;
-    /** File-based debug logging on/off (mirrors includes\my::$enabled). */
-    public bool $debugLogging = true;
+    /** File-based debug logging on/off (mirrors includes\my::$enabled; off unless -d). */
+    public bool $debugLogging = false;
     /**
      * Menu model published by App for the renderer while the menu is open.
      * @var list<array{label:string,action:string,enabled:bool}>

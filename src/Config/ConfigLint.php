@@ -90,6 +90,10 @@ final class ConfigLint
         foreach (RuntimeCheck::missing($config->getString('driver', ConnectionOptions::DRIVER_AUTO)) as $missing) {
             $lint->notes[] = 'php: ' . $missing;
         }
+        $xdebug = RuntimeCheck::xdebugWarning();
+        if ($xdebug !== null) {
+            $lint->notes[] = 'php: ' . $xdebug;
+        }
         return $lint;
     }
 

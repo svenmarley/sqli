@@ -47,7 +47,7 @@ use Sqli\Terminal\PasswordPrompt;
 
 // Version scheme: major.<ISO week number>.<counter>. The middle digit tracks the
 // week we're working in; the trailing counter just keeps climbing per change.
-const SQLI_VERSION = '2.45.1';
+const SQLI_VERSION = '2.45.4';
 
 // Route my::lineout('FILE:FILE', …) to a log file that actually exists. The
 // library default (/data/tmp/error_logs/debug.log) is never created in FILE
@@ -55,6 +55,11 @@ const SQLI_VERSION = '2.45.1';
 my::$debugLogPath = __DIR__ . '/debug.log';
 
 $config = new Config($argv);
+
+// debug.log is written only under -d / --debug (or `debug` in a config file).
+// Off by default: every line is a file append, and on a slow disk (WSL's
+// /mnt/d) that adds up. System Menu → Debug Logging still flips it mid-run.
+my::$enabled = $config->isFlag('debug');
 
 if ($config->isFlag('help')) {
     echo $config->helpText();
@@ -99,6 +104,11 @@ if ($configErrors !== []) {
 }
 
 my::lineout('FILE:FILE', 'sqli start', SQLI_VERSION);
+
+// Startup timing (§1): when each step began, logged once after the first frame.
+// REQUEST_TIME_FLOAT is when PHP handed over to this script — the time spent
+// loading PHP's own extensions before that is not visible from here.
+$startMarks = ['php' => (float) ($_SERVER['REQUEST_TIME_FLOAT'] ?? microtime(true)), 'script' => microtime(true)];
 
 // Scripting mode (backlog #6): `-e SQL`, or SQL piped on stdin. No TUI, the
 // result goes out as CSV, and the exit code says how it went.
@@ -194,6 +204,12 @@ foreach ($config->envConflicts($config->envChain()) as $conflict) {
 if (!$script) {
     foreach (RuntimeCheck::missing($config->getString('driver', ConnectionOptions::DRIVER_AUTO)) as $missing) {
         echo 'sqli: note: ' . $missing . PHP_EOL;
+    }
+    // Xdebug makes every redraw far slower. Said, never blocked; the TUI
+    // repeats it on the status line, since the alternate screen covers this.
+    $xdebug = RuntimeCheck::xdebugWarning();
+    if ($xdebug !== null) {
+        echo 'sqli: warning: ' . $xdebug . PHP_EOL;
     }
 }
 
@@ -324,6 +340,7 @@ $makeDatabase = static function (string $pw) use ($config, $tls, $connection): D
  * meet — is not something retyping a password repairs, so it exits at once
  * rather than pretending otherwise.
  */
+$startMarks['connect'] = microtime(true);
 $maxAttempts = 3;
 $mayRetry = !$config->isFlag('no-password') && PasswordPrompt::isInteractive();
 $database = $makeDatabase($password);
@@ -362,7 +379,9 @@ foreach ($database->sessionProblems() as $problem) {
     fwrite($warn, 'sqli: warning: ' . $problem . PHP_EOL);
 }
 
+$startMarks['connected'] = microtime(true);
 $app = new App($database, $config, $settings, SQLI_VERSION);
+$app->setStartMarks($startMarks);
 
 if (!$script) {
     exit($app->run());

@@ -98,7 +98,7 @@ final class Config
         'user-config'        => [null, 'user-config', false, null, 'User JSON config overriding --config (or $SQLI_USER_CONFIG)'],
         'help'               => ['h', 'help', true, false, 'Print help and exit'],
         'version'            => ['V', 'version', true, false, 'Print version and exit'],
-        'debug'              => ['d', 'debug', true, false, 'Verbose debug logging'],
+        'debug'              => ['d', 'debug', true, false, 'Write debug.log (beside sqli.php) — off unless given'],
     ];
 
     /** Options that only make sense on the CLI/env, never inside a config file. */

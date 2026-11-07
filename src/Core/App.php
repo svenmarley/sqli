@@ -8,6 +8,7 @@ use includes\my;
 use Sqli\Config\Config;
 use Sqli\Config\Settings;
 use Sqli\Config\Macros;
+use Sqli\Config\RuntimeCheck;
 use Sqli\Db\ConnectionOptions;
 use Sqli\Db\Database;
 use Sqli\Db\DataDictionary;
@@ -167,6 +168,8 @@ final class App
     private float $resizeRedrawUntil = 0.0;
     /** When the loop last drew a frame — the base for the deadline checks. */
     private float $lastDrawAt = 0.0;
+    /** @var array<string,float> when each startup step began (sqli.php); logged after the first frame */
+    private array $startMarks = [];
     /** The last idle wait ended on input; see idleWait(). */
     private bool $wokeByInput = false;
     /**
@@ -564,6 +567,8 @@ final class App
     public function run(): int
     {
         $this->state->version = $this->version;
+        // sqli.php set the logger from -d; the menu item starts from that.
+        $this->state->debugLogging = my::$enabled;
         $this->state->readOnly = $this->config->isFlag('read-only');
         $this->state->envUntyped = $this->untypedEnv();
         // `--comment PROD`, or a `comment` key on the env in the config file, so
@@ -637,6 +642,16 @@ final class App
                 . (count($conflicts) > 1 ? sprintf(' (+%d more — see --lint)', count($conflicts) - 1) : '');
             $this->state->statusIsError = true;
         }
+        // Xdebug slows every redraw. A warning on the status line, nothing to
+        // click; the config messages above, when there are any, matter more.
+        $xdebug = RuntimeCheck::xdebugWarning();
+        if ($xdebug !== null) {
+            my::lineout('FILE:FILE', 'xdebug', $xdebug);
+            if ($this->state->statusLine === '') {
+                $this->state->statusLine = 'warning: ' . $xdebug;
+                $this->state->statusIsError = true;
+            }
+        }
 
         // A project's init-command is never run unasked (§2): offer it, once.
         $this->offerInitCommand();
@@ -655,10 +670,42 @@ final class App
         return 0;
     }
 
+    /** @param array<string,float> $marks from sqli.php: php, script, connect, connected */
+    public function setStartMarks(array $marks): void
+    {
+        $this->startMarks = $marks;
+    }
+
+    /**
+     * One debug.log line saying where the wait before the first screen went
+     * (§1). Each step is the time from its mark to the next one; `before connect`
+     * includes a password prompt when there is one.
+     */
+    private function logStartup(float $drawFrom, float $drawTo): void
+    {
+        $m = $this->startMarks;
+        if (!isset($m['php'], $m['script'], $m['connect'], $m['connected'])) {
+            return;
+        }
+        $ms = static fn (float $a, float $b): int => (int) round(($b - $a) * 1000);
+        // One value: lineout pairs its arguments as key=[value].
+        my::lineout('FILE:FILE', 'startup', sprintf(
+            'php %d ms · before connect %d ms · connect %d ms · setup %d ms · first draw %d ms · total %d ms',
+            $ms($m['php'], $m['script']),
+            $ms($m['script'], $m['connect']),
+            $ms($m['connect'], $m['connected']),
+            $ms($m['connected'], $drawFrom),
+            $ms($drawFrom, $drawTo),
+            $ms($m['php'], $drawTo),
+        ));
+    }
+
     private function loop(): void
     {
+        $drawFrom = microtime(true);
         $this->draw();
         $this->lastDrawAt = microtime(true);
+        $this->logStartup($drawFrom, $this->lastDrawAt);
         while ($this->state->running) {
             $phase = microtime(true);
             $events = $this->terminal->input()->poll();
