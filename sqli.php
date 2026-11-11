@@ -47,7 +47,7 @@ use Sqli\Terminal\PasswordPrompt;
 
 // Version scheme: major.<ISO week number>.<counter>. The middle digit tracks the
 // week we're working in; the trailing counter just keeps climbing per change.
-const SQLI_VERSION = '2.45.4';
+const SQLI_VERSION = '2.46.10';
 
 // Route my::lineout('FILE:FILE', …) to a log file that actually exists. The
 // library default (/data/tmp/error_logs/debug.log) is never created in FILE
@@ -83,10 +83,25 @@ if ($config->isFlag('lint')) {
     foreach ($lint->notes() as $n) {
         echo 'note   ' . $n . PHP_EOL;
     }
+    // --fix (#26): only the keys sqli already ignores are removed, so a fixed
+    // file loads exactly as it did — everything else stays report-only.
+    $fixable = count($lint->fixable());
+    if ($config->isFlag('fix') && $fixable > 0) {
+        $result = $lint->applyFixes();
+        foreach ($result['fixed'] as $f) {
+            echo 'FIXED  ' . $f . PHP_EOL;
+        }
+        foreach ($result['failed'] as $f) {
+            fwrite(STDERR, 'ERROR  --fix: ' . $f . PHP_EOL);
+        }
+    } elseif ($fixable > 0) {
+        echo 'note   ' . $fixable . ' warning(s) can be fixed with --lint --fix (originals kept as .bak)' . PHP_EOL;
+    }
     echo $lint->hasProblems()
-        ? sprintf('sqli --lint: %d error(s), %d warning(s)' . PHP_EOL, count($lint->errors()), count($lint->warnings()))
+        ? sprintf('sqli --lint: %d error(s), %d warning(s)%s' . PHP_EOL, count($lint->errors()), count($lint->warnings()),
+            isset($result) ? sprintf(', %d fixed', count(array_filter($result['fixed'], static fn (string $f): bool => str_contains($f, '): removed ')))) : '')
         : 'sqli --lint: all config files OK' . PHP_EOL;
-    exit($lint->errors() !== [] ? 1 : 0);
+    exit($lint->errors() !== [] || ($result['failed'] ?? []) !== [] ? 1 : 0);
 }
 
 // A bad --config/--user-config (missing file, invalid JSON) is fatal: fail loudly
@@ -196,6 +211,17 @@ if ($config->envSource() === 'config' && $chatter !== null) {
 // as always; this only makes sure it is not a surprise.
 foreach ($config->envConflicts($config->envChain()) as $conflict) {
     fwrite($warn, 'sqli: warning: ' . $conflict . PHP_EOL);
+}
+
+// Keys sqli ignores — a misspelled option, a CLI-only key in a file (#26).
+// Listed every run, with file:line, until `--lint --fix` removes them.
+$ignoredKeys = ConfigLint::ignoredKeys($config);
+foreach ($ignoredKeys as $ignored) {
+    fwrite($warn, 'sqli: warning: ' . $ignored . PHP_EOL);
+}
+if ($ignoredKeys !== []) {
+    fwrite($warn, 'sqli: note: php sqli.php --lint --fix removes ' . (count($ignoredKeys) === 1 ? 'it' : 'them')
+        . ' (originals kept as .bak)' . PHP_EOL);
 }
 
 // Optional extensions whose absence takes a feature away (Esc-cancel, fast

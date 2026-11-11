@@ -6,12 +6,14 @@ namespace Sqli\Core;
 
 use includes\my;
 use Sqli\Config\Config;
+use Sqli\Config\ConfigLint;
 use Sqli\Config\Settings;
 use Sqli\Config\Macros;
 use Sqli\Config\RuntimeCheck;
 use Sqli\Db\ConnectionOptions;
 use Sqli\Db\Database;
 use Sqli\Db\DataDictionary;
+use Sqli\Db\DbStatus;
 use Sqli\Db\FieldValidator;
 use Sqli\Db\QueryResult;
 use Sqli\Db\ResultColumns;
@@ -79,7 +81,7 @@ final class App
      */
     private const COLUMN_ACTIONS = [
         'sort_asc', 'sort_desc', 'move', 'width', 'fit', 'fit_all',
-        'format_epoch', 'copy_col', 'hide',
+        'format_epoch', 'copy_col', 'hide', 'filter_rows', 'unfilter_rows',
     ];
 
     private const SIZE_POLL_INTERVAL = 0.3; // seconds between terminal-size checks
@@ -469,6 +471,13 @@ final class App
         $this->completion = new Completion();
         $this->schema = new Schema($database);
         $this->macros = Macros::fromConfig($config);
+        // `?db_status` (built in): read when it is expanded, so it reports the
+        // session as it is when the line is sent.
+        $this->macros->provide('db_status', fn (): string => DbStatus::sql($this->database, [
+            'version'  => $this->version,
+            'env'      => $this->config->envName(),
+            'readOnly' => $this->state->readOnly,
+        ]));
         // Decide truecolor vs. 256-color fallback before styles are emitted.
         Style::setTruecolor($this->resolveTruecolor());
         $this->theme = $this->buildTheme();
@@ -629,6 +638,18 @@ final class App
         if ($notices !== []) {
             $this->state->statusLine = (string) end($notices);
             $this->state->statusIsError = false;
+        }
+        // Keys sqli ignores (#26): said on the plain terminal too, but the
+        // alternate screen covers that. Env conflicts below still win the line.
+        $ignored = ConfigLint::ignoredKeys($this->config);
+        foreach ($ignored as $i) {
+            my::lineout('FILE:FILE', 'ignored key', $i);
+        }
+        if ($ignored !== []) {
+            $this->state->statusLine = 'warning: ' . $ignored[0]
+                . (count($ignored) > 1 ? sprintf(' (+%d more)', count($ignored) - 1) : '')
+                . ' — php sqli.php --lint --fix removes ' . (count($ignored) === 1 ? 'it' : 'them');
+            $this->state->statusIsError = true;
         }
         // The selected env is defined differently by two config files (§2). sqli.php
         // said so on the plain terminal, which the alternate screen has just
@@ -1358,6 +1379,18 @@ final class App
             return;
         }
 
+        // So does the `x` row-filter bar on a header (§6).
+        if ($this->state->rowFilterCol !== null) {
+            $this->handleRowFilterKey($e);
+            return;
+        }
+
+        // The Ctrl+F find bar owns the keyboard the same way until it closes (§6).
+        if ($this->state->find !== null) {
+            $this->handleFindKey($e);
+            return;
+        }
+
         // Completion popup is a soft modal: it consumes navigation/insert keys;
         // any other key closes it and is then handled normally (live editing).
         if ($this->state->completion) {
@@ -1931,6 +1964,10 @@ final class App
         }
 
         switch ($e->key) {
+            case Key::F3:
+                // F3 / Shift+F3 → next / previous match of the last find (§6).
+                $this->findAgain($e->shift ? -1 : 1);
+                break;
             case Key::Up:
                 // Ctrl+Up jumps to the first row in the current column (§7).
                 if ($e->ctrl) {
@@ -2027,6 +2064,15 @@ final class App
                 } elseif ($e->ctrl && $e->alt && strtolower($e->char) === 'f') {
                     // Ctrl+Alt+F → filter the columns by name (§6).
                     $this->openColFilter();
+                } elseif ($e->ctrl && !$e->alt && strtolower($e->char) === 'f') {
+                    // Ctrl+F → find text in the result's cells (§6).
+                    $this->openFind();
+                } elseif ($this->headerQuickKey($e)) {
+                    // On the header row the popup's letters work without
+                    // opening it (2.46.5) — handled inside headerQuickKey().
+                } elseif (!$e->ctrl && !$e->alt && $e->char === 'x' && $this->state->selectedRow === -1) {
+                    // x on the header row → filter the rows by this field (§6).
+                    $this->openRowFilter();
                 } elseif ($e->ctrl && !$e->alt && strtolower($e->char) === 'c') {
                     // Ctrl+C → copy the Shift+arrow range as CSV, or else the
                     // selected cell value, to the clipboard (§19).
@@ -2207,6 +2253,237 @@ final class App
             // visibleColumnNames() returns — the filtered list.
             $this->handleDataKey($e);
         }
+    }
+
+    /**
+     * On the header row, a lowercase letter that names a Data View
+     * Configuration item runs that item for the column under the cursor, just
+     * as opening the popup and pressing it would (user's call, 2.46.5: "if i
+     * have them memorized i can use them"). Only the fixed letters count, not
+     * the numbered entries. Returns false when the key is not one of them, so
+     * the grid's own keys still get it: `x`, and the inspector's `v` `e` `m`
+     * while it is open. (`v` on the header used to open the inspector; it is
+     * Reset column widths there now — open it from a data row.)
+     */
+    private function headerQuickKey(KeyEvent $e): bool
+    {
+        $s = $this->state;
+        if ($s->selectedRow !== -1 || $e->ctrl || $e->alt || $e->char === ''
+            || $s->vertical || !$s->hasResult()) {
+            return false;
+        }
+        // While the inspector is open its own v/e/m keep working.
+        if ($s->cellView && in_array($e->char, ['v', 'e', 'm'], true)) {
+            return false;
+        }
+        $saved = $s->popupCol;
+        $s->popupCol = $s->selectedCol;
+        $items = $this->layoutPopupItems();
+        foreach ($items as $i => $item) {
+            if ($item['label'] !== null && ($item['key'] ?? '') === $e->char) {
+                $s->layoutItem = $i;
+                $this->activateLayoutItem($items);
+                $s->layoutPopup = false;
+                return true;
+            }
+        }
+        $s->popupCol = $saved;
+        return false;
+    }
+
+    // --- row filter (x on a header, §6) --------------------------------------
+
+    /** Open the row-filter bar on the field under the cursor, with its current text. */
+    private function openRowFilter(): void
+    {
+        $col = $this->selectedColumnName();
+        if ($col === null || !$this->state->hasResult() || $this->state->vertical) {
+            return;
+        }
+        $this->state->clearRange();
+        $this->state->rowFilterCol = $col;
+    }
+
+    /**
+     * Keys while the row-filter bar is open (§6). Typing and Backspace change
+     * the filter and the rows narrow as you type; emptying it removes it.
+     * Enter closes the bar and keeps the filter; Esc closes it and removes this
+     * field's filter. Everything else is swallowed. The cursor stays on the
+     * header, where `x` on another field adds the next filter.
+     */
+    private function handleRowFilterKey(KeyEvent $e): void
+    {
+        $s = $this->state;
+        $col = (string) $s->rowFilterCol;
+        $text = $s->rowFilters[$col] ?? '';
+        if ($e->key === Key::Escape) {
+            unset($s->rowFilters[$col]);
+            $s->rowFilterCol = null;
+        } elseif ($e->key === Key::Enter) {
+            $s->rowFilterCol = null;
+        } elseif ($e->key === Key::Backspace) {
+            $this->setRowFilter($col, mb_substr($text, 0, -1));
+        } elseif ($e->isChar() && !$e->ctrl && !$e->alt) {
+            $this->setRowFilter($col, $text . $e->char);
+        }
+    }
+
+    private function setRowFilter(string $col, string $text): void
+    {
+        if ($text === '') {
+            unset($this->state->rowFilters[$col]);
+        } else {
+            $this->state->rowFilters[$col] = $text;
+        }
+        $this->state->selectedRow = -1;
+        $this->state->rowOffset = 0;
+    }
+
+    /** The Layout popup item, naming the filtered fields when there are any. */
+    private function rowFiltersLabel(): string
+    {
+        $cols = array_keys($this->state->rowFilters);
+        return $cols === [] ? 'Clear row filters' : 'Clear row filters (' . implode(', ', $cols) . ')';
+    }
+
+    // --- find in the result (Ctrl+F, §6) -------------------------------------
+
+    /** Where the cursor was when the find bar opened: typing searches from here. */
+    private array $findOrigin = [0, 0];
+
+    /** Open the find bar, empty, searching from the cell under the cursor. */
+    private function openFind(): void
+    {
+        if (!$this->state->hasResult() || $this->state->vertical) {
+            return;
+        }
+        $this->state->clearRange();
+        $this->state->find = '';
+        $this->state->findMatches = [];
+        $this->state->findIndex = -1;
+        $this->findOrigin = [max(0, $this->state->selectedRow), $this->state->selectedCol];
+    }
+
+    /** Close the bar; the cursor stays on the match, and the text is kept for F3. */
+    private function closeFind(): void
+    {
+        if ($this->state->find !== null && $this->state->find !== '') {
+            $this->state->findTerm = $this->state->find;
+        }
+        $this->state->find = null;
+        $this->state->findMatches = [];
+        $this->state->findIndex = -1;
+    }
+
+    /**
+     * New find text: match again and jump to the first match at or after the
+     * cell the bar opened on (wrapping to the top). With no match the cursor
+     * goes back to that cell, so deleting the typo finds the same place again.
+     */
+    private function setFindText(string $text): void
+    {
+        $s = $this->state;
+        $s->find = $text;
+        $s->findMatches = $s->findMatches($text);
+        $s->findIndex = -1;
+        if ($s->findMatches === []) {
+            [$s->selectedRow, $s->selectedCol] = $this->findOrigin;
+            return;
+        }
+        $s->findIndex = 0;
+        foreach ($s->findMatches as $i => $m) {
+            if ($m >= $this->findOrigin) {   // [row, col] compares row first
+                $s->findIndex = $i;
+                break;
+            }
+        }
+        [$s->selectedRow, $s->selectedCol] = $s->findMatches[$s->findIndex];
+    }
+
+    /** Step to the next (+1) or previous (-1) match of the open bar, wrapping. */
+    private function stepFind(int $dir): void
+    {
+        $s = $this->state;
+        $n = count($s->findMatches);
+        if ($n === 0) {
+            return;
+        }
+        $s->findIndex = (($s->findIndex < 0 ? ($dir > 0 ? -1 : 0) : $s->findIndex) + $dir + $n) % $n;
+        [$s->selectedRow, $s->selectedCol] = $s->findMatches[$s->findIndex];
+    }
+
+    /**
+     * Keys while the find bar is open (§6). Typing and Backspace edit the text
+     * and search as you go; Enter / Down / F3 go to the next match, Up /
+     * Shift+F3 to the previous one. Esc and Ctrl+F close it on the match.
+     * Everything else is swallowed.
+     */
+    private function handleFindKey(KeyEvent $e): void
+    {
+        $text = (string) $this->state->find;
+        if ($e->key === Key::Escape
+            || ($e->isChar() && $e->ctrl && !$e->alt && strtolower($e->char) === 'f')) {
+            $this->closeFind();
+            return;
+        }
+        if ($e->key === Key::Backspace) {
+            if ($text !== '') {
+                $this->setFindText(mb_substr($text, 0, -1));
+            }
+            return;
+        }
+        if ($e->isChar() && !$e->ctrl && !$e->alt) {
+            $this->setFindText($text . $e->char);
+            return;
+        }
+        if ($e->key === Key::Enter || $e->key === Key::Down || ($e->key === Key::F3 && !$e->shift)) {
+            $this->stepFind(1);
+        } elseif ($e->key === Key::Up || ($e->key === Key::F3 && $e->shift)) {
+            $this->stepFind(-1);
+        }
+    }
+
+    /**
+     * F3 / Shift+F3 with the bar closed: the next / previous cell after the
+     * cursor that holds the last text searched, wrapping, with the count on
+     * the status line.
+     */
+    private function findAgain(int $dir): void
+    {
+        $s = $this->state;
+        $term = $s->findTerm;
+        if ($term === '') {
+            $s->statusLine = 'Nothing to find again · [Ctrl+F] find';
+            $s->statusIsError = false;
+            return;
+        }
+        $matches = $s->findMatches($term);
+        $n = count($matches);
+        if ($n === 0) {
+            $s->statusLine = 'no cell contains "' . $term . '"';
+            $s->statusIsError = true;
+            return;
+        }
+        $here = [max(0, $s->selectedRow), $s->selectedCol];
+        $pick = $dir > 0 ? 0 : $n - 1;
+        if ($dir > 0) {
+            foreach ($matches as $i => $m) {
+                if ($m > $here) {
+                    $pick = $i;
+                    break;
+                }
+            }
+        } else {
+            for ($i = $n - 1; $i >= 0; $i--) {
+                if ($matches[$i] < $here) {
+                    $pick = $i;
+                    break;
+                }
+            }
+        }
+        [$s->selectedRow, $s->selectedCol] = $matches[$pick];
+        $s->statusLine = sprintf('Find "%s": match %d of %d · [F3] next · [Shift+F3] previous', $term, $pick + 1, $n);
+        $s->statusIsError = false;
     }
 
     /** Enter "move column" mode for a visible column index, snapshotting state for Esc revert (§6). */
@@ -2635,6 +2912,16 @@ final class App
             if (!$inGrid && !$onBar) {
                 $this->closeColFilter();
             }
+        }
+
+        // The find bar (§6): any click closes it as Esc would, keeping the
+        // text for F3, and then does what it always does.
+        if ($this->state->find !== null) {
+            $this->closeFind();
+        }
+        // The row-filter bar: a click closes it as Enter would, keeping the filter.
+        if ($this->state->rowFilterCol !== null) {
+            $this->state->rowFilterCol = null;
         }
 
         // A click outside the topmost dismissable popup/dialog closes it like
@@ -3459,7 +3746,7 @@ final class App
             ['label' => 'Edit Theme',             'action' => 'theme',     'enabled' => true],
             ['label' => 'Header Comment' . ($this->state->comment !== '' ? ': ' . $this->state->comment : ''),
                 'action' => 'comment', 'enabled' => true],
-            ['label' => 'Macros (' . $this->macros->count() . ')', 'action' => 'macros_view', 'enabled' => true],
+            ['label' => 'Macros (' . count($this->macros->all()) . ')', 'action' => 'macros_view', 'enabled' => true],
             ['label' => 'Create Local sqli Config', 'action' => 'create_config', 'enabled' => true],
             ['label' => 'Debug Logging: ' . ($this->state->debugLogging ? 'on' : 'off'),
                 'action' => 'debug_logging', 'enabled' => true],
@@ -5669,6 +5956,17 @@ final class App
             case 'hide':
                 $this->hideColumn($name);
                 break;
+            case 'unfilter_rows':
+                // Drop this field's row filter, as Esc in its bar does (§6).
+                unset($this->state->rowFilters[$name]);
+                break;
+            case 'filter_rows':
+                // Same bar as `x` on the header (§6): put the cursor on this
+                // field's header first, then open it with any text it has.
+                $this->state->selectedCol = $this->state->popupCol;
+                $this->state->selectedRow = -1;
+                $this->openRowFilter();
+                break;
         }
     }
 
@@ -5695,10 +5993,15 @@ final class App
         $items[] = ['label' => null, 'action' => null, 'enabled' => false];
         foreach ([
             ['label' => 'Reset column widths', 'action' => 'reset_widths', 'enabled' => true, 'key' => 'v'],
-            ['label' => 'Reset column order',  'action' => 'reset_order',  'enabled' => true, 'key' => 'w'],
+            ['label' => 'Reset column order',  'action' => 'reset_order',  'enabled' => true, 'key' => 'y'],
             ['label' => 'Reset all',           'action' => 'reset_all',    'enabled' => true, 'key' => 'z'],
         ] as $item) {
             $items[] = $item;
+        }
+        // Only while rows are filtered (`x` on a header, §6). Every undo
+        // letter from `v` up is taken, so it is the one just below them.
+        if ($this->state->rowFilters !== []) {
+            $items[] = ['label' => $this->rowFiltersLabel(), 'action' => 'clear_row_filters', 'enabled' => true, 'key' => 'u'];
         }
         // The per-column entries below (Unhide: …, Clear format: …) come and
         // go with the table, so they are numbered instead.
@@ -5752,6 +6055,10 @@ final class App
             $arrow = $this->state->sortDir === 'desc' ? '↓' : '↑';
             $sortLabel = 'Clear sort (' . $this->state->sortCol . ' ' . $arrow . ')';
         }
+        // Filter rows is `f` and, while this field is filtered, Remove row
+        // filter is `g` (user's calls, 2.46.5). `x` on the header still opens it.
+        $filterText = $this->state->rowFilters[$name] ?? null;
+        $filterLabel = $filterText === null ? 'Filter rows' : 'Filter rows ("' . $filterText . '")';
         // Each fixed item answers to a letter (2.42.1), so the key is the same
         // whatever else the menu is showing. The ones that do something take
         // a letter out of their label — `c` copies, so Change width is `n`.
@@ -5760,13 +6067,17 @@ final class App
         return [
             ['label' => 'Sort ASC',           'action' => 'sort_asc',     'enabled' => true, 'key' => 'a'],
             ['label' => 'Sort DESC',          'action' => 'sort_desc',    'enabled' => true, 'key' => 'd'],
-            ['label' => $sortLabel,           'action' => 'clear_sort',   'enabled' => $this->state->sortCol !== null, 'key' => 'y'],
+            ['label' => $sortLabel,           'action' => 'clear_sort',   'enabled' => $this->state->sortCol !== null, 'key' => 's'],
             ['label' => null,                 'action' => null,           'enabled' => false],
             ['label' => 'Move column',        'action' => 'move',         'enabled' => true, 'key' => 'm'],
             ['label' => 'Change width',       'action' => 'width',        'enabled' => true, 'key' => 'n'],
-            ['label' => 'Fit to content',     'action' => 'fit',          'enabled' => true, 'key' => 'f'],
-            ['label' => 'Fit all to content', 'action' => 'fit_all',      'enabled' => true, 'key' => 'l'],
+            ['label' => 'Fit to content',     'action' => 'fit',          'enabled' => true, 'key' => 'i'],
+            ['label' => 'Fit all to content', 'action' => 'fit_all',      'enabled' => true, 'key' => 'w'],
             ['label' => $formatLabel,         'action' => 'format_epoch', 'enabled' => true, 'key' => 'e'],
+            ['label' => $filterLabel,         'action' => 'filter_rows',  'enabled' => !$this->state->vertical, 'key' => 'f'],
+            ...($filterText === null ? [] : [
+                ['label' => 'Remove row filter', 'action' => 'unfilter_rows', 'enabled' => true, 'key' => 'g'],
+            ]),
             ['label' => 'Copy column',        'action' => 'copy_col',     'enabled' => true, 'key' => 'c'],
             ['label' => 'Hide column',        'action' => 'hide',         'enabled' => true, 'key' => 'h'],
         ];
@@ -5801,7 +6112,7 @@ final class App
 
         $items = [['label' => null, 'action' => null, 'enabled' => false]];
         if ($applied !== []) {
-            $items[] = ['label' => 'Clear all formats', 'action' => 'clear_formats', 'enabled' => true, 'key' => 'x'];
+            $items[] = ['label' => 'Clear all formats', 'action' => 'clear_formats', 'enabled' => true, 'key' => 'o'];
             foreach ($applied as $name => $id) {
                 $items[] = [
                     'label' => 'Clear format: ' . $name . ' (' . self::formatLabel($id) . ')',
@@ -5877,7 +6188,11 @@ final class App
                 $this->state->sortCol = null;
                 $this->state->applySort();
                 break;
+            case 'clear_row_filters':
+                $this->state->rowFilters = [];
+                break;
             case 'reset_all':
+                $this->state->rowFilters = [];
                 $this->state->hiddenCols = [];
                 $this->state->colWidthOverride = [];
                 $this->state->colOrder = [];
@@ -8843,6 +9158,8 @@ final class App
         $this->state->colOffset = 0;
         $this->state->sortCol = null;
         $this->state->applySort();
+        $this->state->rowFilters = [];
+        $this->state->rowFilterCol = null;
         $this->state->pending = [];
         $this->state->deleteMarks = [];
         $this->state->markMode = false;
@@ -10474,6 +10791,10 @@ final class App
         $this->state->markMode = false;
         $this->state->colFilter = null;
         $this->state->colFilterMiss = '';
+        $this->closeFind();
+        // Row filters belong to the rows they were made on (§6, user's call).
+        $this->state->rowFilters = [];
+        $this->state->rowFilterCol = null;
 
         // Restore the saved per-table layout for this query (§6).
         $this->applySavedLayout($sql, (bool) ($this->queryContext['unsaved'] ?? false));

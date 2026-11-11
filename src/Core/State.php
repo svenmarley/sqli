@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Sqli\Core;
 
 use Sqli\Db\QueryResult;
+use Sqli\Format\ColumnFormats;
 use Sqli\Input\LineEditor;
 
 /**
@@ -59,7 +60,7 @@ final class State
         'selectedRow', 'selectedCol', 'rowOffset', 'colOffset', 'rangeRow', 'rangeCol',
         // Layout customization (§6)
         'hiddenCols', 'colWidthOverride', 'colOrder', 'layoutFields', 'layoutUnsaved', 'colAlpha', 'colFormats', 'ddColFormats',
-        'sortCol', 'sortDir', 'sortedOrder',
+        'sortCol', 'sortDir', 'sortedOrder', 'rowFilters',
         // Output mode (§5/§8)
         'vertical', 'verticalScroll', 'detail', 'detailFieldIdx', 'detailVisibleFields',
         // Un-run cell edits (§9)
@@ -189,6 +190,24 @@ final class State
     /** The last filter text refused for matching nothing, for the status line ('' = none). */
     public string $colFilterMiss = '';
 
+    /**
+     * Ctrl+F find in the result (§6): while non-null, the find bar is open with
+     * this text. It searches the cell values as shown on screen (formats
+     * applied), in the visible fields only — never the field names.
+     */
+    public ?string $find = null;
+    /** The last text searched, kept after the bar closes so F3 / Shift+F3 can reuse it. */
+    public string $findTerm = '';
+    /**
+     * Every match of the open find bar, in reading order, as [display row,
+     * visible column]. Rebuilt by App on each change; empty when the bar is closed.
+     *
+     * @var list<array{0:int,1:int}>
+     */
+    public array $findMatches = [];
+    /** Index into $findMatches of the match under the cursor, or -1 with none. */
+    public int $findIndex = -1;
+
     // Layout customization (§6), persisted per db+table by App.
     /** @var list<string> hidden column names */
     public array $hiddenCols = [];
@@ -251,6 +270,21 @@ final class State
     public bool $moveMode = false;
     /** @var list<int>|null cached display order (raw row indices); null = natural */
     private ?array $sortedOrder = null;
+
+    /**
+     * Row filters (§6, `x` on a header): field name → text. A row is shown only
+     * when, for every entry, that field's shown text contains the text (any
+     * case). They stack, are part of the view like the sort, are never saved,
+     * and a new result clears them.
+     *
+     * @var array<string,string>
+     */
+    public array $rowFilters = [];
+    /** The field whose row-filter bar is open, or null with none open. */
+    public ?string $rowFilterCol = null;
+    /** displayOrder()'s filtered list and the inputs it was built from. */
+    private ?array $rowFilterMemo = null;
+    private string $rowFilterMemoKey = '';
 
     // Detail view (§8).
     public bool $detail = false;
@@ -899,7 +933,12 @@ final class State
 
     public function maxRow(): int
     {
-        return $this->hasResult() ? $this->result->rowCount() - 1 : 0;
+        // Counts the rows shown: a row filter (§6) can leave fewer than the
+        // result holds, or none — then -1, the header row.
+        if (!$this->hasResult()) {
+            return 0;
+        }
+        return $this->rowFilters === [] ? $this->result->rowCount() - 1 : count($this->displayOrder()) - 1;
     }
 
     public function hasRange(): bool
@@ -1051,13 +1090,82 @@ final class State
         return $cols;
     }
 
+    /**
+     * A cell's text exactly as the grid shows it (§6): `NULL` for SQL NULL, a
+     * staged edit over the stored value, and the column's display format
+     * applied. Find searches this, so it matches what is on screen.
+     */
+    public function cellDisplayText(int $rawIdx, string $col): string
+    {
+        $rows = $this->result?->rows ?? [];
+        $raw = array_key_exists($col, $this->pending[$rawIdx] ?? [])
+            ? $this->pending[$rawIdx][$col]
+            : ($rows[$rawIdx][$col] ?? null);
+        if ($raw === null) {
+            return 'NULL';
+        }
+        $disp = (string) $raw;
+        $fmt = ColumnFormats::get($this->formatOf($col));
+        return $fmt !== null && $disp !== '' ? $fmt->display($disp) : $disp;
+    }
+
+    /**
+     * Every cell whose shown text contains $term (case-insensitive), in reading
+     * order — row by row, left to right — as [display row, visible column].
+     * Hidden and filtered-out fields are left out, and so are the field names.
+     *
+     * @return list<array{0:int,1:int}>
+     */
+    public function findMatches(string $term): array
+    {
+        if ($term === '' || !$this->hasResult()) {
+            return [];
+        }
+        $cols = $this->visibleColumnNames();
+        $out = [];
+        foreach ($this->displayOrder() as $dispIdx => $rawIdx) {
+            foreach ($cols as $colIdx => $name) {
+                if (mb_stripos($this->cellDisplayText($rawIdx, $name), $term) !== false) {
+                    $out[] = [$dispIdx, $colIdx];
+                }
+            }
+        }
+        return $out;
+    }
+
     /** @return list<int> raw row indices in display order (sort applied) */
     public function displayOrder(): array
     {
-        if ($this->sortedOrder !== null) {
-            return $this->sortedOrder;
+        $order = $this->sortedOrder
+            ?? ($this->hasResult() ? range(0, $this->result->rowCount() - 1) : []);
+        if ($this->rowFilters === [] || $order === []) {
+            return $order;
         }
-        return $this->hasResult() ? range(0, $this->result->rowCount() - 1) : [];
+        // Filtering reads every cell's shown text, and this is called many times
+        // a frame — so the list is kept until something it depends on changes.
+        $key = spl_object_id($this->result) . "\0" . $this->sortCol . "\0" . $this->sortDir
+            . "\0" . serialize($this->rowFilters) . "\0" . serialize($this->colFormats)
+            . "\0" . serialize($this->pending) . "\0" . count($order);
+        if ($this->rowFilterMemo === null || $this->rowFilterMemoKey !== $key) {
+            $kept = [];
+            foreach ($order as $rawIdx) {
+                foreach ($this->rowFilters as $col => $text) {
+                    if (mb_stripos($this->cellDisplayText($rawIdx, $col), $text) === false) {
+                        continue 2;
+                    }
+                }
+                $kept[] = $rawIdx;
+            }
+            $this->rowFilterMemo = $kept;
+            $this->rowFilterMemoKey = $key;
+        }
+        return $this->rowFilterMemo;
+    }
+
+    /** Rows the result holds, before any row filter: for the "N of M rows" count. */
+    public function totalRowCount(): int
+    {
+        return $this->hasResult() ? $this->result->rowCount() : 0;
     }
 
     /** Recompute the cached sort order from sortCol/sortDir. */
@@ -1113,7 +1221,8 @@ final class State
             || $this->colWidthOverride !== []
             || $this->colOrder !== []
             || $this->formattedColumns() !== []
-            || $this->sortCol !== null;
+            || $this->sortCol !== null
+            || $this->rowFilters !== [];
     }
 
     /** Nulls sort last; numeric strings compare numerically, else as strings. */

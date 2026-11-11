@@ -89,6 +89,7 @@ final class Config
         'env'                => ['E', 'env', false, null, 'Named environment from the config `envs` section (also $SQLI_ENV)'],
         'no-env'             => [null, 'no-env', true, false, 'Ignore $SQLI_ENV and the config\'s default `env`; run with no named environment'],
         'lint'               => [null, 'lint', true, false, 'Validate the config/formatting JSON files and exit'],
+        'fix'                => [null, 'fix', true, false, 'With --lint: remove the keys sqli ignores from the files (original kept as <file>.bak)'],
         'execute'            => ['e', 'execute', false, null, 'Run the SQL, print the result as CSV and exit — no TUI (SQL piped on stdin does the same)'],
         'skip-column-names'  => ['N', 'skip-column-names', true, false, 'With -e / piped SQL: no header row in the CSV'],
         'out'                => [null, 'out', false, null, 'With -e / piped SQL: write the CSV to this file instead of stdout'],
@@ -102,7 +103,7 @@ final class Config
     ];
 
     /** Options that only make sense on the CLI/env, never inside a config file. */
-    private const FILE_EXCLUDED = ['no-env', 'project', 'config', 'user-config', 'help', 'version', 'lint', 'execute', 'out'];
+    private const FILE_EXCLUDED = ['no-env', 'project', 'config', 'user-config', 'help', 'version', 'lint', 'fix', 'execute', 'out'];
 
     /**
      * Options a config file may set only in its **base** — its flat root keys or

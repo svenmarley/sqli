@@ -24,7 +24,8 @@ You already know SQL. These are the parts of `mysql>` you work around.
 - **Nine result views on one connection.** `\3` runs CLI command into view 3, so a schema lookup doesn't cost you the
   result you were reading. Alt-{1-9} change view. → [Data views](#data-views)
 - **Macros.**`?name` for the query you retype ten times a day — with arguments, prompts, and optionally a different
-  macro/id on prod than on dev. → [Macros](#macros)
+  macro/id on prod than on dev. One is built in: `?db_status`, the whole connection and server status in a grid.
+  → [Macros](#macros)
 - **Hierarchical configs** - Set a .sqli config in the project/repo root, then `cd` anywhere into the repo directory.
   Run `sqli -E prod`. Config looks up the directory tree; uses the -E {environment} you chose. Supports a password file
   that you never commit. → [Configuration](#configuration)
@@ -57,6 +58,41 @@ You already know SQL. These are the parts of `mysql>` you work around.
   terminal. (Legacy `cmd.exe` works but is slower.)
 - **No third-party PHP packages.** sqli has zero external dependencies, no
   `composer install`, and no build step.
+
+### Installing PHP and the extensions
+
+| Platform        | Get PHP                                                                                              | Extensions                                                                                              |
+|-----------------|------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------|
+| Windows         | [windows.php.net/download](https://windows.php.net/download/) — the x64 **Non Thread Safe** zip       | Ship in the zip, but are switched off in `php.ini` (see below)                                          |
+| macOS           | [Homebrew](https://brew.sh): `brew install php` ([formula](https://formulae.brew.sh/formula/php))     | Built in                                                                                                |
+| Debian / Ubuntu | `sudo apt install php-cli php-mysql php-mbstring`                                                    | `php-mysql` brings both `pdo_mysql` and `mysqli`                                                         |
+| Fedora / RHEL   | `sudo dnf install php-cli php-mysqlnd php-mbstring php-ffi`                                          | `php-mysqlnd` brings both `pdo_mysql` and `mysqli`                                                       |
+| Anything else   | [php.net: installation and configuration](https://www.php.net/manual/en/install.php)                 |                                                                                                         |
+
+Then check what you have. `php -m` lists the loaded extensions, and `php --ini` names the `php.ini` that is in use:
+
+```sh
+php -v                                              # 8.1 or newer
+php -m | grep -iE "pdo_mysql|mysqli|mbstring|openssl|ffi"   # Windows: findstr /i in place of grep -iE
+php --ini
+```
+
+**On Windows**, the zip ships `php.ini-production` but no `php.ini`. Copy it to `php.ini` in the same folder, then
+remove the leading `;` from these lines:
+
+```ini
+extension_dir = "ext"
+extension=mbstring
+extension=openssl      ; encrypted connections (TLS)
+extension=pdo_mysql
+extension=mysqli       ; optional: Esc cancels a running query
+extension=ffi          ; optional: instant, reliable window resizing
+```
+
+`openssl` is what encrypted connections need — without it, sqli cannot reach a server that requires TLS (see
+[Encrypted connections](#encrypted-connections)). On Linux and macOS it is part of every standard PHP build. The
+[php.ini documentation](https://www.php.net/manual/en/configuration.file.php) explains where PHP looks for the file.
+`php sqli.php --lint` says when `mysqli` or `ffi` is missing.
 
 ## Quick start
 
@@ -110,7 +146,8 @@ Options can be passed as flags, or stored in a config file so you don't put cred
 | `--project`                |       | Find the project `.sqli/` from this directory instead of the current one                                                  | cwd         |
 | `--config`                 | `-c`  | Load options from a JSON file (or `$SQLI_CONFIG`)                                                                         |             |
 | `--user-config`            |       | Personal overlay on `--config` (or `$SQLI_USER_CONFIG`)                                                                   |             |
-| `--lint`                   |       | Validate every config file sqli would read, then exit                                                                     |             |
+| `--lint`                   |       | Validate every config file sqli would read, naming `file:line` for each problem, then exit                                |             |
+| `--fix`                    |       | With `--lint`: remove the keys sqli ignores from your files. The original is kept as `<file>.bak`                         |             |
 | `--debug`                  | `-d`  | Verbose diagnostics to `debug.log` beside `sqli.php`                                                                      | off         |
 | `--help`                   | `-h`  | Print the full option list and exit                                                                                       |             |
 | `--version`                | `-V`  | Print the version and exit                                                                                                |             |
@@ -125,10 +162,12 @@ every automatic reconnect, every query error code, and a `startup` line timing e
 ## Getting around
 
 `Ctrl+D` swaps focus between the SQL line and the result grid; `F1` is the complete list of {keys} for whichever view 
-you're in, and the system menu is `/`. System menu and in Data View Configuration optinos are scrollable and using Enterhas a quick key
-executes that item.  Each option also have drawn in front of it (`1)` … `9)`, then `a)` … `z)`): press it and the item 
-runs, exactly as `Enter` on it would. In Data View Configuration the keys are letters from the option itself:
-`m)` Move column, `h)` Hide column, `a)` / `d)` Sort ASC / DESC, with every reset and clear kept apart at `v)` … `z)`.
+you're in, and the system menu is `/`. The system menu and Data View Configuration scroll, and every option has a quick
+key drawn in front of it (`1)` … `9)`, then `a)` … `z)`): press it and the item runs, exactly as `Enter` on it would.
+In Data View Configuration the keys are fixed letters: `a)` / `d)` Sort ASC / DESC, `s)` Clear sort, `m)` Move,
+`n)` Change width, `i)` Fit, `w)` Fit all, `e)` date/time format, `f)` Filter rows, `g)` Remove row filter, `c)` Copy,
+`h)` Hide, `v)` Reset widths, `y)` Reset order, `z)` Reset all, `u)` Clear row filters, `t)` Show hidden, `o)` Clear
+formats. **On the header row these letters work without opening the menu** — `d` on a header sorts that field DESC.
 
 The header row says which server you are on, which database and table the grid is showing, and — if you set one — **your
 own short comment beside the `CLI`/`DATA`
@@ -272,14 +311,23 @@ cell in a movable inspector, `j` opens a JSON cell in a tree viewer, `t` opens a
 
 **Find a field — `Ctrl+Alt+F`.** Type part of a field name and the grid narrows to the fields whose name contains it;
 `Backspace` widens it again. `Esc` or `Ctrl+Alt+F` brings every field back with the cursor still on the field you were
-on. Hidden fields stay hidden and aren't searched. Nothing is saved.
+on. Hidden fields stay hidden and aren't searched. Nothing is saved. The text you type shows on the grid's top border.
+
+**Filter the rows — `x` on a header.** Put the cursor on the header row, press `x` and type: only rows whose value in
+that field contains the text stay (`f` does the same). `Enter` keeps the filter, `Esc` removes it, and `g` on the
+header removes it later. Do it on another field and the filters stack. The status line always says `N of M rows shown`; Data View Configuration has **Clear row filters**, and a new
+query clears them.
+
+**Find a value — `Ctrl+F`.** Type and the cursor jumps to the first cell containing it (any case), with every match
+highlighted and `match N of M` on the status line. It searches what the cells show, not the field names. `Enter` or
+`↓` goes to the next match, `↑` to the previous. `Esc` closes it on the match; after that `F3` / `Shift+F3` keep going.
 
 **`Ctrl+Alt+S` shows the columns A–Z** — the ones you haven't placed yourself; a column you moved keeps its place.
 Press it again for the result's own order. It is never saved, and it turns off when the view shows another table.
 
 **Rearrange it — `Ctrl+L`.** That opens **Data View Configuration**, the one menu for everything about how the grid
-looks. The top half acts on the column you're on and the title names it: sort, move, resize, fit, copy, hide, and a
-display-format toggle. The bottom half acts on the whole table: reset the widths, the order or all of it, and put back
+looks. The top half acts on the column you're on and the title names it: sort, move, resize, fit, filter rows, copy,
+hide, and a display-format toggle. The bottom half acts on the whole table: reset the widths, the order or all of it, and put back
 any column you've hidden or format you've applied, one by one or in one go.
 
 Four ways in, all the same menu: `Ctrl+L`, `Enter` on the header row, a click on a column header (which scopes it to the
@@ -450,6 +498,12 @@ cp .sqli/sqli_credentials.example.json .sqli/sqli_credentials.json
 cp .sqli/sqli_macros.example.ini     .sqli/sqli_macros.ini
 php sqli.php --lint          # check what sqli will read, and from where
 ```
+
+`--lint` names the file and line of every problem it finds. Keys that sqli ignores — a misspelled option, a setting that
+only works on the command line, an `env` inside an environment — can be removed for you with `php sqli.php --lint --fix`.
+It cuts only those keys out of the file, leaves everything else as you wrote it, and keeps the original as
+`<file>.bak`. Until then, sqli lists these keys each time it starts, and the first one shows on the status line.
+Everything else `--lint` reports is for you to decide.
 
 ### Where sqli looks
 
@@ -638,6 +692,37 @@ with no `-E` no such section loads at all.
   came from. The menu item carries the count, so you can see whether any loaded without opening it.
 - **`php sqli.php --lint`** validates every macros file it would read, names what each one defines, and reports a bad
   name, an empty value or a reference loop with the file and line.
+
+### Built in: `?db_status`
+
+A **built-in macro** is one sqli defines itself: it is always available, in every project and every environment, and
+it is never written in a `sqli_macros.ini`. You use it exactly like your own — type it, press Enter (no `;` needed), find
+it with `?` + `Tab` — and it shows in the Macros viewer marked `(built in)`. What differs is where its SQL comes from:
+sqli builds it at the moment you run it, so it can report things no fixed text could.
+
+There is one so far. **`?db_status`** is sqli's answer to `mysql`'s `\s`: it opens a data view of the connection and
+the server, one row per fact, in three columns — `Section`, `Item`, `Value` — grouped by section:
+
+- **sqli** — version, driver, environment, read-only, the connection options in force
+- **Connection** — connection ID (the number `KILL` takes), address, login and account, database, encryption, TLS
+  mode and version, compression
+- **Server** — version and distribution, hostname, port and socket, `read_only`, max connections, uptime, threads,
+  connections and statements since start, slow queries, statements per second
+- **Session** — `sql_mode`, time zone, autocommit, transaction isolation and read-only, `wait_timeout`,
+  `interactive_timeout`, the statement time limit
+- **Character sets** — server, database, client, connection and results, and the collations
+
+Because the answer is an ordinary result, everything that works on a grid works on it: sort, filter (`Ctrl+F` finds a
+setting), copy a cell, export with `Ctrl+E`, or run it into another data view (`?db_status ]2`) to compare before and
+after. It is read when you run it, so it is always current, and it works the same through `-e` (as CSV):
+
+```sh
+php sqli.php -E prod -e "?db_status" > prod-status.csv
+```
+ With a `host_label`
+set, the address, hostname, port, socket and account are left out, as they are everywhere else on screen. It is listed
+in the Macros viewer and offered by `?` + `Tab` (`?db` + `Tab` finds it). A file cannot redefine it: a `db_status = …`
+line is reported and ignored.
 
 ## Encrypted connections
 
@@ -867,7 +952,8 @@ covers them; don't commit them.
 
 The files you write yourself — `sqli_config.json`, `sqli_macros.ini`,
 `sqli_credentials.json`, your themes — are never written by sqli. It reads them, tells you what it found with `--lint`,
-and leaves them alone.
+and leaves them alone. The one exception is `--lint --fix`, which you run yourself: it removes the keys sqli ignores and
+keeps the original as `<file>.bak`.
 
 ## License
 

@@ -374,6 +374,18 @@ final class Database
         return $this->compressed;
     }
 
+    /** The resolved connection options (driver, timeouts, init-command, …). */
+    public function options(): ConnectionOptions
+    {
+        return $this->options;
+    }
+
+    /** True when a `host_label` stands in for the address (§2) — keep it off screen. */
+    public function hidesAddress(): bool
+    {
+        return $this->label !== '';
+    }
+
     /**
      * The TLS state of the live connection: the negotiated cipher, or `''` when
      * the session is plaintext (including when it was never connected).

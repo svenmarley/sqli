@@ -118,6 +118,8 @@ final class Theme
         'selected_cell'       => ['sel_active'],
         'header_selected'     => ['sel_active'],
         'cell_range'          => ['sel_range'],     // Shift+arrow range (§19)
+        'cell_match'          => ['chip_warn'],     // Ctrl+F find matches (§6)
+        'header_filtered'     => ['chip_warn', 'b'], // a field the rows are filtered by (§6, x)
         'cell_pending'        => ['warn', 'bi'],
         // Rows marked for deletion, and the mark-mode checkbox gutter (§22)
         'row_marked'          => ['error', 'b'],

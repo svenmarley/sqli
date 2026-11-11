@@ -140,6 +140,17 @@ final class Macros
     public const FILE = 'sqli_macros.ini';
 
     /**
+     * Built-in macros: always there, never in a file. Each is listed and
+     * completed like a file macro, with this text where a value would be; the
+     * SQL it stands for is made by a provider the App hands in
+     * ({@see provide()}), at the moment it is expanded. A file defining one of
+     * these names is refused, so `?db_status` always means the same thing.
+     */
+    public const BUILT_IN = [
+        'db_status' => '(built in) connection, server and session status — like mysql\'s \s',
+    ];
+
+    /**
      * What may follow the `?`. See the class note above: no leading digit, so a
      * name and an argument slot (`?1`) can never be read for one another.
      */
@@ -360,6 +371,9 @@ final class Macros
 
     /** @var array<string,string> name => value, closest layer winning */
     private array $macros = [];
+
+    /** @var array<string, \Closure(): string> built-in name => makes its SQL */
+    private array $providers = [];
 
     /** @var array<string,string> name => the file it came from */
     private array $origin = [];
@@ -740,6 +754,9 @@ final class Macros
     /** Why $name => $value cannot be a macro, or null when it can. */
     private static function validate(string $name, string $value): ?string
     {
+        if (isset(self::BUILT_IN[$name])) {
+            return "`$name` is a built-in macro, so this definition is ignored — give yours another name";
+        }
         if (preg_match('/^' . self::NAME . '$/', $name) !== 1) {
             return "`$name` is not a usable macro name (letters, digits, _ . and -, starting with a letter or _)";
         }
@@ -783,16 +800,31 @@ final class Macros
         return null;
     }
 
-    /** @return array<string,string> every macro, name-sorted */
+    /** @return array<string,string> every macro, built-ins included, name-sorted */
     public function all(): array
     {
-        return $this->macros;
+        $all = $this->macros + self::BUILT_IN;
+        ksort($all, SORT_NATURAL | SORT_FLAG_CASE);
+        return $all;
     }
 
-    /** @return list<string> names, name-sorted */
+    /** @return list<string> names from the files, name-sorted (built-ins: {@see all()}) */
     public function names(): array
     {
         return array_keys($this->macros);
+    }
+
+    public static function isBuiltIn(string $name): bool
+    {
+        return isset(self::BUILT_IN[$name]);
+    }
+
+    /** Hand in what makes a built-in macro's SQL; called each time it is expanded. */
+    public function provide(string $name, \Closure $sql): void
+    {
+        if (isset(self::BUILT_IN[$name])) {
+            $this->providers[$name] = $sql;
+        }
     }
 
     public function get(string $name): ?string
@@ -952,7 +984,10 @@ final class Macros
             if (self::inSpans($start, $spans)) {
                 continue; // quoted: text, and not the last reference either
             }
-            $value = $this->macros[(string) $hit[1][0]] ?? null;
+            // A built-in takes no arguments, so its name alone is a whole call —
+            // and its SQL is not made here, where nothing will run it.
+            $name = (string) $hit[1][0];
+            $value = $this->macros[$name] ?? (isset(self::BUILT_IN[$name]) ? '' : null);
             if ($value === null) {
                 return false;
             }
@@ -1136,6 +1171,11 @@ final class Macros
 
             $name = (string) $m[2][0];
             $value = $this->macros[$name] ?? null;
+            // A built-in is made now, not at load: what it reports is the
+            // session as it is when the line is sent.
+            if ($value === null && isset($this->providers[$name])) {
+                $value = ($this->providers[$name])();
+            }
             if ($value === null) {
                 // Defined, but under an env this session did not select: a
                 // different mistake from a typo, and one whose fix is `-E`

@@ -121,7 +121,8 @@ final class Renderer
         [$cx, $cy, $cw, $ch] = $this->drawResultBox($screen, $state, $w, $boxTop, $boxBottom);
         // Data view tabs ride ON the box's top border rather than taking a row of
         // their own (§20) — five tabs are worth a strip, not a whole line of grid.
-        $this->drawTabs($screen, $state, $w, $boxTop);
+        $tabsEnd = $this->drawTabs($screen, $state, $w, $boxTop);
+        $this->drawColFilterLabel($screen, $state, $w, $boxTop, $tabsEnd);
 
         // While any layout customization is active, a vertical "Layout Config"
         // label runs down the LEFT border of the data view (§6). It paints over
@@ -718,7 +719,7 @@ final class Renderer
      * strip is skipped entirely when even that would not — a narrow terminal
      * keeps its border rather than getting a truncated mess.
      */
-    private function drawTabs(Screen $screen, State $state, int $w, int $y): void
+    private function drawTabs(Screen $screen, State $state, int $w, int $y): int
     {
         $avail = $w - 4;   // clear of both corners and one border glyph each side
         $labels = $state->tabLabels;
@@ -737,7 +738,7 @@ final class Renderer
             }
         }
         if ($this->stripWidth($cells) > $avail) {
-            return;
+            return 2;
         }
 
         $x = 2;
@@ -752,6 +753,56 @@ final class Renderer
             $screen->put($x, $y, $cell, $style);
             $x += mb_strlen($cell);
         }
+        return $x;
+    }
+
+    /**
+     * Paint the open field filter (Ctrl+Alt+F) on the right of the result box's
+     * top border, where the eye already is while filtering — the status line
+     * alone sits below the SQL prompt and is easy to miss (§6). The text keeps
+     * its tail when space is short, since that is where the typing happens.
+     */
+    private function drawColFilterLabel(Screen $screen, State $state, int $w, int $y, int $tabsEnd): void
+    {
+        // The `x` row-filter bar and the Ctrl+F find bar use the same spot and
+        // the same rules.
+        if ($state->rowFilterCol !== null) {
+            $shown = count($state->displayOrder());
+            $this->drawBorderBar($screen, $w, $y, $tabsEnd, ' Rows where ' . $state->rowFilterCol . ': ',
+                $state->rowFilters[$state->rowFilterCol] ?? '',
+                '  ' . $shown . ' of ' . $state->totalRowCount() . ' ', $shown === 0);
+            return;
+        }
+        if ($state->find !== null) {
+            $n = count($state->findMatches);
+            $this->drawBorderBar($screen, $w, $y, $tabsEnd, ' Find: ', $state->find,
+                $state->find === '' ? ' ' : ($n === 0 ? '  no match ' : '  ' . ($state->findIndex + 1) . ' of ' . $n . ' '),
+                $state->find !== '' && $n === 0);
+            return;
+        }
+        if ($state->colFilter === null) {
+            return;
+        }
+        $this->drawBorderBar($screen, $w, $y, $tabsEnd, ' Filter: ', $state->colFilter,
+            '  ' . $state->totalCols() . ' of ' . count($state->unfilteredColumnNames()) . ' ',
+            $state->colFilterMiss !== '');
+    }
+
+    /** One typed-text bar on the right of the result box's top border. */
+    private function drawBorderBar(Screen $screen, int $w, int $y, int $tabsEnd, string $head, string $text, string $count, bool $miss): void
+    {
+        $room = ($w - 3) - ($tabsEnd + 1) - mb_strlen($head) - mb_strlen($count) - 1;
+        if ($room < 4) {
+            return;
+        }
+        if (mb_strlen($text) > $room) {
+            $text = '…' . mb_substr($text, -($room - 1));
+        }
+        $label = $head . $text . '▏' . $count;
+        $style = $miss
+            ? $this->theme->style('status_error')
+            : $this->theme->style('tab_active');
+        $screen->put($w - 2 - mb_strlen($label), $y, $label, $style);
     }
 
     /** @param list<string> $cells */
@@ -819,6 +870,11 @@ final class Renderer
         }
         $rows = $result->rows;
         $order = $state->displayOrder();
+        // A row filter (§6) can drop the row under the cursor — an edit that no
+        // longer matches, say. Keep the cursor on a row that is still shown.
+        if ($state->selectedRow > count($order) - 1) {
+            $state->selectedRow = count($order) - 1;
+        }
         $widths = $this->gridWidths($state, $colNames, $rows);
 
         $rowNumW = max(3, strlen((string) count($order)));
@@ -841,6 +897,8 @@ final class Renderer
         // like the selected cell, and takes over from the selected-row tint so
         // the rectangle reads as one block.
         $showRange = $state->focus === State::FOCUS_DATA && $state->hasRange();
+        // Matches are highlighted only while the find bar is open (§6).
+        $findTerm = (string) $state->find;
 
         // Header row, with a sort arrow on the sorted column.
         $headerY = $y;
@@ -857,6 +915,9 @@ final class Renderer
                 $style = $this->theme->style('header_selected');
             } elseif ($showRange && $state->inRange(-1, $colIdx)) {
                 $style = $this->theme->style('cell_range');
+            } elseif (isset($state->rowFilters[$name]) || $state->rowFilterCol === $name) {
+                // A field the rows are filtered by (§6, `x`).
+                $style = $this->theme->style('header_filtered');
             } elseif ($state->formatOf($name) !== null) {
                 // A formatted column's header is tinted so it's obvious the shown
                 // value differs from what's stored (§6, backlog S).
@@ -922,16 +983,10 @@ final class Renderer
                 $isPending = array_key_exists($name, $state->pending[$rawIdx] ?? []);
                 $raw = $isPending ? $state->pending[$rawIdx][$name] : ($rows[$rawIdx][$name] ?? null);
                 $isNull = $raw === null;
-                if ($isNull) {
-                    $disp = 'NULL';
-                } else {
-                    $disp = (string) $raw;
-                    $fmt = ColumnFormats::get($state->formatOf($name));
-                    if ($fmt !== null && $disp !== '') {
-                        $disp = $fmt->display($disp); // raw → shown value (§6)
-                    }
-                }
+                // raw → shown value (§6); find searches this same text.
+                $disp = $state->cellDisplayText($rawIdx, $name);
                 $text = $this->pad($disp, $colW);
+                $isMatch = $findTerm !== '' && mb_stripos($disp, $findTerm) !== false;
 
                 $isSelCell = $isSelRow && $colIdx === $state->selectedCol && $state->focus === State::FOCUS_DATA;
                 if ($state->moveMode && $colIdx === $state->selectedCol) {
@@ -941,6 +996,10 @@ final class Renderer
                     $style = $this->theme->style('selected_cell');
                 } elseif ($showRange && $state->inRange($dispIdx, $colIdx)) {
                     $style = $this->theme->style('cell_range');
+                } elseif ($isMatch) {
+                    // Every match of the open find bar (§6); the current one
+                    // is the selected cell above.
+                    $style = $this->theme->style('cell_match');
                 } elseif ($isMarked) {
                     // Whole row reads as one doomed record — a pending edit or a
                     // NULL inside it is not the point any more.
@@ -1316,8 +1375,22 @@ final class Renderer
                 . $state->totalCols() . ' of ' . count($state->unfilteredColumnNames())
                 . ($state->colFilterMiss !== '' ? ' · no field contains "' . $state->colFilterMiss . '"' : '')
                 . ' · [←/→] move · [Esc] done';
+        } elseif ($state->rowFilterCol !== null) {
+            $left = 'Rows where ' . $state->rowFilterCol . ' contains: '
+                . ($state->rowFilters[$state->rowFilterCol] ?? '') . '▏ · '
+                . count($state->displayOrder()) . ' of ' . $state->totalRowCount() . ' rows'
+                . ' · [Enter] keep · [Esc] remove';
+        } elseif ($state->find !== null) {
+            $n = count($state->findMatches);
+            $left = 'Find: ' . $state->find . '▏'
+                . ($state->find === '' ? '' : ($n === 0
+                    ? ' · no cell contains "' . $state->find . '"'
+                    : ' · match ' . ($state->findIndex + 1) . ' of ' . $n))
+                . ' · [Enter/↓] next · [↑] previous · [Esc] done';
         }
-        $filterMiss = $state->colFilter !== null && $state->colFilterMiss !== '';
+        $filterMiss = ($state->rowFilterCol !== null && $state->displayOrder() === [])
+            || ($state->colFilter !== null && $state->colFilterMiss !== '')
+            || ($state->find !== null && $state->find !== '' && $state->findMatches === []);
         // While a cell edit is in flight its UPDATE sits on the CLI; remind the
         // user how to resolve it (§9) — takes precedence over the row/col stats.
         if ($left === '' && $state->hasPending()) {
@@ -1329,15 +1402,21 @@ final class Renderer
             // know about notes at all.
             $left = self::resultStats($state->result, $state->autoLimitedAt);
         }
+        // Kept row filters (§6): always say how many rows are showing, whatever
+        // else the status line is saying, so hidden rows are never a surprise.
+        if ($state->rowFilters !== [] && $state->rowFilterCol === null && $state->hasResult()) {
+            $left = count($state->displayOrder()) . ' of ' . $state->totalRowCount() . ' rows shown (filtered by '
+                . implode(', ', array_keys($state->rowFilters)) . ')' . ($left !== '' ? ' · ' . $left : '');
+        }
 
-        $style = $filterMiss || ($state->statusIsError && $state->colFilter === null)
+        $style = $filterMiss || ($state->statusIsError && $state->colFilter === null && $state->find === null)
             ? $this->theme->style('status_error')
             : $this->theme->style('status');
 
         // A column mode's key hint owns the whole status row — drop the generic
         // right-side hints so the mode hint isn't truncated (§6).
         $hints = '';
-        if (!$state->moveMode && !$state->widthAdjust && $state->colFilter === null) {
+        if (!$state->moveMode && !$state->widthAdjust && $state->colFilter === null && $state->find === null && $state->rowFilterCol === null) {
             // The status message has first claim on the row; the hints take what
             // is left and shed topics to fit (§3). Spelling out every binding is
             // what overflowed the line in the first place.
@@ -2799,6 +2878,10 @@ final class Renderer
                 'Ctrl+Alt+O  Export the view to a CSV in the current dir',
                 'Ctrl+Alt+S  Unmoved columns A–Z / result order (not saved)',
                 'Ctrl+Alt+F  Filter fields by name; Esc keeps the cursor there',
+                'Ctrl+F      Find text in the cells; Enter/↓ next, ↑ previous',
+                'x (header)  Filter rows by this field; Enter keeps, Esc removes',
+                'a–z (hdr)   Popup letters work on the header without Enter',
+                'F3 / Sh+F3  Next / previous match after the find bar is closed',
                 'Ctrl+L      Data View Configuration (this column + the table)',
                 'Alt+1…9     Switch data view',
                 'Ctrl+Pg↑/↓  Previous / next data view (wraps at 1 and 9)',
@@ -2818,6 +2901,7 @@ final class Renderer
                 'Ctrl+Pg↑/↓  Previous / next data view (wraps at 1 and 9)',
                 'Tab         Autocomplete tables/fields · ? then Tab for macros',
                 '?name       Expand a macro; any arguments follow it on the line',
+                '?db_status  Built in: connection, server and session status',
                 '?{name}     Ask for this value when the statement runs',
                 '            (a ?name inside quotes is literal — nothing expands)',
                 '↑ / ↓       History (typed) · move between lines',

@@ -157,6 +157,7 @@ final class InputReader
                 return match ($this->buf[2]) {
                     'P'     => [KeyEvent::special(Key::F1), 3],
                     'Q'     => [KeyEvent::special(Key::F2), 3],
+                    'R'     => [KeyEvent::special(Key::F3), 3],
                     'A'     => [KeyEvent::special(Key::Up), 3],
                     'B'     => [KeyEvent::special(Key::Down), 3],
                     'C'     => [KeyEvent::special(Key::Right), 3],
@@ -284,6 +285,13 @@ final class InputReader
         // DSR cursor-position report: ESC [ row ; col R. Not a key — record it
         // for the sizer (after moveToExtreme this is the viewport's bottom-right,
         // i.e. the real height/width) and consume it silently.
+        // F3 with a modifier (Shift+F3 = ESC [ 1 ; 2 R) shares its shape with
+        // that report. A real report comes after moveToExtreme, at the
+        // bottom-right, so row 1 / column 2-8 can only be the key.
+        if ($final === 'R' && count($params) === 2 && $params[0] === 1 && $params[1] >= 2 && $params[1] <= 8) {
+            $mod = $params[1] - 1;
+            return [KeyEvent::special(Key::F3, ctrl: (bool) ($mod & 4), alt: (bool) ($mod & 2), shift: (bool) ($mod & 1)), $consumed];
+        }
         if ($final === 'R' && count($params) >= 2) {
             if ($params[0] > 0 && $params[1] > 0) {
                 $this->sizeReport = [$params[1], $params[0]]; // [width, height]
@@ -305,6 +313,7 @@ final class InputReader
             'D'     => Key::Left,
             'H'     => Key::Home,
             'F'     => Key::End,
+            'R'     => Key::F3,
             '~'     => $this->tildeKey($params[0] ?? 0),
             default => null,
         };
@@ -326,6 +335,7 @@ final class InputReader
             6       => Key::PageDown,
             11      => Key::F1,
             12      => Key::F2,
+            13      => Key::F3,
             15      => Key::F5, // xterm, Windows Terminal, WSL; there is no SS3 form
             default => null,
         };

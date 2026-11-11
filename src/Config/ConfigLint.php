@@ -28,10 +28,153 @@ final class ConfigLint
     /** The config being linted — macros need its env (§23) to load like the app. */
     private ?Config $config = null;
 
+    /**
+     * Warnings `--lint --fix` may act on (#26): keys sqli already ignores, so
+     * removing them changes nothing about how the file loads.
+     *
+     * @var list<array{label:string, file:string, keys:list<string>, line:?int, message:string}>
+     */
+    private array $fixable = [];
+
+    /** The JSON file being checked: its label, path and key positions (#27). */
+    private string $curLabel = '';
+    private string $curFile = '';
+    private ?JsonPositions $curPos = null;
+
     /** @return list<string> */
     public function errors(): array
     {
         return $this->errors;
+    }
+
+    /** @return list<array{label:string, file:string, keys:list<string>, line:?int, message:string}> */
+    public function fixable(): array
+    {
+        return $this->fixable;
+    }
+
+    /**
+     * "label (path:line)" for the key at $keys in the file being checked —
+     * the line of the closest key that exists, or no line at all when even
+     * the top-level key cannot be placed.
+     *
+     * @param list<string|int> $keys
+     */
+    private function at(array $keys): string
+    {
+        $line = $keys === [] ? null : $this->curPos?->line($keys);
+        return $this->curLabel . ' (' . $this->curFile . ($line !== null ? ':' . $line : '') . ')';
+    }
+
+    /** Record a warning that `--fix` can clear by removing the key at $keys. @param list<string> $keys */
+    private function warnFixable(array $keys, string $message): void
+    {
+        $message = $this->at($keys) . ': ' . $message;
+        $this->warnings[] = $message;
+        $this->fixable[] = [
+            'message' => $message,
+            'label' => $this->curLabel,
+            'file'  => $this->curFile,
+            'keys'  => array_map('strval', $keys),
+            'line'  => $this->curPos?->line($keys),
+        ];
+    }
+
+    /**
+     * `--lint --fix` (#26): remove every fixable key from its file. The cut is
+     * made in the text, so everything else in the file — layout, `_comment`
+     * keys, line endings — stays as written. Before a file is written, the
+     * result is decoded and compared with the original minus those keys; any
+     * difference and that file is left alone. The original is kept as
+     * `<file>.bak`.
+     *
+     * @return array{fixed: list<string>, failed: list<string>}
+     */
+    public function applyFixes(): array
+    {
+        $fixed = [];
+        $failed = [];
+        $byFile = [];
+        foreach ($this->fixable as $f) {
+            $byFile[$f['file']][] = $f;
+        }
+        foreach ($byFile as $file => $fixes) {
+            $raw = @file_get_contents($file);
+            if ($raw === false) {
+                $failed[] = "$file: cannot read file";
+                continue;
+            }
+            $expected = json_decode($raw, true);
+            $text = $raw;
+            $done = [];
+            foreach ($fixes as $f) {
+                $next = (new JsonPositions($text))->without($f['keys']);
+                if ($next === null) {
+                    continue;
+                }
+                $text = $next;
+                $expected = self::unsetPath($expected, $f['keys']);
+                $done[] = $f;
+            }
+            if ($done === []) {
+                continue;
+            }
+            if (json_decode($text, true) !== $expected) {
+                $failed[] = "$file: the edited file would not load as expected — left unchanged";
+                continue;
+            }
+            if (!@copy($file, $file . '.bak')) {
+                $failed[] = "$file: cannot write the backup $file.bak — left unchanged";
+                continue;
+            }
+            if (!self::writeAtomically($file, $text)) {
+                $failed[] = "$file: cannot write the file — left unchanged";
+                continue;
+            }
+            foreach ($done as $f) {
+                $fixed[] = $f['label'] . ' (' . $file . ($f['line'] !== null ? ':' . $f['line'] : '') . '): removed '
+                    . implode('.', $f['keys']);
+            }
+            $fixed[] = $done[0]['label'] . ': original kept as ' . $file . '.bak';
+        }
+        return ['fixed' => $fixed, 'failed' => $failed];
+    }
+
+    /** @param list<string> $keys */
+    private static function unsetPath(mixed $data, array $keys): mixed
+    {
+        if (!is_array($data) || $keys === []) {
+            return $data;
+        }
+        $k = array_shift($keys);
+        if (!array_key_exists($k, $data)) {
+            return $data;
+        }
+        if ($keys === []) {
+            unset($data[$k]);
+        } else {
+            $data[$k] = self::unsetPath($data[$k], $keys);
+        }
+        return $data;
+    }
+
+    /** Temp file in the same directory, then rename over the original. */
+    private static function writeAtomically(string $file, string $text): bool
+    {
+        $tmp = $file . '.tmp' . getmypid();
+        if (@file_put_contents($tmp, $text) !== strlen($text)) {
+            @unlink($tmp);
+            return false;
+        }
+        if (@rename($tmp, $file)) {
+            return true;
+        }
+        // Windows can refuse a rename onto an existing file.
+        if (@unlink($file) && @rename($tmp, $file)) {
+            return true;
+        }
+        @unlink($tmp);
+        return false;
     }
 
     /** @return list<string> */
@@ -95,6 +238,29 @@ final class ConfigLint
             $lint->notes[] = 'php: ' . $xdebug;
         }
         return $lint;
+    }
+
+    /**
+     * The ignored keys alone (#26), for startup: only the JSON config and
+     * formatting files are read — no theme scan, no permission check — so it
+     * costs a few milliseconds. Each message names `file:line`.
+     *
+     * @return list<string>
+     */
+    public static function ignoredKeys(Config $config): array
+    {
+        $lint = new self();
+        $lint->config = $config;
+        foreach ($config->knownFiles() as $label => $path) {
+            if (!str_contains($label, 'credential') && !str_contains($label, 'macro')) {
+                $lint->checkFile($label, $path, 'config');
+            }
+        }
+        $fmt = Settings::lintTargets($config->stateDir())['formatting file'] ?? null;
+        if ($fmt !== null) {
+            $lint->checkFile('formatting file', $fmt['path'], 'formatting');
+        }
+        return array_column($lint->fixable, 'message');
     }
 
     /**
@@ -242,9 +408,16 @@ final class ConfigLint
             $this->checkMacros($where, $path);
             return;
         }
+        $this->curLabel = $label;
+        $this->curFile = $path;
+        $this->curPos = new JsonPositions($raw);
         $data = json_decode($raw, true);
         if ($data === null && json_last_error() !== JSON_ERROR_NONE) {
-            $this->errors[] = "$where: invalid JSON — " . json_last_error_msg()
+            // json_decode says what is wrong but not where; the scanner stops
+            // at the first bad byte, which is close enough to point at.
+            $bad = $this->curPos->errorOffset();
+            $this->errors[] = $label . ' (' . $path . ($bad !== null ? ':' . $this->curPos->lineOf($bad) : '') . ')'
+                . ': invalid JSON — ' . json_last_error_msg()
                 . '. Check for trailing commas, missing/extra braces, or unquoted keys.';
             return;
         }
@@ -281,10 +454,14 @@ final class ConfigLint
         $env = $this->config?->envName();
         $chain = $this->config?->envChain() ?? [];
         $macros = new Macros([dirname($path)], $env, $chain);
+        $lines = preg_split('/
+|
+|/', (string) @file_get_contents($path)) ?: [];
+        $at = static fn (?int $line): string => $line !== null ? substr($where, 0, -1) . ':' . $line . ')' : $where;
         foreach ($macros->problems() as $p) {
             // The loader prefixes its own short path; $where already names the
             // file, so keep the message and drop the duplicate location.
-            $this->warnings[] = $where . ': ' . preg_replace('/^[^:]*: /', '', $p);
+            $this->warnings[] = $at(self::macroLine($lines, $p)) . ': ' . preg_replace('/^[^:]*: /', '', $p);
         }
 
         // A section naming an env no config file defines is the one way a
@@ -293,7 +470,8 @@ final class ConfigLint
         $known = $this->config?->envNames();
         foreach ($macros->envsSeen() as $seen) {
             if ($known !== null && $known !== [] && !in_array($seen, $known, true)) {
-                $this->warnings[] = "$where: [env:$seen] names an environment no config file defines"
+                $this->warnings[] = $at(self::iniLine($lines, '/^\s*\[\s*env\s*:\s*' . preg_quote($seen, '/') . '\s*\]/i'))
+                    . ": [env:$seen] names an environment no config file defines"
                     . ' (' . implode(', ', $known) . ') — nothing under it can ever load';
             }
         }
@@ -330,6 +508,44 @@ final class ConfigLint
     }
 
     /**
+     * The line a macro problem is about (#27): the line it already names, or
+     * the line defining the macro it names in backticks — inside its
+     * `[env:…]` section when the message names one.
+     *
+     * @param list<string> $lines
+     */
+    private static function macroLine(array $lines, string $problem): ?int
+    {
+        if (preg_match('/\bline (\d+)\b/', $problem, $m) === 1) {
+            return (int) $m[1];
+        }
+        if (preg_match('/`([^`]+)`/', $problem, $m) !== 1) {
+            return null;
+        }
+        $from = 0;
+        if (preg_match('/\[env:([^\]]+)\]/', $problem, $e) === 1) {
+            $head = self::iniLine($lines, '/^\s*\[\s*env\s*:\s*' . preg_quote($e[1], '/') . '\s*\]/i');
+            $from = $head ?? 0;
+        }
+        return self::iniLine($lines, '/^\s*' . preg_quote($m[1], '/') . '\s*=/', $from);
+    }
+
+    /**
+     * 1-based number of the first line from $from (0-based) matching $re.
+     *
+     * @param list<string> $lines
+     */
+    private static function iniLine(array $lines, string $re, int $from = 0): ?int
+    {
+        for ($i = $from, $n = count($lines); $i < $n; $i++) {
+            if (preg_match($re, $lines[$i]) === 1) {
+                return $i + 1;
+            }
+        }
+        return null;
+    }
+
+    /**
      * `projects` (§2): a list of directory paths, read from the home config
      * only. Anywhere else it is ignored, which is worth a warning — whoever
      * wrote it expects it to do something.
@@ -338,17 +554,18 @@ final class ConfigLint
      */
     private function checkProjects(string $where, mixed $projects, bool $isHome): void
     {
+        $key = Config::PROJECTS_KEY;
         if (!$isHome) {
-            $this->warnings[] = "$where: `projects` is ignored here — only the home config's list is read";
+            $this->warnFixable([$key], "`projects` is ignored here — only the home config's list is read");
             return;
         }
         if (!is_array($projects) || ($projects !== [] && !array_is_list($projects))) {
-            $this->errors[] = "$where: `projects` must be a list of directory paths";
+            $this->errors[] = $this->at([$key]) . ': `projects` must be a list of directory paths';
             return;
         }
-        foreach ($projects as $p) {
+        foreach ($projects as $i => $p) {
             if (!is_string($p) || trim($p) === '') {
-                $this->warnings[] = "$where: a non-path entry in `projects` (ignored)";
+                $this->warnings[] = $this->at([$key, $i]) . ': a non-path entry in `projects` (ignored)';
             }
         }
         $resolved = $this->config?->projectList() ?? [];
@@ -370,33 +587,33 @@ final class ConfigLint
             if (in_array($key, Config::reservedSections(), true)) {
                 continue; // handled below
             }
-            $this->checkOption($where, "top-level '$key'", $key, $value);
+            $this->checkOption([$key], "top-level '$key'", $key, $value);
         }
 
         if (isset($data['defaults'])) {
             if (!self::isObject($data['defaults'])) {
-                $this->errors[] = "$where: `defaults` must be an object";
+                $this->errors[] = $this->at(['defaults']) . ': `defaults` must be an object';
             } else {
                 foreach ($data['defaults'] as $key => $value) {
                     if ((string) $key === '' || ((string) $key)[0] === '_') {
                         continue;
                     }
-                    $this->checkOption($where, "defaults.$key", (string) $key, $value);
+                    $this->checkOption(['defaults', (string) $key], "defaults.$key", (string) $key, $value);
                 }
             }
         }
 
         if (isset($data['envs'])) {
-            $this->checkEnvs($where, $data['envs']);
+            $this->checkEnvs($data['envs']);
         }
 
         // The default `env` lives in the file's base, so it is checked from both
         // halves of that base — `defaults{}` last, because it is the one that wins.
-        $this->checkDefaultEnv($where, $data, 'top-level `env`', $data);
+        $this->checkDefaultEnv([], $data, 'top-level `env`', $data);
         if (self::isObject($data['defaults'] ?? null)) {
             /** @var array<string,mixed> $defaults */
             $defaults = $data['defaults'];
-            $this->checkDefaultEnv($where, $defaults, '`defaults.env`', $data);
+            $this->checkDefaultEnv(['defaults'], $defaults, '`defaults.env`', $data);
         }
     }
 
@@ -407,17 +624,19 @@ final class ConfigLint
      * anywhere defines, which then stops sqli from starting at all. Worth saying
      * before someone cd's into the directory, not after.
      *
+     * @param list<string> $basePath where that half sits: [] or ['defaults']
      * @param array<string,mixed> $base the half of the base being checked — the
      *        file's flat root, or its `defaults{}`
      * @param array<string,mixed> $fileRoot the file root, which is where `envs{}`
      *        lives however deep the key being checked is
      */
-    private function checkDefaultEnv(string $where, array $base, string $label, array $fileRoot): void
+    private function checkDefaultEnv(array $basePath, array $base, string $label, array $fileRoot): void
     {
         if (!array_key_exists('env', $base)) {
             return;
         }
         $value = $base['env'];
+        $where = $this->at([...$basePath, 'env']);
         if ($value === null || (is_string($value) && trim($value) === '')) {
             $this->notes[] = "$where: $label is empty — no default env here,"
                 . " and a farther layer's default is cancelled";
@@ -458,10 +677,10 @@ final class ConfigLint
     }
 
     /** @param mixed $envs */
-    private function checkEnvs(string $where, mixed $envs): void
+    private function checkEnvs(mixed $envs): void
     {
         if (!self::isObject($envs)) {
-            $this->errors[] = "$where: `envs` must be an object of named environments";
+            $this->errors[] = $this->at(['envs']) . ': `envs` must be an object of named environments';
             return;
         }
         /** @var array<string,mixed> $envs */
@@ -472,7 +691,7 @@ final class ConfigLint
                 continue;
             }
             if (!self::isObject($def)) {
-                $this->errors[] = "$where: env '$name' must be an object";
+                $this->errors[] = $this->at(['envs', $name]) . ": env '$name' must be an object";
                 continue;
             }
             /** @var array<string,mixed> $def */
@@ -481,24 +700,24 @@ final class ConfigLint
                 if ($key === 'extends' || $key === '' || $key[0] === '_') {
                     continue;
                 }
-                $this->checkOption($where, "envs.$name.$key", $key, $value);
+                $this->checkOption(['envs', $name, $key], "envs.$name.$key", $key, $value);
             }
             foreach ($def as $key => $value) {
                 if (Config::canonicalKey((string) $key) === 'host_label' && is_string($value) && trim($value) !== '') {
-                    $labels[trim($value)][] = $name;
+                    $labels[trim($value)][] = ['env' => $name, 'key' => (string) $key];
                 }
             }
             // An env naming an env is the one placement that cannot mean anything:
             // `env` selects an environment, and by the time this block is applied
             // the selection has happened. `extends` is the key that was wanted.
             if (array_key_exists('env', $def)) {
-                $this->warnings[] = "$where: env '$name' sets `env` (ignored)"
-                    . ' — an environment cannot select another; `extends` inherits one';
+                $this->warnFixable(['envs', $name, 'env'], "env '$name' sets `env` (ignored)"
+                    . ' — an environment cannot select another; `extends` inherits one');
             }
-            $this->checkExtendsRefs($where, $name, $def['extends'] ?? null, $envs);
+            $this->checkExtendsRefs($name, $def['extends'] ?? null, $envs);
         }
-        $this->checkLabels($where, $labels);
-        $this->checkExtendsCycles($where, $envs);
+        $this->checkLabels($labels);
+        $this->checkExtendsCycles($envs);
     }
 
     /**
@@ -513,13 +732,16 @@ final class ConfigLint
      * lint of one file can actually judge; a name reused in a *farther* config
      * layer is a different environment list and only one of them can win.
      *
-     * @param array<string,list<string>> $labels
+     * @param array<string,list<array{env:string, key:string}>> $labels
      */
-    private function checkLabels(string $where, array $labels): void
+    private function checkLabels(array $labels): void
     {
-        foreach ($labels as $label => $envs) {
-            if (count($envs) > 1) {
-                $this->errors[] = "$where: host_label '$label' is used by more than one env ("
+        foreach ($labels as $label => $uses) {
+            if (count($uses) > 1) {
+                // Point at the second use: the first is fine until it is repeated.
+                $envs = array_column($uses, 'env');
+                $this->errors[] = $this->at(['envs', $uses[1]['env'], $uses[1]['key']])
+                    . ": host_label '$label' is used by more than one env ("
                     . implode(', ', $envs) . ') — a host_label stands in for the address,'
                     . ' so it has to say which server it means';
             }
@@ -527,12 +749,13 @@ final class ConfigLint
     }
 
     /** @param array<string,mixed> $envs */
-    private function checkExtendsRefs(string $where, string $name, mixed $extends, array $envs): void
+    private function checkExtendsRefs(string $name, mixed $extends, array $envs): void
     {
         if ($extends === null) {
             return;
         }
         $parents = is_array($extends) ? $extends : [$extends];
+        $where = $this->at(['envs', $name, 'extends']);
         foreach ($parents as $p) {
             if (!is_string($p)) {
                 $this->errors[] = "$where: env '$name' has a non-string `extends` entry";
@@ -546,14 +769,14 @@ final class ConfigLint
     }
 
     /** @param array<string,mixed> $envs */
-    private function checkExtendsCycles(string $where, array $envs): void
+    private function checkExtendsCycles(array $envs): void
     {
         foreach (array_keys($envs) as $start) {
             $seen = [];
             $node = (string) $start;
             while (true) {
                 if (in_array($node, $seen, true)) {
-                    $this->errors[] = "$where: `extends` cycle: " . implode(' -> ', [...$seen, $node]);
+                    $this->errors[] = $this->at(['envs', (string) $start, 'extends']) . ': `extends` cycle: ' . implode(' -> ', [...$seen, $node]);
                     break;
                 }
                 $seen[] = $node;
@@ -569,17 +792,19 @@ final class ConfigLint
         }
     }
 
-    private function checkOption(string $where, string $ctx, string $key, mixed $value): void
+    /** @param list<string> $keys where the option sits in the file */
+    private function checkOption(array $keys, string $ctx, string $key, mixed $value): void
     {
         $canon = Config::canonicalKey($key);
         if ($canon === null) {
-            $this->warnings[] = "$where: unknown option '$key' at $ctx (ignored)";
+            $this->warnFixable($keys, "unknown option '$key' at $ctx (ignored)");
             return;
         }
         if (in_array($canon, Config::fileExcludedKeys(), true)) {
-            $this->warnings[] = "$where: '$key' at $ctx can't be set in a file (ignored)";
+            $this->warnFixable($keys, "'$key' at $ctx can't be set in a file (ignored)");
             return;
         }
+        $where = $this->at($keys);
         if (Config::isFlagKey($canon)) {
             if (!is_bool($value) && !in_array($value, [0, 1, '0', '1', 'true', 'false', 'yes', 'no', 'on', 'off'], true)) {
                 $this->warnings[] = "$where: '$key' at $ctx should be true/false";
@@ -600,7 +825,7 @@ final class ConfigLint
                 continue;
             }
             if (!self::isObject($secrets)) {
-                $this->errors[] = "$where: credentials for '$env' must be an object "
+                $this->errors[] = $this->at([$env]) . ": credentials for '$env' must be an object "
                     . '(e.g. { "password": "…" })';
             }
         }
@@ -613,12 +838,13 @@ final class ConfigLint
             return;
         }
         if (!self::isObject($data['databases'])) {
-            $this->errors[] = "$where: `databases` must be an object";
+            $this->errors[] = $this->at(['databases']) . ': `databases` must be an object';
             return;
         }
         foreach ($data['databases'] as $db => $dbData) {
+            $db = (string) $db;
             if (!self::isObject($dbData)) {
-                $this->errors[] = "$where: databases.$db must be an object";
+                $this->errors[] = $this->at(['databases', $db]) . ": databases.$db must be an object";
                 continue;
             }
             $tables = $dbData['tables'] ?? null;
@@ -626,17 +852,19 @@ final class ConfigLint
                 continue;
             }
             if (!self::isObject($tables)) {
-                $this->errors[] = "$where: databases.$db.tables must be an object";
+                $this->errors[] = $this->at(['databases', $db, 'tables']) . ": databases.$db.tables must be an object";
                 continue;
             }
             foreach ($tables as $table => $spec) {
-                $this->checkFormattingTable("$where: databases.$db.tables.$table", $spec);
+                $this->checkFormattingTable(['databases', $db, 'tables', (string) $table], $spec);
             }
         }
     }
 
-    private function checkFormattingTable(string $ctx, mixed $spec): void
+    /** @param list<string> $keys */
+    private function checkFormattingTable(array $keys, mixed $spec): void
     {
+        $ctx = $this->at($keys) . ': ' . implode('.', $keys);
         if (!self::isObject($spec)) {
             $this->errors[] = "$ctx must be an object";
             return;
@@ -651,21 +879,22 @@ final class ConfigLint
             if ($key === '' || $key[0] === '_') {
                 continue;
             }
+            $kctx = $this->at([...$keys, $key]) . ': ' . implode('.', $keys);
             if (!isset($allowed[$key])) {
-                $this->warnings[] = "$ctx.$key: unknown key (expected widths/order/formats/hidden/lists/splits)";
+                $this->warnFixable([...$keys, $key], implode('.', $keys) . ".$key: unknown key (expected widths/order/formats/hidden/lists/splits)");
                 continue;
             }
             if ($key === 'splits' && is_array($value)) {
                 foreach ($value as $col => $def) {
                     if (\Sqli\Split\SplitSpec::fromArray($def) === null) {
-                        $this->warnings[] = "$ctx.splits.$col: not a usable table-view definition "
+                        $this->warnings[] = $this->at([...$keys, $key, (string) $col]) . ': ' . implode('.', $keys) . ".splits.$col: not a usable table-view definition "
                             . '(expected {rows, fields:[{name, sep}]}, every field but the last with a separator)';
                     }
                 }
             }
             $ok = $allowed[$key] === 'list' ? array_is_list((array) $value) && is_array($value) : self::isObject($value) || $value === [];
             if (!$ok) {
-                $this->warnings[] = "$ctx.$key: expected a " . ($allowed[$key] === 'list' ? 'list [ … ]' : 'object { … }');
+                $this->warnings[] = "$kctx.$key: expected a " . ($allowed[$key] === 'list' ? 'list [ … ]' : 'object { … }');
             }
         }
     }
@@ -674,11 +903,11 @@ final class ConfigLint
     private function checkState(string $where, array $data): void
     {
         if (isset($data['theme']) && !is_string($data['theme'])) {
-            $this->warnings[] = "$where: `theme` should be a string";
+            $this->warnings[] = $this->at(['theme']) . ': `theme` should be a string';
         }
         foreach (['history', 'execHistory'] as $k) {
             if (isset($data[$k]) && !(is_array($data[$k]) && array_is_list($data[$k]))) {
-                $this->warnings[] = "$where: `$k` should be a list of strings";
+                $this->warnings[] = $this->at([$k]) . ": `$k` should be a list of strings";
             }
         }
     }
